@@ -1,0 +1,115 @@
+# ===========================================================================
+#  Green-Kubo thermal conductivity with mff/torch (ML force field)
+#  System: H/O/C/N random mixture, ~1000 atoms (small test)
+#
+#  Usage (Kokkos GPU):
+#    lmp -k on g 1 -sf kk -pk kokkos newton off neigh full \
+#        -in in.green_kubo_kappa
+#
+#  Prerequisites:
+#    - Compiled with -D MFF_ENABLE_VIRIAL=ON
+#    - core_with_e0_fp32.pt at the path below
+# ===========================================================================
+
+# ---------- System setup ----------
+
+units         metal
+atom_style    atomic
+boundary      p p p
+
+region        box block 0 30 0 30 0 30
+create_box    4 box
+create_atoms  1 random 300 12345 box
+create_atoms  2 random 300 12346 box
+create_atoms  3 random 200 12347 box
+create_atoms  4 random 200 12348 box
+mass          1 1.008      # H
+mass          2 15.999     # O
+mass          3 12.011     # C
+mass          4 14.007     # N
+
+neighbor      1.0 bin
+
+pair_style    mff/torch 5.0 cuda
+pair_coeff    * * /root/shared-nvme/rebuild/core_with_e0_fp32.pt H O C N
+
+# ---------- Variables ----------
+
+variable      T_target  equal  300
+variable      dt_ps     equal  0.001       # 1 fs in metal units (ps)
+variable      t_equil   equal  5000        # Equilibration: 5 ps
+variable      t_sample  equal  100000      # Production:  100 ps
+
+# fix ave/correlate parameters
+variable      s_corr    equal  5           # sample every 5 steps (5 fs)
+variable      p_corr    equal  40          # 40 samples per block
+variable      d_corr    equal  200         # correlation window = 200 steps = 1 ps
+
+# ---------- Equilibration: NVT ----------
+
+velocity      all create ${T_target} 42 dist gaussian
+timestep      ${dt_ps}
+
+fix           eq all nvt temp ${T_target} ${T_target} 0.1
+thermo        500
+thermo_style  custom step temp pe ke etotal press
+
+run           ${t_equil}
+unfix         eq
+
+# ---------- Production: NVE + Green-Kubo ----------
+
+reset_timestep 0
+
+fix           nve all nve
+
+# Per-atom quantities needed by compute heat/flux:
+#   ke/atom  → per-atom kinetic energy
+#   pe/atom  → per-atom potential energy  (reads eatom from pair style)
+#   stress/atom NULL virial → per-atom virial stress (reads vatom from pair style)
+compute       ke_atom all ke/atom
+compute       pe_atom all pe/atom
+compute       st_atom all stress/atom NULL virial
+
+# Heat flux: J = (1/V) Σ_i [ e_i v_i + S_i · v_i ]
+compute       flux all heat/flux ke_atom pe_atom st_atom
+
+# Unit conversion for metal units:
+#   [J] = eV·Å/ps,  [V] = Å^3,  [T] = K,  [kB] = eV/K
+#   κ = V/(kB T^2) * dt * ∫<J(t)J(0)>dt
+#   metal→SI: 1 eV/(ps·Å·K) = 1.6022e6 W/(m·K)... but LAMMPS heat/flux
+#   already includes the 1/V factor, so:
+#   κ = 1/(kB T^2 V) * dt * Σ<J(t)J(0)> * (eV^2·Å^2)/(ps^2·Å^3)
+#   The correct prefactor in metal units is:
+#     scale = dt_ps * V / (kB * T^2) * 1.6022e+6  [W/(m·K)]
+#   But compute heat/flux already divides by V, giving J in eV/(ps·Å^2).
+#   So: scale = dt_ps / (kB * T^2 * V) * ... needs care.
+#
+#   Following LAMMPS documentation convention for metal units:
+variable      kB     equal  8.617333262e-5        # eV/K
+variable      V      equal  vol                    # Å^3
+variable      Treal  equal  temp
+variable      scale  equal  ${dt_ps}*1.0e-12/(${kB}*${T_target}*${T_target}*v_V*1.0e-30)*1.602176634e-19
+
+# Heat-flux autocorrelation
+fix           gk all ave/correlate ${s_corr} ${p_corr} ${d_corr} &
+              c_flux[1] c_flux[2] c_flux[3] &
+              type auto file hfacf.dat ave running
+
+variable      kx equal trap(f_gk[3])*${scale}
+variable      ky equal trap(f_gk[4])*${scale}
+variable      kz equal trap(f_gk[5])*${scale}
+variable      kappa equal (v_kx+v_ky+v_kz)/3.0
+
+thermo        1000
+thermo_style  custom step temp pe ke press v_kx v_ky v_kz v_kappa
+
+run           ${t_sample}
+
+print "==========================================="
+print " Green-Kubo thermal conductivity result"
+print " kappa_x = ${kx} W/(m·K)"
+print " kappa_y = ${ky} W/(m·K)"
+print " kappa_z = ${kz} W/(m·K)"
+print " kappa   = ${kappa} W/(m·K)"
+print "==========================================="

@@ -1,0 +1,31 @@
+units metal
+atom_style atomic
+boundary p p p
+
+# read_data system.data
+# 或者用 create_atoms 生成一个最小体系
+
+neighbor 1.0 bin
+
+# Kokkos GPU 运行时建议命令行启用：
+#   lmp -k on g 1 -sf kk -pk kokkos newton on neigh half -in in.mfftorch_minimal
+
+# cutoff(Angstrom) + device(cpu|cuda)
+pair_style mff/torch 5.0 cuda
+
+# pair_coeff * * <core.pt> <elem_for_type1> <elem_for_type2> ...
+pair_coeff * * core.pt H O
+
+# 如果 core.pt 带 physical_tensor_outputs，可开启：
+# compute mffg all mff/torch/phys global
+# compute mffa all mff/torch/phys atom
+# compute mffd all mff/torch/phys global dipole
+# compute mffdx all mff/torch/phys global dipole x
+# compute mffad all mff/torch/phys atom dipole
+# compute mffadx all mff/torch/phys atom dipole x
+# thermo_style custom step pe c_mffg[2] c_mffg[3] c_mffg[4]
+# dump 1 all custom 10 dump.mff id type x y z c_mffa[1] c_mffa[2] c_mffa[3] c_mffa[4]
+
+thermo 10
+run 10
+

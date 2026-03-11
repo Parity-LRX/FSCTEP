@@ -1,0 +1,8 @@
+2
+Properties=species:S:1:pos:R:3:force:R:3:Z:I:1 energy=-10.5 pbc="T T T" Lattice="10 0 0 0 10 0 0 0 10"
+H 0.0 0.0 0.0 0.01 0.02 0.03 1
+O 0.96 0.0 0.0 -0.01 -0.02 -0.03 8
+2
+Properties=species:S:1:pos:R:3:force:R:3:Z:I:1 energy=-10.4 pbc="T T T" Lattice="10 0 0 0 10 0 0 0 10"
+H 0.01 0.0 0.0 0.02 0.01 0.00 1
+O 0.97 0.0 0.0 -0.02 -0.01 0.00 8
