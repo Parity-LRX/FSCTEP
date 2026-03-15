@@ -56,6 +56,12 @@ from molecular_force_field.models import E3_TransformerLayer_multi
 from molecular_force_field.models.e3nn_layers_channelwise import (
     E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
 )
+from molecular_force_field.models.pure_cartesian_sparse_layers import (
+    PureCartesianSparseTransformerLayer,
+)
+from molecular_force_field.models.pure_cartesian_sparse_layers_save import (
+    PureCartesianSparseTransformerLayerSave,
+)
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PhysicalTensorICTDRecovery,
     PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerSave,
@@ -67,6 +73,7 @@ from molecular_force_field.utils.checkpoint_metadata import (
     infer_external_tensor_rank_from_state_dict,
     infer_physical_tensor_outputs_from_state_dict,
 )
+from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 from molecular_force_field.utils.tensor_utils import map_tensor_values
 
 
@@ -122,6 +129,55 @@ def _canonicalize_cartesian_rank2(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(*x.shape[:-2], 9)
 
 
+def _physical_block_is_cartesian(block: torch.Tensor, rank: int) -> bool:
+    if block is None:
+        return False
+    if rank == 0:
+        return block.dim() >= 2 and block.shape[-1] == 1
+    if rank == 1:
+        return block.dim() >= 3 and block.shape[-1] == 3
+    if rank == 2:
+        return block.dim() >= 4 and block.shape[-2:] == (3, 3)
+    return False
+
+
+def _recover_rank1_cartesian(blocks: dict[int, torch.Tensor]) -> torch.Tensor:
+    blk = blocks.get(1)
+    if blk is None:
+        raise ValueError("Missing l=1 block for rank-1 Cartesian physical tensor")
+    if not _physical_block_is_cartesian(blk, 1):
+        raise ValueError(f"rank-1 Cartesian block must have shape (..., C, 3), got {tuple(blk.shape)}")
+    if blk.shape[-2] != 1:
+        raise ValueError("rank-1 Cartesian physical tensor export currently requires channels_out=1")
+    return blk[..., 0, :]
+
+
+def _recover_rank2_cartesian(blocks: dict[int, torch.Tensor], *, include_trace: bool) -> torch.Tensor:
+    mat = None
+    if 2 in blocks:
+        blk = blocks[2]
+        if not _physical_block_is_cartesian(blk, 2):
+            raise ValueError(f"rank-2 Cartesian block must have shape (..., C, 3, 3), got {tuple(blk.shape)}")
+        if blk.shape[-3] != 1:
+            raise ValueError("rank-2 Cartesian physical tensor export currently requires channels_out=1")
+        mat = blk[..., 0, :, :]
+    if mat is None:
+        if include_trace:
+            raise ValueError("Missing l=2 block for rank-2 Cartesian physical tensor")
+        return torch.zeros(0)
+    mat = 0.5 * (mat + mat.transpose(-1, -2))
+    if include_trace and 0 in blocks:
+        trace_blk = blocks[0]
+        if not _physical_block_is_cartesian(trace_blk, 0):
+            raise ValueError(f"rank-0 Cartesian block must have shape (..., C, 1), got {tuple(trace_blk.shape)}")
+        if trace_blk.shape[-2] != 1:
+            raise ValueError("rank-0 Cartesian physical tensor export currently requires channels_out=1")
+        trace = trace_blk[..., 0, 0]
+        eye = torch.eye(3, device=mat.device, dtype=mat.dtype)
+        mat = mat + trace.unsqueeze(-1).unsqueeze(-1) * eye
+    return mat
+
+
 def _recover_cartesian_physical_tensors(
     physical_out: dict[str, dict[int, torch.Tensor]] | None,
     *,
@@ -153,20 +209,33 @@ def _recover_cartesian_physical_tensors(
                 blk = blocks.get(0)
                 if blk is None:
                     continue
-                if blk.shape[-2] != 1:
-                    raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
-                global_phys[:, start:end] = blk[..., 0, :].reshape(blk.shape[0], 1)
+                if _physical_block_is_cartesian(blk, 0):
+                    if blk.shape[-2] != 1:
+                        raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
+                    global_phys[:, start:end] = blk[..., 0, 0].reshape(blk.shape[0], 1)
+                else:
+                    if blk.shape[-2] != 1:
+                        raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
+                    global_phys[:, start:end] = blk[..., 0, :].reshape(blk.shape[0], 1)
             elif name == "dipole":
-                rec = recover_rank1(blocks)
+                rec = _recover_rank1_cartesian(blocks) if _physical_block_is_cartesian(blocks.get(1), 1) else recover_rank1(blocks)
                 global_phys[:, start:end] = rec.reshape(rec.shape[0], 3)
             elif name == "polarizability":
-                rec = recover_rank2_full(blocks)
+                rec = (
+                    _recover_rank2_cartesian(blocks, include_trace=True)
+                    if _physical_block_is_cartesian(blocks.get(2), 2)
+                    else recover_rank2_full(blocks)
+                )
                 global_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
             elif name == "quadrupole":
                 l2_only = {2: blocks[2]} if 2 in blocks else {}
                 if not l2_only:
                     continue
-                rec = recover_rank2_l2(l2_only)
+                rec = (
+                    _recover_rank2_cartesian(l2_only, include_trace=False)
+                    if _physical_block_is_cartesian(l2_only.get(2), 2)
+                    else recover_rank2_l2(l2_only)
+                )
                 global_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
             global_mask[global_mask_index[name]] = 1.0
         elif name in _ATOM_PHYS_OFFSETS:
@@ -175,20 +244,33 @@ def _recover_cartesian_physical_tensors(
                 blk = blocks.get(0)
                 if blk is None:
                     continue
-                if blk.shape[-2] != 1:
-                    raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
-                atom_phys[:, start:end] = blk[..., 0, :].reshape(blk.shape[0], 1)
+                if _physical_block_is_cartesian(blk, 0):
+                    if blk.shape[-2] != 1:
+                        raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
+                    atom_phys[:, start:end] = blk[..., 0, 0].reshape(blk.shape[0], 1)
+                else:
+                    if blk.shape[-2] != 1:
+                        raise ValueError(f"{name} channels_out>1 is not supported for LibTorch export")
+                    atom_phys[:, start:end] = blk[..., 0, :].reshape(blk.shape[0], 1)
             elif name == "dipole_per_atom":
-                rec = recover_rank1(blocks)
+                rec = _recover_rank1_cartesian(blocks) if _physical_block_is_cartesian(blocks.get(1), 1) else recover_rank1(blocks)
                 atom_phys[:, start:end] = rec.reshape(rec.shape[0], 3)
             elif name == "polarizability_per_atom":
-                rec = recover_rank2_full(blocks)
+                rec = (
+                    _recover_rank2_cartesian(blocks, include_trace=True)
+                    if _physical_block_is_cartesian(blocks.get(2), 2)
+                    else recover_rank2_full(blocks)
+                )
                 atom_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
             elif name == "quadrupole_per_atom":
                 l2_only = {2: blocks[2]} if 2 in blocks else {}
                 if not l2_only:
                     continue
-                rec = recover_rank2_l2(l2_only)
+                rec = (
+                    _recover_rank2_cartesian(l2_only, include_trace=False)
+                    if _physical_block_is_cartesian(l2_only.get(2), 2)
+                    else recover_rank2_l2(l2_only)
+                )
                 atom_phys[:, start:end] = _canonicalize_cartesian_rank2(rec)
             atom_mask[atom_mask_index[name]] = 1.0
 
@@ -617,6 +699,8 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         - "spherical": E3_TransformerLayer_multi (e3nn_layers)
         - "spherical-save": E3_TransformerLayer_multi_channelwise (e3nn_layers_channelwise)
         - "spherical-save-cue": E3_TransformerLayer_multi (cue_layers_channelwise, cuEquivariance GPU)
+        - "pure-cartesian-sparse": PureCartesianSparseTransformerLayer
+        - "pure-cartesian-sparse-save": PureCartesianSparseTransformerLayerSave
         - "pure-cartesian-ictd": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers_full)
         - "pure-cartesian-ictd-save": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers)
         """
@@ -659,6 +743,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         )
         if num_interaction is None:
             num_interaction = int(arch_meta.get("num_interaction", 2))
+        invariant_channels = int(arch_meta.get("invariant_channels", 32))
 
         if atomic_energy_keys is not None and atomic_energy_values is not None:
             aek = torch.tensor(atomic_energy_keys, dtype=torch.long)
@@ -739,6 +824,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 main_hidden_sizes3=config.main_hidden_sizes3,
                 num_layers=config.num_layers,
                 num_interaction=num_interaction,
+                invariant_channels=invariant_channels,
                 function_type_main=config.function_type,
                 lmax=config.lmax,
                 physical_tensor_outputs=physical_tensor_outputs,
@@ -804,12 +890,117 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 main_hidden_sizes3=config.main_hidden_sizes3,
                 num_layers=config.num_layers,
                 num_interaction=num_interaction,
+                invariant_channels=invariant_channels,
                 function_type_main=config.function_type,
                 lmax=config.lmax,
                 ictd_tp_path_policy=ictd_tp_path_policy,
                 ictd_tp_max_rank_other=ictd_tp_max_rank_other,
                 internal_compute_dtype=dtype,
                 device=torch.device(device),
+                long_range_mode=long_range_mode,
+                long_range_hidden_dim=long_range_hidden_dim,
+                long_range_boundary=long_range_boundary,
+                long_range_neutralize=long_range_neutralize,
+                long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+                long_range_kmax=long_range_kmax,
+                long_range_mesh_size=long_range_mesh_size,
+                long_range_slab_padding_factor=long_range_slab_padding_factor,
+                long_range_include_k0=long_range_include_k0,
+                long_range_source_channels=long_range_source_channels,
+                long_range_backend=long_range_backend,
+                long_range_reciprocal_backend=long_range_reciprocal_backend,
+                long_range_energy_partition=long_range_energy_partition,
+                long_range_green_mode=long_range_green_mode,
+                long_range_assignment=long_range_assignment,
+                long_range_theta=long_range_theta,
+                long_range_leaf_size=long_range_leaf_size,
+                long_range_multipole_order=long_range_multipole_order,
+                long_range_far_source_dim=long_range_far_source_dim,
+                long_range_far_num_shells=long_range_far_num_shells,
+                long_range_far_shell_growth=long_range_far_shell_growth,
+                long_range_far_tail=long_range_far_tail,
+                long_range_far_tail_bins=long_range_far_tail_bins,
+                long_range_far_stats=long_range_far_stats,
+                long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+                long_range_far_source_norm=long_range_far_source_norm,
+                long_range_far_gate_init=long_range_far_gate_init,
+                feature_spectral_mode=feature_spectral_mode,
+                feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+                feature_spectral_mesh_size=feature_spectral_mesh_size,
+                feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+                feature_spectral_boundary=feature_spectral_boundary,
+                feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+                feature_spectral_neutralize=feature_spectral_neutralize,
+                feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_gate_init=feature_spectral_gate_init,
+            ).to(device)
+        elif mode in ("pure-cartesian-sparse", "pure-cartesian-sparse-save"):
+            max_rank_other = int(ckpt.get("max_rank_other", arch_meta.get("max_rank_other", 1)))
+            k_policy = str(ckpt.get("k_policy", arch_meta.get("k_policy", "k0")))
+            sparse_cls = (
+                PureCartesianSparseTransformerLayerSave
+                if mode == "pure-cartesian-sparse-save"
+                else PureCartesianSparseTransformerLayer
+            )
+            model = sparse_cls(
+                max_embed_radius=config.max_radius,
+                main_max_radius=config.max_radius_main,
+                main_number_of_basis=config.number_of_basis_main,
+                hidden_dim_conv=config.channel_in,
+                hidden_dim_sh=config.get_hidden_dim_sh(),
+                hidden_dim=config.emb_number_main_2,
+                channel_in2=config.channel_in2,
+                embedding_dim=config.embedding_dim,
+                max_atomvalue=config.max_atomvalue,
+                output_size=config.output_size,
+                embed_size=config.embed_size,
+                main_hidden_sizes3=config.main_hidden_sizes3,
+                num_layers=config.num_layers,
+                num_interaction=num_interaction,
+                invariant_channels=invariant_channels,
+                function_type_main=config.function_type,
+                lmax=config.lmax,
+                max_rank_other=max_rank_other,
+                k_policy=k_policy,
+                physical_tensor_outputs=physical_tensor_outputs,
+                external_tensor_rank=external_tensor_rank,
+                device=torch.device(device),
+                long_range_mode=long_range_mode,
+                long_range_hidden_dim=long_range_hidden_dim,
+                long_range_boundary=long_range_boundary,
+                long_range_neutralize=long_range_neutralize,
+                long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+                long_range_kmax=long_range_kmax,
+                long_range_mesh_size=long_range_mesh_size,
+                long_range_slab_padding_factor=long_range_slab_padding_factor,
+                long_range_include_k0=long_range_include_k0,
+                long_range_source_channels=long_range_source_channels,
+                long_range_backend=long_range_backend,
+                long_range_reciprocal_backend=long_range_reciprocal_backend,
+                long_range_energy_partition=long_range_energy_partition,
+                long_range_green_mode=long_range_green_mode,
+                long_range_assignment=long_range_assignment,
+                long_range_theta=long_range_theta,
+                long_range_leaf_size=long_range_leaf_size,
+                long_range_multipole_order=long_range_multipole_order,
+                long_range_far_source_dim=long_range_far_source_dim,
+                long_range_far_num_shells=long_range_far_num_shells,
+                long_range_far_shell_growth=long_range_far_shell_growth,
+                long_range_far_tail=long_range_far_tail,
+                long_range_far_tail_bins=long_range_far_tail_bins,
+                long_range_far_stats=long_range_far_stats,
+                long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+                long_range_far_source_norm=long_range_far_source_norm,
+                long_range_far_gate_init=long_range_far_gate_init,
+                feature_spectral_mode=feature_spectral_mode,
+                feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+                feature_spectral_mesh_size=feature_spectral_mesh_size,
+                feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+                feature_spectral_boundary=feature_spectral_boundary,
+                feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+                feature_spectral_neutralize=feature_spectral_neutralize,
+                feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         elif mode == "spherical-save-cue":
             try:
@@ -904,8 +1095,45 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 main_hidden_sizes3=config.main_hidden_sizes3,
                 num_layers=config.num_layers,
                 num_interaction=num_interaction,
+                invariant_channels=invariant_channels,
                 function_type_main=config.function_type,
                 device=torch.device(device),
+                long_range_mode=long_range_mode,
+                long_range_hidden_dim=long_range_hidden_dim,
+                long_range_boundary=long_range_boundary,
+                long_range_neutralize=long_range_neutralize,
+                long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+                long_range_kmax=long_range_kmax,
+                long_range_mesh_size=long_range_mesh_size,
+                long_range_slab_padding_factor=long_range_slab_padding_factor,
+                long_range_include_k0=long_range_include_k0,
+                long_range_source_channels=long_range_source_channels,
+                long_range_backend=long_range_backend,
+                long_range_reciprocal_backend=long_range_reciprocal_backend,
+                long_range_energy_partition=long_range_energy_partition,
+                long_range_green_mode=long_range_green_mode,
+                long_range_assignment=long_range_assignment,
+                long_range_theta=long_range_theta,
+                long_range_leaf_size=long_range_leaf_size,
+                long_range_multipole_order=long_range_multipole_order,
+                long_range_far_source_dim=long_range_far_source_dim,
+                long_range_far_num_shells=long_range_far_num_shells,
+                long_range_far_shell_growth=long_range_far_shell_growth,
+                long_range_far_tail=long_range_far_tail,
+                long_range_far_tail_bins=long_range_far_tail_bins,
+                long_range_far_stats=long_range_far_stats,
+                long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+                long_range_far_source_norm=long_range_far_source_norm,
+                long_range_far_gate_init=long_range_far_gate_init,
+                feature_spectral_mode=feature_spectral_mode,
+                feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+                feature_spectral_mesh_size=feature_spectral_mesh_size,
+                feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+                feature_spectral_boundary=feature_spectral_boundary,
+                feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+                feature_spectral_neutralize=feature_spectral_neutralize,
+                feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         else:
             model = E3_TransformerLayer_multi(
@@ -927,8 +1155,46 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 embed_size=config.embed_size,
                 main_hidden_sizes3=config.main_hidden_sizes3,
                 num_layers=config.num_layers,
+                num_interaction=num_interaction,
+                invariant_channels=invariant_channels,
                 function_type_main=config.function_type,
                 device=torch.device(device),
+                long_range_mode=long_range_mode,
+                long_range_hidden_dim=long_range_hidden_dim,
+                long_range_boundary=long_range_boundary,
+                long_range_neutralize=long_range_neutralize,
+                long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+                long_range_kmax=long_range_kmax,
+                long_range_mesh_size=long_range_mesh_size,
+                long_range_slab_padding_factor=long_range_slab_padding_factor,
+                long_range_include_k0=long_range_include_k0,
+                long_range_source_channels=long_range_source_channels,
+                long_range_backend=long_range_backend,
+                long_range_reciprocal_backend=long_range_reciprocal_backend,
+                long_range_energy_partition=long_range_energy_partition,
+                long_range_green_mode=long_range_green_mode,
+                long_range_assignment=long_range_assignment,
+                long_range_theta=long_range_theta,
+                long_range_leaf_size=long_range_leaf_size,
+                long_range_multipole_order=long_range_multipole_order,
+                long_range_far_source_dim=long_range_far_source_dim,
+                long_range_far_num_shells=long_range_far_num_shells,
+                long_range_far_shell_growth=long_range_far_shell_growth,
+                long_range_far_tail=long_range_far_tail,
+                long_range_far_tail_bins=long_range_far_tail_bins,
+                long_range_far_stats=long_range_far_stats,
+                long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+                long_range_far_source_norm=long_range_far_source_norm,
+                long_range_far_gate_init=long_range_far_gate_init,
+                feature_spectral_mode=feature_spectral_mode,
+                feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+                feature_spectral_mesh_size=feature_spectral_mesh_size,
+                feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+                feature_spectral_boundary=feature_spectral_boundary,
+                feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+                feature_spectral_neutralize=feature_spectral_neutralize,
+                feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         if mode == "spherical-save-cue":
             load_result = model.load_state_dict(ckpt["e3trans_state_dict"], strict=False)
@@ -956,6 +1222,8 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                         )
         else:
             model.load_state_dict(ckpt["e3trans_state_dict"], strict=True)
+
+        model = maybe_wrap_model_with_zbl(model, arch_meta)
 
         # Optional TorchScript tracing
         use_ts = bool(torchscript) or (os.environ.get("MLIAP_USE_TORCHSCRIPT", "").lower() in ("1", "true", "yes"))

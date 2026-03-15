@@ -367,6 +367,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # If None: keep current behavior (mul_l = channels for all l).
         # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
         product5_muls_by_l: dict[int, int] | None = None,
+        invariant_channels: int = 32,
         # Optional: physical tensor outputs (equivariant heads).
         # Example:
         #   physical_tensor_outputs={
@@ -433,6 +434,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.num_interaction = int(num_interaction)
         if self.num_interaction < 2:
             raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
+        self.invariant_channels = int(invariant_channels)
 
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
@@ -525,7 +527,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         #  - scalars: per-l channel Gram -> 32
         #  - norms: per-l per-channel L2 over m
         combined_channels = self.channels * self.num_interaction
-        scalar_channels = (self.num_interaction - 1) * 32
+        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
         self.W_read = nn.ParameterList([
             nn.Parameter(torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02)
             for _ in range(self.lmax + 1)
@@ -811,7 +813,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                         out_blocks[l] = yg
                 physical_out[name] = out_blocks
 
-        scalars = torch.zeros(f_combine.shape[0], (self.num_interaction - 1) * 32, device=f_combine.device, dtype=f_combine.dtype)
+        scalars = torch.zeros(
+            f_combine.shape[0],
+            (self.num_interaction - 1) * self.invariant_channels,
+            device=f_combine.device,
+            dtype=f_combine.dtype,
+        )
         for l in range(self.lmax + 1):
             t = xb[l]  # (N,nC,2l+1)
             # e3nn-style component normalization: divide by sqrt(2l+1)
@@ -886,4 +893,3 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             assert reciprocal_source is not None
             return e_scalar, reciprocal_source
         return e_scalar
-

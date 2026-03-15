@@ -259,7 +259,7 @@ mff-export-core \
 ```bash
 python - <<'PY'
 import torch
-from molecular_force_field.interfaces.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd
+from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd
 _make_dummy_checkpoint_pure_cartesian_ictd("dummy.pth", device=torch.device("cpu"))
 print("dummy.pth 已生成")
 PY

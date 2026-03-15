@@ -533,7 +533,7 @@ python -m molecular_force_field.interfaces.lammps_potential \
 **ML-IAP 接口：**
 
 ```bash
-python -m molecular_force_field.interfaces.test_mliap
+python -m molecular_force_field.test.test_mliap
 ```
 
 会依次测试 atom forces 数值一致性（AtomForcesWrapper）、legacy edge forces 一致性、导出/加载往返、以及 LAMMPS 联机（需已编译 ML-IAP）。

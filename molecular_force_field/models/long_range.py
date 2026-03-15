@@ -1845,3 +1845,213 @@ def build_long_range_module(
             assignment=assignment,
         )
     raise ValueError(f"Unsupported long_range_mode: {mode!r}")
+
+
+def configure_long_range_modules(
+    owner: nn.Module,
+    *,
+    feature_dim: int,
+    cutoff_radius: float,
+    long_range_mode: str = "none",
+    long_range_hidden_dim: int = 64,
+    long_range_boundary: str = "nonperiodic",
+    long_range_neutralize: bool = True,
+    long_range_filter_hidden_dim: int = 64,
+    long_range_kmax: int = 2,
+    long_range_mesh_size: int = 16,
+    long_range_slab_padding_factor: int = 2,
+    long_range_include_k0: bool = False,
+    long_range_source_channels: int = 1,
+    long_range_backend: str = "dense_pairwise",
+    long_range_reciprocal_backend: str = "direct_kspace",
+    long_range_energy_partition: str = "potential",
+    long_range_green_mode: str = "poisson",
+    long_range_assignment: str = "cic",
+    long_range_theta: float = 0.5,
+    long_range_leaf_size: int = 32,
+    long_range_multipole_order: int = 0,
+    long_range_far_source_dim: int = 16,
+    long_range_far_num_shells: int = 3,
+    long_range_far_shell_growth: float = 2.0,
+    long_range_far_tail: bool = True,
+    long_range_far_tail_bins: int = 2,
+    long_range_far_stats: str = "mean,count,mean_r,rms_r",
+    long_range_far_max_radius_multiplier: float | None = None,
+    long_range_far_source_norm: bool = True,
+    long_range_far_gate_init: float = 0.0,
+    feature_spectral_mode: str = "none",
+    feature_spectral_bottleneck_dim: int = 8,
+    feature_spectral_mesh_size: int = 16,
+    feature_spectral_filter_hidden_dim: int = 64,
+    feature_spectral_boundary: str = "periodic",
+    feature_spectral_slab_padding_factor: int = 2,
+    feature_spectral_neutralize: bool = True,
+    feature_spectral_include_k0: bool = False,
+    feature_spectral_gate_init: float = 0.0,
+) -> None:
+    owner.long_range_mode = str(long_range_mode)
+    owner.long_range_hidden_dim = int(long_range_hidden_dim)
+    owner.long_range_boundary = str(long_range_boundary)
+    owner.long_range_neutralize = bool(long_range_neutralize)
+    owner.long_range_filter_hidden_dim = int(long_range_filter_hidden_dim)
+    owner.long_range_kmax = int(long_range_kmax)
+    owner.long_range_mesh_size = int(long_range_mesh_size)
+    owner.long_range_slab_padding_factor = int(long_range_slab_padding_factor)
+    owner.long_range_include_k0 = bool(long_range_include_k0)
+    owner.long_range_source_channels = int(long_range_source_channels)
+    owner.long_range_backend = str(long_range_backend)
+    owner.long_range_reciprocal_backend = str(long_range_reciprocal_backend)
+    owner.long_range_energy_partition = str(long_range_energy_partition)
+    owner.long_range_green_mode = str(long_range_green_mode)
+    owner.long_range_assignment = str(long_range_assignment)
+    owner.long_range_theta = float(long_range_theta)
+    owner.long_range_leaf_size = int(long_range_leaf_size)
+    owner.long_range_multipole_order = int(long_range_multipole_order)
+    owner.long_range_far_source_dim = int(long_range_far_source_dim)
+    owner.long_range_far_num_shells = int(long_range_far_num_shells)
+    owner.long_range_far_shell_growth = float(long_range_far_shell_growth)
+    owner.long_range_far_tail = bool(long_range_far_tail)
+    owner.long_range_far_tail_bins = int(long_range_far_tail_bins)
+    owner.long_range_far_stats = str(long_range_far_stats)
+    owner.long_range_far_max_radius_multiplier = (
+        None if long_range_far_max_radius_multiplier is None else float(long_range_far_max_radius_multiplier)
+    )
+    owner.long_range_far_source_norm = bool(long_range_far_source_norm)
+    owner.long_range_far_gate_init = float(long_range_far_gate_init)
+    owner.feature_spectral_mode = str(feature_spectral_mode)
+    owner.feature_spectral_bottleneck_dim = int(feature_spectral_bottleneck_dim)
+    owner.feature_spectral_mesh_size = int(feature_spectral_mesh_size)
+    owner.feature_spectral_filter_hidden_dim = int(feature_spectral_filter_hidden_dim)
+    owner.feature_spectral_boundary = str(feature_spectral_boundary)
+    owner.feature_spectral_slab_padding_factor = int(feature_spectral_slab_padding_factor)
+    owner.feature_spectral_neutralize = bool(feature_spectral_neutralize)
+    owner.feature_spectral_include_k0 = bool(feature_spectral_include_k0)
+    owner.feature_spectral_gate_init = float(feature_spectral_gate_init)
+
+    owner.long_range_module = build_long_range_module(
+        mode=owner.long_range_mode,
+        feature_dim=int(feature_dim),
+        hidden_dim=owner.long_range_hidden_dim,
+        boundary=owner.long_range_boundary,
+        neutralize=owner.long_range_neutralize,
+        filter_hidden_dim=owner.long_range_filter_hidden_dim,
+        kmax=owner.long_range_kmax,
+        mesh_size=owner.long_range_mesh_size,
+        slab_padding_factor=owner.long_range_slab_padding_factor,
+        include_k0=owner.long_range_include_k0,
+        source_channels=owner.long_range_source_channels,
+        backend=owner.long_range_backend,
+        reciprocal_backend=owner.long_range_reciprocal_backend,
+        energy_partition=owner.long_range_energy_partition,
+        green_mode=owner.long_range_green_mode,
+        assignment=owner.long_range_assignment,
+        theta=owner.long_range_theta,
+        leaf_size=owner.long_range_leaf_size,
+        multipole_order=owner.long_range_multipole_order,
+        far_source_dim=owner.long_range_far_source_dim,
+        far_num_shells=owner.long_range_far_num_shells,
+        far_shell_growth=owner.long_range_far_shell_growth,
+        far_tail=owner.long_range_far_tail,
+        far_tail_bins=owner.long_range_far_tail_bins,
+        far_stats=owner.long_range_far_stats,
+        far_max_radius_multiplier=owner.long_range_far_max_radius_multiplier,
+        far_source_norm=owner.long_range_far_source_norm,
+        far_gate_init=owner.long_range_far_gate_init,
+        cutoff_radius=float(cutoff_radius),
+    )
+    owner.long_range_num_k = (
+        getattr(owner.long_range_module, "num_k", None) if owner.long_range_module is not None else None
+    )
+    owner.feature_spectral_module = build_feature_spectral_module(
+        mode=owner.feature_spectral_mode,
+        feature_dim=int(feature_dim),
+        bottleneck_dim=owner.feature_spectral_bottleneck_dim,
+        mesh_size=owner.feature_spectral_mesh_size,
+        filter_hidden_dim=owner.feature_spectral_filter_hidden_dim,
+        boundary=owner.feature_spectral_boundary,
+        slab_padding_factor=owner.feature_spectral_slab_padding_factor,
+        neutralize=owner.feature_spectral_neutralize,
+        include_k0=owner.feature_spectral_include_k0,
+        gate_init=owner.feature_spectral_gate_init,
+    )
+    owner.long_range_runtime_backend = "none"
+    owner.long_range_runtime_source_kind = "none"
+    owner.long_range_runtime_source_channels = 0
+    owner.long_range_runtime_source_layout = "none"
+    owner.long_range_runtime_source_boundary = owner.long_range_boundary
+    owner.long_range_runtime_source_slab_padding_factor = owner.long_range_slab_padding_factor
+    if owner.long_range_module is not None and bool(getattr(owner.long_range_module, "exports_reciprocal_source", False)):
+        owner.long_range_runtime_backend = str(getattr(owner.long_range_module, "runtime_backend", "none"))
+        owner.long_range_runtime_source_kind = str(getattr(owner.long_range_module, "source_kind", "latent_charge"))
+        owner.long_range_runtime_source_channels = int(
+            getattr(owner.long_range_module, "source_channels", owner.long_range_source_channels)
+        )
+        owner.long_range_runtime_source_layout = str(getattr(owner.long_range_module, "source_layout", "channels_last"))
+        owner.long_range_runtime_source_boundary = owner.long_range_boundary
+        owner.long_range_runtime_source_slab_padding_factor = owner.long_range_slab_padding_factor
+        owner.reciprocal_source_channels = owner.long_range_runtime_source_channels
+        owner.reciprocal_source_boundary = owner.long_range_runtime_source_boundary
+        owner.reciprocal_source_slab_padding_factor = owner.long_range_runtime_source_slab_padding_factor
+    elif owner.feature_spectral_module is not None:
+        owner.long_range_runtime_backend = "mesh_fft"
+        owner.long_range_runtime_source_kind = "feature_bottleneck"
+        owner.long_range_runtime_source_channels = owner.feature_spectral_bottleneck_dim
+        owner.long_range_runtime_source_layout = "channels_last"
+        owner.long_range_runtime_source_boundary = owner.feature_spectral_boundary
+        owner.long_range_runtime_source_slab_padding_factor = owner.feature_spectral_slab_padding_factor
+        owner.reciprocal_source_channels = owner.feature_spectral_bottleneck_dim
+        owner.reciprocal_source_boundary = owner.feature_spectral_boundary
+        owner.reciprocal_source_slab_padding_factor = owner.feature_spectral_slab_padding_factor
+    else:
+        owner.reciprocal_source_channels = 0
+        owner.reciprocal_source_boundary = "periodic"
+        owner.reciprocal_source_slab_padding_factor = 2
+
+
+def apply_long_range_modules(
+    owner: nn.Module,
+    invariant_features: torch.Tensor,
+    pos: torch.Tensor,
+    batch: torch.Tensor,
+    cell: torch.Tensor,
+    *,
+    edge_src: torch.Tensor,
+    edge_dst: torch.Tensor,
+    return_reciprocal_source: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
+    feature_reciprocal_source = None
+    if getattr(owner, "feature_spectral_module", None) is not None:
+        invariant_features, feature_reciprocal_source = owner.feature_spectral_module(
+            invariant_features,
+            pos,
+            batch,
+            cell,
+        )
+
+    long_range_energy = None
+    reciprocal_source = None
+    defer_long_range_to_runtime = False
+    if getattr(owner, "long_range_module", None) is not None:
+        if return_reciprocal_source and bool(getattr(owner.long_range_module, "exports_reciprocal_source", False)):
+            long_range_energy, reciprocal_source = owner.long_range_module(
+                invariant_features,
+                pos,
+                batch,
+                cell,
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+                return_source=True,
+            )
+            defer_long_range_to_runtime = reciprocal_source.numel() > 0
+        else:
+            long_range_energy = owner.long_range_module(
+                invariant_features,
+                pos,
+                batch,
+                cell,
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+            )
+    if reciprocal_source is None:
+        reciprocal_source = feature_reciprocal_source
+    return invariant_features, long_range_energy, reciprocal_source, defer_long_range_to_runtime

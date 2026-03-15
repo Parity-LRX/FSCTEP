@@ -4,7 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods. **Highlights**: embed **external fields** (e.g., electric field) into the equivariant message passing, and train **physical tensors** (charge, dipole, polarizability, quadrupole) as supervised outputs—both supported in `pure-cartesian-ictd` mode.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods. **Highlights**: embed **external fields** (e.g., electric field) into the equivariant message passing, and train **physical tensors** (charge, dipole, polarizability, quadrupole) as supervised outputs—supported in `pure-cartesian-ictd`, `pure-cartesian-sparse`, and `pure-cartesian-sparse-save`.
 
 ## ✨ Features
 
@@ -20,10 +20,22 @@
   
 - **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
 
-- **External Fields & Physical Tensors** (pure-cartesian-ictd):
+- **Configurable Invariant Readout Width**:
+  - `--invariant-channels` controls the scalar invariant channel width used by the product-3 style readout blocks in `spherical`, `spherical-save`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`, and `pure-cartesian-ictd-save`
+  - Default is `32`, which matches the previous hard-coded behavior
+  - `spherical-save-cue` does not use this parameter; even if a checkpoint carries `invariant_channels`, that field is ignored by the cuEquivariance channelwise backend
+  - The value is stored in checkpoint metadata and restored automatically by training resume, `mff-evaluate`, active learning loaders, thermal loaders, `mff-export-core`, and `export_mliap`
+
+- **External Fields & Physical Tensors** (`pure-cartesian-ictd`, `pure-cartesian-sparse`, `pure-cartesian-sparse-save`):
   - **External field embedding**: Inject global tensors (e.g., electric field, rank-1) into conv1 for field-dependent potentials
   - **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
   - Configurable loss weights, checkpoint-based inference mode; LAMMPS/TorchScript export outputs energy+forces only
+
+- **Optional ZBL Short-Range Repulsion**:
+  - Adds a universal `Ziegler-Biersack-Littmark (ZBL)` short-range repulsive correction on top of the learned per-atom energy
+  - Intended for high-energy close-contact configurations such as collision cascades, irradiation, ion implantation, and general short-range stabilization
+  - The configuration is stored in checkpoint metadata and is automatically restored by `mff-train`, `mff-evaluate`, `mff-export-core`, `export_mliap`, ASE calculators, active learning loaders, and thermal loaders
+  - Current controls: `--zbl-enabled`, `--zbl-inner-cutoff`, `--zbl-outer-cutoff`, `--zbl-exponent`, `--zbl-energy-scale`
 
 - **Prototype Long-Range Modules** (`pure-cartesian-ictd`, `spherical-save-cue`):
   - `latent-coulomb`: latent-charge real-space prototype
@@ -52,6 +64,7 @@
   
 - **CLI Commands**:
   - `mff-preprocess` - Data preprocessing
+  - `mff-convert-dataset` - Convert common MLFF datasets to extxyz
   - `mff-train` - Training
   - `mff-evaluate` - Evaluation (static/MD/NEB/phonon)
   - `mff-active-learn` - Active learning loop (explore, select, label, merge)
@@ -60,10 +73,11 @@
   - `python -m molecular_force_field.cli.export_mliap` - Export ML-IAP format
 - `python -m molecular_force_field.cli.thermal_transport` - IFC2/IFC3, intrinsic BTE, and Callaway thermal workflow
   - `torchrun -m molecular_force_field.cli.inference_ddp` - Large-scale multi-GPU inference (pure-cartesian-ictd only)
+
+Dataset notes and conversion examples are in [DATASETS.md](DATASETS.md).
   
 - **Easy to Use**:
   - Simple command-line interface
-  - Python API for custom workflows
   - Automatic data preprocessing
   - Checkpoint management with mode detection
   
@@ -148,7 +162,7 @@ This pulls in `phono3py` and `scipy`. See [THERMAL_TRANSPORT.md](THERMAL_TRANSPO
 Preprocess your Extended XYZ file:
 
 ```bash
-mff-preprocess --input-file data.xyz --output-dir data --max-atom 40
+mff-preprocess --input-file data.xyz --output-dir data
 ```
 
 This will:
@@ -156,12 +170,26 @@ This will:
 - Split into training and validation sets
 - Fit baseline atomic energies
 - Save preprocessed data to HDF5 and CSV formats
+- Save `read_{train,val}.h5` in variable-length per-sample groups by default
 - Precompute neighbor lists and write `processed_{train,val}.h5` by default
 
 To skip neighbor list preprocessing (for quick sanity-check):
 
 ```bash
-mff-preprocess --input-file data.xyz --output-dir data --max-atom 40 --skip-h5
+mff-preprocess --input-file data.xyz --output-dir data --skip-h5
+```
+
+If your `extxyz` uses custom field names, you can override them explicitly:
+
+```bash
+mff-preprocess \
+  --input-file custom.extxyz \
+  --output-dir data \
+  --energy-key REF_energy \
+  --force-key REF_force \
+  --species-key elem \
+  --coord-key coords \
+  --atomic-number-key atomic_number
 ```
 
 ### 2. Training
@@ -194,16 +222,32 @@ mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-pr
 mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
 ```
 
-Train with external field and physical tensors (pure-cartesian-ictd only):
+Train with external field and physical tensors (`pure-cartesian-ictd`, `pure-cartesian-sparse`, or `pure-cartesian-sparse-save`):
 
 ```bash
 # External electric field + dipole/polarizability training
-mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse \
   --external-tensor-rank 1 --external-field-file data/efield.npy \
   --physical-tensors dipole,polarizability \
   --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
   --physical-tensor-weights "dipole:2.0,polarizability:1.0"
 ```
+
+Train with ZBL short-range repulsion:
+
+```bash
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+  --zbl-enabled \
+  --zbl-inner-cutoff 0.6 \
+  --zbl-outer-cutoff 1.2 \
+  --zbl-exponent 0.23 \
+  --zbl-energy-scale 1.0
+```
+
+Notes:
+- ZBL is implemented as a short-range energy correction outside the tensor-product backbone, so it is compatible with all tensor-product modes in the Python training/evaluation stack.
+- For `core.pt` export, the usual TorchScript mode restrictions still apply: currently `pure-cartesian-ictd`, `pure-cartesian-ictd-save`, and `spherical-save-cue`.
+- Once written into the checkpoint, the ZBL settings are restored automatically during evaluation and export; you do not need to pass them again to `mff-export-core` or `export_mliap`.
 
 Train with LES-style long-range (`mesh_fft`, recommended first-stage settings):
 
@@ -259,7 +303,7 @@ Evaluate a trained model. The recommended default is to let `mff-evaluate` resto
 mff-evaluate --checkpoint combined_model.pth --test-prefix test --output-prefix test --use-h5
 ```
 
-If you explicitly pass conflicting structure arguments such as `--tensor-product-mode`, `--embedding-dim`, or `--output-size`, the CLI takes precedence over the checkpoint. For new checkpoints, `mff-evaluate` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint; older checkpoints still fall back to local `fitted_E0.csv` behavior. Only pass those arguments when you intentionally want to override the checkpoint configuration.
+If you explicitly pass conflicting structure arguments such as `--tensor-product-mode`, `--embedding-dim`, `--output-size`, or `--invariant-channels`, the CLI takes precedence over the checkpoint. For new checkpoints, `mff-evaluate` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint; older checkpoints still fall back to local `fitted_E0.csv` behavior. Only pass those arguments when you intentionally want to override the checkpoint configuration.
 
 Outputs include:
 - `test_loss.csv`
@@ -348,6 +392,7 @@ FusedSCEquiTensorPot supports three LAMMPS integration methods:
    ```
 
    `mff-export-core` restores structure hyperparameters such as `tensor_product_mode`, `max_radius`, and `num_interaction` from the checkpoint by default. It now embeds E0 by default as well. New checkpoints store `atomic_energy_keys/atomic_energy_values`, so checkpoint E0 is usually enough; if `--e0-csv` is passed explicitly, the CLI wins. Older checkpoints still fall back to local `fitted_E0.csv`. Use `--no-embed-e0` only if you explicitly want to export network energy without E0.
+   If the checkpoint was trained with ZBL enabled, the exported `core.pt` will include the same short-range ZBL correction automatically.
 
 2. **Build LAMMPS**: Enable `PKG_KOKKOS` and `PKG_USER-MFFTORCH`. See [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](lammps_user_mfftorch/docs/BUILD_AND_RUN.md).
 
@@ -361,6 +406,8 @@ FusedSCEquiTensorPot supports three LAMMPS integration methods:
 pair_style mff/torch 5.0 cuda
 pair_coeff * * /path/to/core.pt H O
 ```
+
+If `core.pt` came from a checkpoint with ZBL enabled, no extra LAMMPS keyword is needed: the ZBL short-range repulsion is already embedded in the exported TorchScript model.
 
 For `pure-cartesian-ictd` checkpoints exported with external-field architecture, USER-MFFTORCH also supports a runtime rank-1 external field:
 
@@ -413,6 +460,7 @@ Notes:
 - `pure-cartesian` and `pure-cartesian-sparse` are still not supported by `export_mliap`.
 - `export_mliap` also restores structure hyperparameters from the checkpoint by default. If conflicting CLI values are passed explicitly, the CLI wins.
 - For new checkpoints, `export_mliap` can also restore `atomic_energy_keys/atomic_energy_values` directly from the checkpoint. Older checkpoints still fall back to local `fitted_E0.csv`.
+- If the checkpoint was trained with ZBL enabled, the exported `model-mliap.pt` carries the same ZBL correction automatically.
 
 ### Thermal Transport Workflow
 
@@ -457,238 +505,6 @@ Outputs include `fc2.hdf5`, `fc3.hdf5`, `kappa-*.hdf5`, and Callaway CSV/JSON su
 For the detailed workflow, fitting strategy, and engineering notes, see [`THERMAL_TRANSPORT.md`](THERMAL_TRANSPORT.md).
 
 See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for full documentation.
-
-## Python API
-
-The library supports **eight tensor product modes**. Here's how to use them in Python:
-
-### Basic Usage (Spherical Mode - Default)
-
-```python
-from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
-from molecular_force_field.data import H5Dataset
-from molecular_force_field.data.collate import collate_fn_h5
-from molecular_force_field.training.trainer import Trainer
-from molecular_force_field.utils.config import ModelConfig
-from torch.utils.data import DataLoader
-import torch
-
-# Load dataset
-train_dataset = H5Dataset('train')
-val_dataset = H5Dataset('val')
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=8,
-    shuffle=True,
-    collate_fn=collate_fn_h5
-)
-
-# Initialize model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-config = ModelConfig()
-
-model = MainNet(
-    input_size=config.input_dim_weight,
-    hidden_sizes=config.main_hidden_sizes4,
-    output_size=1
-).to(device)
-
-# Spherical mode (default, e3nn-based)
-e3trans = E3_TransformerLayer_multi(
-    max_embed_radius=config.max_radius,
-    main_max_radius=config.max_radius_main,
-    main_number_of_basis=config.number_of_basis_main,
-    irreps_input=config.get_irreps_output_conv(),
-    irreps_query=config.get_irreps_query_main(),
-    irreps_key=config.get_irreps_key_main(),
-    irreps_value=config.get_irreps_value_main(),
-    irreps_output=config.get_irreps_output_conv_2(),
-    irreps_sh=config.get_irreps_sh_transformer(),
-    hidden_dim_sh=config.get_hidden_dim_sh(),
-    hidden_dim=config.emb_number_main_2,
-    channel_in2=config.channel_in2,
-    embedding_dim=config.embedding_dim,
-    max_atomvalue=config.max_atomvalue,
-    output_size=config.output_size,
-    embed_size=config.embed_size,
-    main_hidden_sizes3=config.main_hidden_sizes3,
-    num_layers=config.num_layers,
-    function_type_main=config.function_type,
-    device=device
-).to(device)
-
-# Train
-trainer = Trainer(
-    model=model,
-    e3trans=e3trans,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    train_dataset=train_dataset,
-    val_dataset=val_dataset,
-    device=device,
-    config=config,
-)
-
-trainer.run_training()
-```
-
-### Using Different Tensor Product Modes
-
-```python
-from molecular_force_field.models import (
-    E3_TransformerLayer_multi,           # spherical mode
-    CartesianTransformerLayer,           # partial-cartesian mode
-    CartesianTransformerLayerLoose,      # partial-cartesian-loose mode
-    PureCartesianTransformerLayer,       # pure-cartesian mode
-    PureCartesianSparseTransformerLayer, # pure-cartesian-sparse mode
-    PureCartesianICTDTransformerLayer,  # pure-cartesian-ictd mode
-    MainNet
-)
-from molecular_force_field.utils.config import ModelConfig
-import torch
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-config = ModelConfig()
-
-# Choose tensor product mode
-tensor_product_mode = "pure-cartesian-ictd"  # Options: spherical, spherical-save, spherical-save-cue,
-                                              # partial-cartesian, partial-cartesian-loose,
-                                              # pure-cartesian, pure-cartesian-sparse,
-                                              # pure-cartesian-ictd, pure-cartesian-ictd-save
-
-if tensor_product_mode == 'spherical':
-    e3trans = E3_TransformerLayer_multi(
-        max_embed_radius=config.max_radius,
-        main_max_radius=config.max_radius_main,
-        main_number_of_basis=config.number_of_basis_main,
-        irreps_input=config.get_irreps_output_conv(),
-        irreps_query=config.get_irreps_query_main(),
-        irreps_key=config.get_irreps_key_main(),
-        irreps_value=config.get_irreps_value_main(),
-        irreps_output=config.get_irreps_output_conv_2(),
-        irreps_sh=config.get_irreps_sh_transformer(),
-        hidden_dim_sh=config.get_hidden_dim_sh(),
-        hidden_dim=config.emb_number_main_2,
-        channel_in2=config.channel_in2,
-        embedding_dim=config.embedding_dim,
-        max_atomvalue=config.max_atomvalue,
-        output_size=config.output_size,
-        embed_size=config.embed_size,
-        main_hidden_sizes3=config.main_hidden_sizes3,
-        num_layers=config.num_layers,
-        function_type_main=config.function_type,
-        device=device
-    ).to(device)
-elif tensor_product_mode == 'partial-cartesian':
-    e3trans = CartesianTransformerLayer(
-        max_embed_radius=config.max_radius,
-        main_max_radius=config.max_radius_main,
-        main_number_of_basis=config.number_of_basis_main,
-        hidden_dim_conv=config.channel_in,
-        hidden_dim_sh=config.get_hidden_dim_sh(),
-        hidden_dim=config.emb_number_main_2,
-        channel_in2=config.channel_in2,
-        embedding_dim=config.embedding_dim,
-        max_atomvalue=config.max_atomvalue,
-        output_size=config.output_size,
-        embed_size=config.embed_size,
-        main_hidden_sizes3=config.main_hidden_sizes3,
-        num_layers=config.num_layers,
-        function_type_main=config.function_type,
-        lmax=config.lmax,
-        device=device
-    ).to(device)
-elif tensor_product_mode == 'partial-cartesian-loose':
-    e3trans = CartesianTransformerLayerLoose(
-        max_embed_radius=config.max_radius,
-        main_max_radius=config.max_radius_main,
-        main_number_of_basis=config.number_of_basis_main,
-        hidden_dim_conv=config.channel_in,
-        hidden_dim_sh=config.get_hidden_dim_sh(),
-        hidden_dim=config.emb_number_main_2,
-        channel_in2=config.channel_in2,
-        embedding_dim=config.embedding_dim,
-        max_atomvalue=config.max_atomvalue,
-        output_size=config.output_size,
-        embed_size=config.embed_size,
-        main_hidden_sizes3=config.main_hidden_sizes3,
-        num_layers=config.num_layers,
-        function_type_main=config.function_type,
-        lmax=config.lmax,
-        device=device
-    ).to(device)
-elif tensor_product_mode == 'pure-cartesian-sparse':
-    e3trans = PureCartesianSparseTransformerLayer(
-        max_embed_radius=config.max_radius,
-        main_max_radius=config.max_radius_main,
-        main_number_of_basis=config.number_of_basis_main,
-        hidden_dim_conv=config.channel_in,
-        hidden_dim_sh=config.get_hidden_dim_sh(),
-        hidden_dim=config.emb_number_main_2,
-        channel_in2=config.channel_in2,
-        embedding_dim=config.embedding_dim,
-        max_atomvalue=config.max_atomvalue,
-        output_size=config.output_size,
-        embed_size=config.embed_size,
-        main_hidden_sizes3=config.main_hidden_sizes3,
-        num_layers=config.num_layers,
-        function_type_main=config.function_type,
-        lmax=config.lmax,
-        max_rank_other=1,  # Restrict to rank≤1 interactions
-        k_policy='k0',     # Delta contraction policy
-        device=device
-    ).to(device)
-elif tensor_product_mode == 'pure-cartesian-ictd':
-    e3trans = PureCartesianICTDTransformerLayer(
-        max_embed_radius=config.max_radius,
-        main_max_radius=config.max_radius_main,
-        main_number_of_basis=config.number_of_basis_main,
-        hidden_dim_conv=config.channel_in,
-        hidden_dim_sh=config.get_hidden_dim_sh(),
-        hidden_dim=config.emb_number_main_2,
-        channel_in2=config.channel_in2,
-        embedding_dim=config.embedding_dim,
-        max_atomvalue=config.max_atomvalue,
-        output_size=config.output_size,
-        embed_size=config.embed_size,
-        main_hidden_sizes3=config.main_hidden_sizes3,
-        num_layers=config.num_layers,
-        function_type_main=config.function_type,
-        lmax=config.lmax,
-        ictd_tp_path_policy='full',  # Path pruning: 'full' or 'max_rank_other'
-        ictd_tp_max_rank_other=None, # Max rank for sparse paths (if path_policy='max_rank_other')
-        device=device
-    ).to(device)
-elif tensor_product_mode == 'pure-cartesian':
-    e3trans = PureCartesianTransformerLayer(
-        max_embed_radius=config.max_radius,
-        main_max_radius=config.max_radius_main,
-        main_number_of_basis=config.number_of_basis_main,
-        hidden_dim_conv=config.channel_in,
-        hidden_dim_sh=config.get_hidden_dim_sh(),
-        hidden_dim=config.emb_number_main_2,
-        channel_in2=config.channel_in2,
-        embedding_dim=config.embedding_dim,
-        max_atomvalue=config.max_atomvalue,
-        output_size=config.output_size,
-        embed_size=config.embed_size,
-        main_hidden_sizes3=config.main_hidden_sizes3,
-        num_layers=config.num_layers,
-        function_type_main=config.function_type,
-        lmax=config.lmax,
-        device=device
-    ).to(device)
-
-# Initialize main network
-model = MainNet(
-    input_size=config.input_dim_weight,
-    hidden_sizes=config.main_hidden_sizes4,
-    output_size=1
-).to(device)
-
-# Continue with training...
-```
 
 ## Project Structure
 
@@ -905,4 +721,3 @@ If you use this library in your research, please cite:
   url = {https://github.com/Parity-LRX/FusedSCEquiTensorPot}
 }
 ```
-

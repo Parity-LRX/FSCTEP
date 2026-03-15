@@ -61,9 +61,7 @@ First, you need to preprocess your raw XYZ file into a format that the library c
 mff-preprocess \
     --input-file 2000.xyz \
     --output-dir data \
-    --max-atom 5 \
     --train-ratio 0.95 \
-    --preprocess-h5 \
     --max-radius 5.0 \
     --num-workers 8
 ```
@@ -71,19 +69,40 @@ mff-preprocess \
 **Parameter Description:**
 - `--input-file`: Path to input XYZ file
 - `--output-dir`: Output directory (default 'data'), all preprocessed files will be saved in this directory
-- `--max-atom`: Maximum number of atoms per structure (for padding)
+- `--max-atom`: Optional legacy padded raw-storage size; by default `read_{train,val}.h5` uses variable-length per-sample groups
 - `--train-ratio`: Training set ratio (default 0.95)
-- `--preprocess-h5`: Whether to preprocess H5 files (precompute neighbor lists to accelerate training)
 - `--max-radius`: Maximum radius for neighbor search
 - `--num-workers`: Number of parallel processing workers
 
 **Output Files (in `data/` directory):**
-- `read_train.h5`, `read_val.h5` - Atomic data
+- `read_train.h5`, `read_val.h5` - Raw atomic data (variable-length `sample_i` groups by default; legacy padded format if `--max-atom` is set)
 - `raw_energy_train.h5`, `raw_energy_val.h5` - Raw energies
 - `correction_energy_train.h5`, `correction_energy_val.h5` - Correction energies
 - `cell_train.h5`, `cell_val.h5` - Cell information
 - `processed_train.h5`, `processed_val.h5` - Preprocessed data (if --preprocess-h5 is used)
 - `fitted_E0.csv` - Fitted atomic reference energies (default: fitted from training set using least squares)
+
+**Override custom extxyz keys**:
+
+If your `extxyz` does not use the default `energy=...` plus `Properties=species:...:pos:...:force:...:Z:...` naming, you can override the keys explicitly:
+
+```bash
+mff-preprocess \
+    --input-file custom.extxyz \
+    --output-dir data \
+    --energy-key REF_energy \
+    --force-key REF_force \
+    --species-key elem \
+    --coord-key coords \
+    --atomic-number-key atomic_number
+```
+
+Default search rules:
+- `energy`: `energy=...` in the comment line
+- `force`: `force` / `forces` / `f`
+- `species`: `species` / `symbol` / `element`
+- `coord`: `pos`
+- `atomic number`: `Z` / `atomic_number`
 
 ### Step 2: Train Model
 
@@ -147,21 +166,128 @@ mff-train \
     --atomic-energy-values -430.53299511 -821.03326787 -1488.18856918 -2044.3509823
 ```
 
-**External Fields & Physical Tensor Training** (pure-cartesian-ictd only):
+**ZBL Short-Range Repulsion** (Optional, recommended for high-energy close-contact configurations):
+
+ZBL (`Ziegler-Biersack-Littmark`) is a classical short-range nucleus-nucleus repulsive potential. FSCETP can now add it as a unified short-range correction on top of the learned energy output to improve physical behavior at very small interatomic distances. Typical use cases include:
+
+- irradiation damage, collision cascades, and ion implantation
+- very close atomic contacts at high temperature or high pressure
+- preventing unphysical short-range attraction in regions not covered by training data
+
+Example: enable ZBL during training
+
+```bash
+mff-train \
+    --data-dir data \
+    --tensor-product-mode pure-cartesian-ictd \
+    --zbl-enabled \
+    --zbl-inner-cutoff 0.6 \
+    --zbl-outer-cutoff 1.2 \
+    --zbl-exponent 0.23 \
+    --zbl-energy-scale 1.0
+```
+
+Parameter summary:
+
+| Parameter | Description |
+|-----------|-------------|
+| `--zbl-enabled` | Enable ZBL short-range repulsion |
+| `--zbl-inner-cutoff` | Inner cutoff in Angstrom. Full ZBL is applied below this distance |
+| `--zbl-outer-cutoff` | Outer cutoff in Angstrom. ZBL is smoothly switched to zero beyond this distance |
+| `--zbl-exponent` | Exponent used in the screening-length expression; the common default is `0.23` |
+| `--zbl-energy-scale` | Global multiplicative scale for the ZBL energy term; `1.0` means standard strength |
+
+Practical notes:
+
+- You must keep `--zbl-inner-cutoff < --zbl-outer-cutoff`
+- If your training set does not contain ultra-short contacts, a good starting point is `0.6 / 1.2 / 0.23 / 1.0`
+- If your training data already covers the short-range collision regime explicitly, tune the cutoffs carefully to avoid double-counting the learned short-range behavior
+- ZBL is attached as a unified correction layer outside the tensor-product backbone, so it works across the Python training/evaluation/ASE/ML-IAP stack; `core.pt` export still follows the existing TorchScript-supported mode restrictions
+
+Where the constants come from:
+
+- `14.399645...` is \(\frac{e^2}{4\pi\varepsilon_0}\) expressed in `eV·Angstrom`
+- `0.529177... Angstrom` is the Bohr radius \(a_0\)
+- The `0.8854` prefactor and default exponent `0.23` in the screening length come from the standard ZBL parameterization:
+  \[
+  a_{ij} = \frac{0.8854 a_0}{Z_i^{p} + Z_j^{p}}, \quad p=0.23
+  \]
+- The screening function
+  \[
+  \phi(x)=0.1818e^{-3.2x}+0.5099e^{-0.9423x}+0.2802e^{-0.4029x}+0.02817e^{-0.2016x}
+  \]
+  uses the standard universal ZBL fitted coefficients and exponents
+- The quintic smoothstep
+  \[
+  1-10t^3+15t^4-6t^5
+  \]
+  is not an original ZBL physical constant; it is a numerical switching function used to keep both energy and forces smooth between the inner and outer cutoffs
+
+In the current implementation, the pair potential is:
+
+\[
+E_{ij}^{\mathrm{ZBL}}(r)
+=
+s(r)\,\lambda\,
+14.3996454784255
+\frac{Z_i Z_j}{r}
+\phi\!\left(\frac{r}{a_{ij}}\right)
+\]
+
+where \(\lambda = \texttt{zbl\_energy\_scale}\) and \(s(r)\) is the smooth switching function defined by `--zbl-inner-cutoff` and `--zbl-outer-cutoff`.
+
+Checkpoint and downstream behavior:
+
+- ZBL settings are saved into checkpoint metadata
+- `mff-evaluate` restores the saved ZBL configuration by default
+- `mff-export-core` and `python -m molecular_force_field.cli.export_mliap` also inherit the ZBL configuration from the checkpoint automatically
+- In normal workflows you usually enable ZBL once during training, then reuse the saved checkpoint for evaluation and export without retyping the ZBL arguments
+
+`--invariant-channels` (scalar invariant readout width):
+
+- This parameter controls the scalar invariant channel width used by the product-3 style readout blocks in several tensor-product backbones; the default is `32`
+- Supported modes: `spherical`, `spherical-save`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`, `pure-cartesian-ictd-save`
+- `spherical-save-cue` does not use this parameter; even if a checkpoint stores `invariant_channels`, that field is ignored by the cuEquivariance channelwise backend
+- The previous behavior was equivalent to `--invariant-channels 32`; it is now exposed through the CLI, for example:
+
+```bash
+mff-train \
+    --data-dir data \
+    --tensor-product-mode pure-cartesian-ictd \
+    --invariant-channels 64
+```
+
+- After training, `invariant_channels` is written into checkpoint `model_hyperparameters`
+- Resume training, `mff-evaluate`, active learning loaders, thermal loaders, `mff-export-core`, and `python -m molecular_force_field.cli.export_mliap` all restore it from the checkpoint automatically
+- In practice, active learning usually does not need `--invariant-channels` to be typed again unless you intentionally want to override the checkpoint architecture
+
+Example: explicit override during evaluation
+
+```bash
+mff-evaluate \
+    --checkpoint checkpoint/combined_model_pure_cartesian_ictd.pth \
+    --input-file test.xyz \
+    --tensor-product-mode pure-cartesian-ictd \
+    --zbl-enabled \
+    --zbl-inner-cutoff 0.6 \
+    --zbl-outer-cutoff 1.2
+```
+
+**External Fields & Physical Tensor Training** (`pure-cartesian-ictd`, `pure-cartesian-sparse`, `pure-cartesian-sparse-save`):
 
 - **External field embedding**: Inject global tensors (e.g., electric field, rank=1) into conv1 for field-dependent potentials
 - **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
 
 ```bash
 # External field (electric) + dipole/polarizability training
-mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse \
   --external-tensor-rank 1 --external-field-file data/efield.npy \
   --physical-tensors dipole,polarizability \
   --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
   --physical-tensor-weights "dipole:2.0,polarizability:1.0"
 
 # Per-atom physical tensors (requires per-node label HDF5)
-mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse-save \
   --extra-per-node-file data/per_atom_labels.h5 \
   --physical-tensors-per-node charge_per_atom,dipole_per_atom
 ```
@@ -1112,7 +1238,7 @@ For slab active learning, prefer an initial structure with explicit `pbc="T T F"
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--work-dir` | `al_work` | Active learning working directory |
-| `--data-dir` | `data` | Training data directory (must contain processed_train.h5 or train.xyz) |
+| `--data-dir` | `data` | Training data directory (typically contains `processed_train.h5` plus raw files such as variable-length `read_train.h5` / `raw_energy_train.h5`) |
 | `--init-structure` | Auto from data-dir | One or more initial structure paths (multi-structure parallel exploration), or a directory of .xyz files |
 | `--init-checkpoint` | None | Optional warm-start checkpoint(s). Iteration 0 can skip training and explore directly; 1 checkpoint=bootstrap mode, `n_models` checkpoints=full ensemble |
 | `--n-models` | 4 | Number of ensemble models |
@@ -1383,7 +1509,8 @@ Each iteration (until the stage’s `max_iters` or convergence) roughly does:
    - **Layer 1** (uncertainty gate): keep frames with `level_f_lo ≤ max_devi_f < level_f_hi`.
    - **Layer 2** (diversity): SOAP / deviation-histogram fingerprint + FPS, capped at `--max-candidates-per-iter`.
 4. **Label**: Run DFT (or identity/script) on selected configs; write extended XYZ (energy, forces) to `iterations/iter_<i>/labeled/`.
-5. **Merge**: Merge new labeled data into `data_dir` (update processed_train.h5 / train.xyz) for the next round.
+5. **Merge**: Merge new labeled data into `data_dir` (update `read_train.h5`, `raw_energy_train.h5`, `processed_train.h5`, etc.) for the next round.
+   `read_train.h5` stores raw atomic data in variable-length `sample_i` groups by default, without fixed `max-atom` padding.
 
 With `--stages`, stages run in order; iterations repeat within each stage and data accumulates across stages.
 
@@ -1487,7 +1614,7 @@ ORCA and QE can use `--orca-command` / `--qe-command` or have executables on PAT
 
 ### FAQ
 
-- **Where does the initial structure come from?** If `--init-structure` is not set, the first structure is taken from `train.xyz` or `processed_train.h5` in `--data-dir`. You can pass multiple files or a directory for **multi-structure parallel exploration**: `--init-structure A.xyz B.xyz` or `--init-structure structures/`.
+- **Where does the initial structure come from?** If `--init-structure` is not set, the first structure is extracted from available training data in `--data-dir`, preferring `train.xyz` and otherwise falling back to `processed_train.h5` / `read_train.h5`. You can pass multiple files or a directory for **multi-structure parallel exploration**: `--init-structure A.xyz B.xyz` or `--init-structure structures/`.
 - **How do I start active learning from an existing checkpoint?** Use `--init-checkpoint`. With a single checkpoint, iteration 0 enters bootstrap mode: training is skipped, MD exploration starts immediately, and explored frames are sent directly to candidate/diversity/labeling. With `n_models` checkpoints, iteration 0 still skips training but keeps full ensemble deviation.
 - **How to resume after interruption?** Re-run the command with `--resume`. The loop loads `work_dir/al_state.json` and reuses existing checkpoints, `explore_traj.xyz`, `model_devi.out`, `candidate.xyz`, `labeled.xyz`, and `merge.done`, so completed steps are not repeated. SLURM labelers still skip structures whose `output.xyz` already exists.
 - **Output XYZ format?** Labeler output must be extended XYZ with `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`, energy in eV, forces in eV/Å.
@@ -1536,7 +1663,7 @@ fitted_values = fit_baseline_energies(
 # Compute correction energies
 train_correction = compute_correction(train_blocks, train_raw_E, keys, fitted_values)
 
-# Save data (including pbc information)
+# Save data (including pbc information; raw H5 uses variable-length sample_i groups by default)
 save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs)
 
 # Preprocess H5 files (precompute neighbor lists)
@@ -1909,6 +2036,8 @@ mff-export-core \
   --out core.pt
 ```
 
+If the checkpoint was trained with ZBL enabled, the exported `core.pt` automatically contains the same ZBL short-range repulsion; you do not need to pass any extra `--zbl-*` flags during export.
+
 **Checkpoint auto-restore notes:**
 
 - `mff-export-core` now restores model-structure hyperparameters from the checkpoint by default, such as `tensor_product_mode`, `max_radius`, and `num_interaction`
@@ -1947,6 +2076,12 @@ fix 1 all nve
 thermo 20
 run 200
 ```
+
+Additional note:
+
+- `pair_style mff/torch` has no separate `zbl` runtime keyword
+- if `core.pt` was exported from a checkpoint with ZBL enabled, the short-range repulsion is already embedded in the TorchScript model
+- at runtime you only need to keep the `core.pt` path and element order consistent with export
 
 **USER-MFFTORCH notes**:
 
@@ -2052,6 +2187,8 @@ python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
     --output model-mliap.pt
 ```
 
+If the checkpoint was trained with ZBL enabled, the exported `model-mliap.pt` automatically inherits the same ZBL short-range repulsion; no extra `--zbl-*` flags are needed during export.
+
 **Automatic TorchScript behavior (important)**:
 
 - For `spherical-save-cue`, `python -m molecular_force_field.cli.export_mliap` now **automatically enables TorchScript export**, even if `--torchscript` is not specified explicitly.
@@ -2104,6 +2241,8 @@ load_unified(model)
 lmp.file("input.lammps")
 lmp.close()
 ```
+
+Likewise, ML-IAP has no extra runtime ZBL keyword. If `model-mliap.pt` was exported from a checkpoint with ZBL enabled, the short-range repulsion is already included and will be used automatically at runtime.
 
 `input.lammps` example:
 ```
@@ -2497,7 +2636,7 @@ The trainer will **automatically detect and load** checkpoint files. If the file
 **Recommended usage:**
 
 - When resuming training, you usually only need to keep passing `--checkpoint` plus runtime/training options; most model-structure arguments can be omitted
-- Only pass `--embedding-dim`, `--output-size`, `--lmax`, `--num-interaction`, `--max-radius`, `--tensor-product-mode`, etc. when you intentionally want to override the checkpoint config
+- Only pass `--embedding-dim`, `--output-size`, `--lmax`, `--num-interaction`, `--max-radius`, `--tensor-product-mode`, `--invariant-channels`, etc. when you intentionally want to override the checkpoint config
 - If CLI and checkpoint conflict, the current behavior is: **CLI overrides checkpoint**
 - Very old checkpoints without `model_hyperparameters` may still require some manual arguments
 
@@ -2552,7 +2691,7 @@ Notes:
 
 - `mff-evaluate` now restores `tensor_product_mode` and model-structure hyperparameters from the checkpoint by default
 - For new checkpoints, `mff-evaluate` also restores `atomic_energy_keys/atomic_energy_values` from the checkpoint by default
-- If you explicitly pass conflicting options such as `--tensor-product-mode`, `--embedding-dim`, or `--output-size`, the **CLI wins**
+- If you explicitly pass conflicting options such as `--tensor-product-mode`, `--embedding-dim`, `--output-size`, or `--invariant-channels`, the **CLI wins**
 - If you explicitly pass `--atomic-energy-file` or `--atomic-energy-keys/--atomic-energy-values`, those E0 inputs also override the checkpoint
 - Older checkpoints without saved E0 still follow the legacy local `fitted_E0.csv` fallback path
 - Therefore, only pass those structure parameters when you intentionally want to override the checkpoint configuration
@@ -3521,4 +3660,3 @@ tp_ext = CartesianFullyConnectedTensorProduct(
 weights = weight_network(edge_features)  # shape: (..., tp_ext.weight_numel)
 out = tp_ext(x1, x2, weights)
 ```
-

@@ -1,6 +1,6 @@
 # 使用指南
 
-FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，并可在 `pure-cartesian-ictd` 模式下**嵌入外场**（如电场）和**训练物理张量**（电荷、偶极矩、极化率、四极矩）。包括：
+FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，并可在 `pure-cartesian-ictd`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save` 模式下**嵌入外场**（如电场）和**训练物理张量**（电荷、偶极矩、极化率、四极矩）。包括：
 - `spherical`: 基于 e3nn 的球谐函数方法（默认）
 - `spherical-save`: channelwise edge conv（e3nn 后端，参数量更少）
 - `spherical-save-cue`: channelwise edge conv（cuEquivariance 后端，需可选依赖，GPU 加速）
@@ -30,6 +30,7 @@ pip install -e .
 
 ```bash
 mff-preprocess --help
+mff-convert-dataset --help
 mff-train --help
 mff-evaluate --help
 mff-export-core --help   # LAMMPS LibTorch 导出
@@ -61,9 +62,7 @@ Python API 示例见[示例 5a：LAMMPS LibTorch 接口](#示例-5a-使用-lammp
 mff-preprocess \
     --input-file 2000.xyz \
     --output-dir data \
-    --max-atom 5 \
     --train-ratio 0.95 \
-    --preprocess-h5 \
     --max-radius 5.0 \
     --num-workers 8
 ```
@@ -71,20 +70,41 @@ mff-preprocess \
 **参数说明：**
 - `--input-file`: 输入的XYZ文件路径
 - `--output-dir`: 输出目录（默认'data'），所有预处理文件会保存在这个目录下
-- `--max-atom`: 每个结构最大原子数（用于填充）
+- `--max-atom`: 兼容旧 padded 原始存储的可选参数；默认不需要，`read_{train,val}.h5` 会按样本变长存储
 - `--train-ratio`: 训练集比例（默认0.95）
-- `--preprocess-h5`: 是否预处理H5文件（预计算邻居列表，加速训练）
 - `--max-radius`: 邻居搜索的最大半径
 - `--num-workers`: 并行处理的进程数
 
 **输出文件（在 `data/` 目录下）：**
-- `read_train.h5`, `read_val.h5` - 原子数据
+- `read_train.h5`, `read_val.h5` - 原始原子数据（默认按 `sample_i` 变长存储；传 `--max-atom` 时保留旧 padded 格式）
 - `raw_energy_train.h5`, `raw_energy_val.h5` - 原始能量
 - `correction_energy_train.h5`, `correction_energy_val.h5` - 校正能量
 - `cell_train.h5`, `cell_val.h5` - 晶胞信息
 - `stress_train.h5`, `stress_val.h5` - 应力张量（当 XYZ 含 stress/virial 时；否则为零矩阵）
 - `processed_train.h5`, `processed_val.h5` - 预处理后的数据（如果使用--preprocess-h5）
 - `fitted_E0.csv` - 拟合的原子基准能量（默认：从训练集用最小二乘拟合得到）
+
+**自定义 extxyz 键名覆盖**：
+
+如果你的 `extxyz` 不是默认的 `energy=...` + `Properties=species:...:pos:...:force:...:Z:...`，可以显式指定：
+
+```bash
+mff-preprocess \
+    --input-file custom.extxyz \
+    --output-dir data \
+    --energy-key REF_energy \
+    --force-key REF_force \
+    --species-key elem \
+    --coord-key coords \
+    --atomic-number-key atomic_number
+```
+
+默认搜索规则：
+- `energy`: comment 行里的 `energy=...`
+- `force`: `force` / `forces` / `f`
+- `species`: `species` / `symbol` / `element`
+- `coord`: `pos`
+- `atomic number`: `Z` / `atomic_number`
 
 ### 步骤 2: 训练模型
 
@@ -148,21 +168,128 @@ mff-train \
     --atomic-energy-values -430.53299511 -821.03326787 -1488.18856918 -2044.3509823
 ```
 
-**外场与物理张量训练**（仅 `pure-cartesian-ictd` 支持）：
+**ZBL 短程排斥修正**（可选，推荐用于高能近距离构型）：
+
+ZBL (`Ziegler-Biersack-Littmark`) 是经典的短程核-核排斥势。FSCETP 现在支持把它作为统一短程修正项叠加到模型能量输出上，用来改善极短距离下的物理合理性。典型场景包括：
+
+- 辐照损伤、碰撞级联、离子注入
+- 高温或高压下的原子过近接触
+- 希望避免 ML 势在未见过的超短程区域出现不物理吸引
+
+训练时开启示例：
+
+```bash
+mff-train \
+    --data-dir data \
+    --tensor-product-mode pure-cartesian-ictd \
+    --zbl-enabled \
+    --zbl-inner-cutoff 0.6 \
+    --zbl-outer-cutoff 1.2 \
+    --zbl-exponent 0.23 \
+    --zbl-energy-scale 1.0
+```
+
+参数说明：
+
+| 参数 | 说明 |
+|------|------|
+| `--zbl-enabled` | 启用 ZBL 短程排斥修正 |
+| `--zbl-inner-cutoff` | 内截止半径（Å）。在此半径内使用完整 ZBL 排斥 |
+| `--zbl-outer-cutoff` | 外截止半径（Å）。超过此半径后 ZBL 平滑衰减到 0 |
+| `--zbl-exponent` | 屏蔽长度公式中的指数参数，默认常用值为 `0.23` |
+| `--zbl-energy-scale` | ZBL 能量整体缩放因子；默认 `1.0` 表示标准强度 |
+
+使用建议：
+
+- 必须满足 `--zbl-inner-cutoff < --zbl-outer-cutoff`
+- 若训练集不覆盖极短程构型，建议先从 `0.6 / 1.2 / 0.23 / 1.0` 开始
+- 若训练集已经专门包含超短程碰撞区，请谨慎调 cutoff，避免与模型本身学到的短程部分重复计入
+- ZBL 以统一修正层方式接入，因此对训练、评估、ASE、active learning、ML-IAP 都适用；但 `core.pt` 导出仍受原本 TorchScript 支持模式限制
+
+常数来源说明：
+
+- 势能中的 `14.399645...` 是 \(\frac{e^2}{4\pi\varepsilon_0}\) 在 `eV·Å` 单位制下的数值
+- `0.529177... Å` 是 Bohr 半径 \(a_0\)
+- 屏蔽长度中的 `0.8854` 与默认指数 `0.23` 来自标准 ZBL 势的经验参数化：
+  \[
+  a_{ij} = \frac{0.8854 a_0}{Z_i^{p} + Z_j^{p}}, \quad p=0.23
+  \]
+- 屏蔽函数
+  \[
+  \phi(x)=0.1818e^{-3.2x}+0.5099e^{-0.9423x}+0.2802e^{-0.4029x}+0.02817e^{-0.2016x}
+  \]
+  中的系数与指数也是标准 ZBL 文献的通用拟合参数
+- 截断区使用的五次 smoothstep 多项式
+  \[
+  1-10t^3+15t^4-6t^5
+  \]
+  不是 ZBL 原始物理常数，而是为了保证内外截止之间能量和力都平滑连续的数值实现
+
+实现上，当前代码采用的 pair 势形式为：
+
+\[
+E_{ij}^{\mathrm{ZBL}}(r)
+=
+s(r)\,\lambda\,
+14.3996454784255
+\frac{Z_i Z_j}{r}
+\phi\!\left(\frac{r}{a_{ij}}\right)
+\]
+
+其中 \(\lambda = \texttt{zbl\_energy\_scale}\)，\(s(r)\) 是由 `--zbl-inner-cutoff` 和 `--zbl-outer-cutoff` 定义的平滑截断函数。
+
+checkpoint 与后处理说明：
+
+- 训练后，ZBL 参数会写入 checkpoint metadata
+- `mff-evaluate` 默认会自动恢复 checkpoint 中的 ZBL 配置
+- `mff-export-core` 与 `python -m molecular_force_field.cli.export_mliap` 也会自动继承 checkpoint 中的 ZBL 配置
+- 因此通常只需要在训练时显式开启一次，后续评估与导出无需重复手动填写
+
+`--invariant-channels`（标量不变量通道宽度）：
+
+- 该参数控制若干张量积模式中 product-3 类标量不变量读出块的通道宽度，默认值为 `32`
+- 适用模式：`spherical`、`spherical-save`、`partial-cartesian`、`partial-cartesian-loose`、`pure-cartesian`、`pure-cartesian-sparse`、`pure-cartesian-ictd`、`pure-cartesian-ictd-save`
+- `spherical-save-cue` 不使用这个参数；即使 checkpoint 里保存了 `invariant_channels`，在 cuEquivariance channelwise 后端中也不会生效
+- 之前这些模式的行为等价于固定使用 `32`；现在可以通过 CLI 显式调整，例如：
+
+```bash
+mff-train \
+    --data-dir data \
+    --tensor-product-mode pure-cartesian-ictd \
+    --invariant-channels 64
+```
+
+- 训练后，`invariant_channels` 会写入 checkpoint 的 `model_hyperparameters`
+- 后续恢复训练、`mff-evaluate`、主动学习、thermal loader、`mff-export-core` 与 `python -m molecular_force_field.cli.export_mliap` 都会自动从 checkpoint 恢复该值
+- 因此主动学习阶段通常不需要再次手动传入 `--invariant-channels`，除非你明确想覆盖 checkpoint 中保存的结构配置
+
+评估时显式覆盖示例：
+
+```bash
+mff-evaluate \
+    --checkpoint checkpoint/combined_model_pure_cartesian_ictd.pth \
+    --input-file test.xyz \
+    --tensor-product-mode pure-cartesian-ictd \
+    --zbl-enabled \
+    --zbl-inner-cutoff 0.6 \
+    --zbl-outer-cutoff 1.2
+```
+
+**外场与物理张量训练**（支持 `pure-cartesian-ictd`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save`）：
 
 - **外场嵌入**：将全局张量（如电场，rank=1）注入 conv1，用于场依赖势能
 - **物理张量训练**：监督输出电荷、偶极矩、极化率、四极矩（结构级或原子级）
 
 ```bash
 # 外场（电场）+ 偶极矩/极化率训练
-mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse \
   --external-tensor-rank 1 --external-field-file data/efield.npy \
   --physical-tensors dipole,polarizability \
   --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
   --physical-tensor-weights "dipole:2.0,polarizability:1.0"
 
 # 原子级物理张量（需 per-node 标签 HDF5）
-mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse-save \
   --extra-per-node-file data/per_atom_labels.h5 \
   --physical-tensors-per-node charge_per_atom,dipole_per_atom
 ```
@@ -1207,7 +1334,7 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--work-dir` | `al_work` | 主动学习工作目录 |
-| `--data-dir` | `data` | 训练数据目录（需含 processed_train.h5 或 train.xyz） |
+| `--data-dir` | `data` | 训练数据目录（通常含 `processed_train.h5`，以及默认变长存储的 `read_train.h5` / `raw_energy_train.h5` 等原始文件） |
 | `--init-structure` | 从 data-dir 自动提取 | 一个或多个初始结构路径（多结构并行探索），或包含 .xyz 文件的目录 |
 | `--init-checkpoint` | 无 | 可选 warm start checkpoint。第 0 轮可跳过训练直接探索；1 个 checkpoint=bootstrap，`n_models` 个 checkpoint=完整集成 |
 | `--n-models` | 4 | 集成模型数量 |
@@ -1525,7 +1652,8 @@ mff-active-learn --explore-type ase --label-type vasp \
    - **Layer 1**（不确定性门控）：按 `level_f_lo` / `level_f_hi` 筛选出“不确定”的构型。
    - **Layer 2**（多样性筛选）：用 SOAP / deviation 直方图等结构指纹 + FPS 选取最多 `--max-candidates-per-iter` 个多样化子集。
 4. **标注**：对筛选出的构型调用 DFT（或 identity/script），生成带能量、力的 extended XYZ，写入 `iterations/iter_<i>/labeled/`。
-5. **合并**：将新标注的数据合并回 `data_dir`（更新 processed_train.h5 / train.xyz 等），作为下一轮训练的输入。
+5. **合并**：将新标注的数据合并回 `data_dir`（更新 `read_train.h5`、`raw_energy_train.h5`、`processed_train.h5` 等），作为下一轮训练的输入。
+   `read_train.h5` 默认按 `sample_i` 变长存储原子数据，不再依赖固定 `max-atom` padding。
 
 使用 `--stages` 时，会按 JSON 中定义的阶段顺序执行；每个阶段内重复上述迭代，阶段之间数据累积。
 
@@ -1628,7 +1756,7 @@ ORCA 和 QE 可通过 `--orca-command`、`--qe-command` 指定，或确保可执
 
 ### 常见问题（FAQ）
 
-- **初始结构从哪里来？** 未指定 `--init-structure` 时，从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。支持传入多个文件或一个目录实现**多结构并行探索**：`--init-structure A.xyz B.xyz` 或 `--init-structure structures/`。
+- **初始结构从哪里来？** 未指定 `--init-structure` 时，会从 `--data-dir` 里可用的训练数据提取第一个结构，优先使用 `train.xyz`，否则回退到 `processed_train.h5` / `read_train.h5`。支持传入多个文件或一个目录实现**多结构并行探索**：`--init-structure A.xyz B.xyz` 或 `--init-structure structures/`。
 - **如何从已有 checkpoint 直接开始主动学习？** 用 `--init-checkpoint`。若只给 1 个 checkpoint，第 0 轮进入 bootstrap 模式：跳过训练，直接 MD 采样并把探索帧送去多样性筛选/标注；若给 `n_models` 个 checkpoint，则第 0 轮仍跳过训练，但可以直接计算 ensemble deviation。
 - **如何从中断处继续？** 重新执行同一条命令并加 `--resume`。程序会读取 `work_dir/al_state.json`，并复用已有的 checkpoint、`explore_traj.xyz`、`model_devi.out`、`candidate.xyz`、`labeled.xyz` 和 `merge.done`，避免重复训练/探索/标注/merge。对标注阶段而言，`slurm` 和 `local-script` 标注器还会进一步按结构级别检查已有的 `output.xyz` 并跳过已完成任务；其他本地标注器不做 `output.xyz` 级 resume，但仍可通过 `--label-error-handling skip` 在单个结构失败后继续剩余任务。
 - **输出 XYZ 格式要求？** 标注器输出的 XYZ 需包含 `Properties=species:S:1:pos:R:3:energy:R:1:forces:R:3`，能量 eV，力 eV/Å。
@@ -1677,7 +1805,7 @@ fitted_values = fit_baseline_energies(
 # 计算校正能量
 train_correction = compute_correction(train_blocks, train_raw_E, keys, fitted_values)
 
-# 保存数据（包含 pbc 和 stress 信息）
+# 保存数据（包含 pbc 和 stress 信息；原始 H5 默认按 sample_i 变长存储）
 save_set('train', train_indices, train_blocks, train_raw_E, train_correction, all_cells, pbc_list=all_pbcs, stress_list=all_stresses)
 
 # 预处理H5文件（预计算邻居列表）
@@ -2049,6 +2177,8 @@ mff-export-core \
   --out core.pt
 ```
 
+若 checkpoint 训练时已启用 ZBL，则导出的 `core.pt` 会自动包含相同的 ZBL 短程排斥修正；导出命令本身不需要额外再写 `--zbl-*` 参数。
+
 **checkpoint 自动恢复说明**：
 
 - `mff-export-core` 会优先从 checkpoint 自动恢复模型结构超参数，例如 `tensor_product_mode`、`max_radius`、`num_interaction`
@@ -2109,6 +2239,12 @@ fix 1 all nve
 thermo 20
 run 200
 ```
+
+补充说明：
+
+- `pair_style mff/torch` 本身没有单独的 `zbl` 关键字
+- 只要 `core.pt` 是从启用 ZBL 的 checkpoint 导出的，短程排斥已经内嵌在 TorchScript 模型里
+- 因此运行时只需保证 `core.pt` 路径、元素顺序和导出时一致即可
 
 **USER-MFFTORCH 注意事项**：
 
@@ -2514,6 +2650,8 @@ python -m molecular_force_field.cli.export_mliap your_checkpoint.pth \
     --output model-mliap.pt
 ```
 
+若 checkpoint 训练时已启用 ZBL，则导出的 `model-mliap.pt` 会自动继承相同的 ZBL 短程排斥修正；不需要在导出命令中再次显式传入 `--zbl-*`。
+
 **自动 TorchScript 行为（重要）**：
 
 - 对 `spherical-save-cue`，`python -m molecular_force_field.cli.export_mliap` 会**自动启用 TorchScript 导出**，即使用户没有显式传 `--torchscript`
@@ -2571,6 +2709,8 @@ load_unified(model)
 lmp.file("input.lammps")
 lmp.close()
 ```
+
+同样地，ML-IAP 运行时没有额外的 ZBL 关键字；只要 `model-mliap.pt` 是从启用 ZBL 的 checkpoint 导出的，运行时就会自动生效。
 
 `input.lammps` 内容示例：
 
@@ -2971,7 +3111,7 @@ python -m molecular_force_field.cli.thermal_transport callaway \
 **推荐用法：**
 
 - 恢复训练时，通常只需要继续传 `--checkpoint` 和训练运行参数；大多数模型结构超参数可以省略
-- 只有在你**明确想覆盖 checkpoint 中的结构配置**时，才显式传 `--embedding-dim`、`--output-size`、`--lmax`、`--num-interaction`、`--max-radius`、`--tensor-product-mode` 等参数
+- 只有在你**明确想覆盖 checkpoint 中的结构配置**时，才显式传 `--embedding-dim`、`--output-size`、`--lmax`、`--num-interaction`、`--max-radius`、`--tensor-product-mode`、`--invariant-channels` 等参数
 - 如果 CLI 和 checkpoint 冲突，当前行为是**CLI 覆盖 checkpoint**
 - 对非常老、未保存 `model_hyperparameters` 的 checkpoint，仍可能需要手动补部分参数
 

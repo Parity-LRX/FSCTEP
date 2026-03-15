@@ -17,9 +17,8 @@ import copy
 
 from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
 from molecular_force_field.models.losses import RMSELoss
-from molecular_force_field.utils.tensor_utils import map_tensor_values
+from molecular_force_field.utils.tensor_utils import build_physical_tensor_label_blocks, map_tensor_values
 from molecular_force_field.utils.config import ModelConfig
-from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
 
 
 def log_gradient_statistics(networks, batch_idx, logger):
@@ -169,7 +168,8 @@ class Trainer:
             tensor_product_mode: Tensor product mode used (default: 'spherical').
                 Options: 'spherical', 'spherical-save', 'spherical-save-cue',
                 'partial-cartesian', 'partial-cartesian-loose',
-                'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'
+                'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save',
+                'pure-cartesian-ictd', 'pure-cartesian-ictd-save'
         """
         self.distributed = distributed
         self.rank = rank
@@ -201,6 +201,7 @@ class Trainer:
             'partial-cartesian-loose': '_partial_cartesian_loose',
             'pure-cartesian': '_pure_cartesian',
             'pure-cartesian-sparse': '_pure_cartesian_sparse',
+            'pure-cartesian-sparse-save': '_pure_cartesian_sparse_save',
             'pure-cartesian-ictd': '_pure_cartesian_ictd',
             'pure-cartesian-ictd-save': '_pure_cartesian_ictd_save',
         }
@@ -557,6 +558,9 @@ class Trainer:
             num_interaction = getattr(base, "num_interaction", None)
             if num_interaction is not None:
                 model_hparams["num_interaction"] = int(num_interaction)
+            invariant_channels = getattr(base, "invariant_channels", None)
+            if invariant_channels is not None:
+                model_hparams["invariant_channels"] = int(invariant_channels)
             for attr_name in (
                 "max_rank_other",
                 "k_policy",
@@ -590,6 +594,11 @@ class Trainer:
                 "feature_spectral_neutralize",
                 "feature_spectral_include_k0",
                 "feature_spectral_gate_init",
+                "zbl_enabled",
+                "zbl_inner_cutoff",
+                "zbl_outer_cutoff",
+                "zbl_exponent",
+                "zbl_energy_scale",
             ):
                 if hasattr(base, attr_name):
                     value = getattr(base, attr_name)
@@ -624,20 +633,16 @@ class Trainer:
             base = name.replace("_per_atom", "")
             return phys_weights.get(name, phys_weights.get(base, 1.0))
 
-        def _get_embed(rank: int, *, include_trace_chain: bool):
-            key = (rank, include_trace_chain, lmax_model)
-            m = emb_cache.get(key)
-            if m is None:
-                m = PhysicalTensorICTDEmbedding(
-                    rank=rank,
-                    lmax_out=lmax_model,
-                    channels_in=1,
-                    channels_out=1,
-                    input_repr="cartesian",
-                    include_trace_chain=include_trace_chain,
-                ).to(self.device)
-                emb_cache[key] = m
-            return m
+        def _get_embed(y_tensor: torch.Tensor, rank: int, *, include_trace_chain: bool):
+            return build_physical_tensor_label_blocks(
+                y_tensor,
+                rank=rank,
+                lmax=lmax_model,
+                include_trace_chain=include_trace_chain,
+                representation=getattr(base_e3, "physical_tensor_representation", "ictd"),
+                device=self.device,
+                cache=emb_cache,
+            )
 
         # charge / charge_per_atom: scalar l=0
         for name in ("charge", "charge_per_atom"):
@@ -667,7 +672,7 @@ class Trainer:
                 mask = extras.get(f"{name}_mask", None)
                 mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
                 y_cart = extras[name]
-                y_blocks = _get_embed(1, include_trace_chain=False)(y_cart, return_blocks=True)
+                y_blocks = _get_embed(y_cart, 1, include_trace_chain=False)
                 p1 = phys_pred[name].get(1) if isinstance(phys_pred[name], dict) else None
                 if p1 is None or 1 not in y_blocks:
                     continue
@@ -683,7 +688,7 @@ class Trainer:
                 mask = extras.get(f"{name}_mask", None)
                 mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
                 y_cart = extras[name]
-                y_blocks = _get_embed(2, include_trace_chain=True)(y_cart, return_blocks=True)
+                y_blocks = _get_embed(y_cart, 2, include_trace_chain=True)
                 for l in (0, 2):
                     pl = phys_pred[name].get(l) if isinstance(phys_pred[name], dict) else None
                     if pl is None or l not in y_blocks:
@@ -700,7 +705,7 @@ class Trainer:
                 mask = extras.get(f"{name}_mask", None)
                 mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
                 y_cart = extras[name]
-                y_blocks = _get_embed(2, include_trace_chain=True)(y_cart, return_blocks=True)
+                y_blocks = _get_embed(y_cart, 2, include_trace_chain=True)
                 p2 = phys_pred[name].get(2) if isinstance(phys_pred[name], dict) else None
                 if p2 is None or 2 not in y_blocks:
                     continue

@@ -15,6 +15,7 @@ from molecular_force_field.models import (
     CartesianTransformerLayerLoose,
     PureCartesianTransformerLayer,
     PureCartesianSparseTransformerLayer,
+    PureCartesianSparseTransformerLayerSave,
     PureCartesianICTDTransformerLayer,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
@@ -35,6 +36,7 @@ from molecular_force_field.utils.checkpoint_metadata import (
     resolve_model_architecture,
 )
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
 
 def main():
@@ -60,8 +62,8 @@ def main():
                         help='Path to energy HDF5 file (for on-the-fly dataset)')
     parser.add_argument('--cell-file', type=str, default=None,
                         help='Path to cell HDF5 file (for on-the-fly dataset)')
-    parser.add_argument('--max-atom', type=int, default=1,
-                        help='Maximum number of atoms (for padding, used when --input-file is provided)')
+    parser.add_argument('--max-atom', type=int, default=None,
+                        help='Legacy padded raw-storage size when --input-file is provided; leave unset for variable-length read_*.h5')
     parser.add_argument('--elements', type=str, nargs='+', default=None,
                         help='Element symbols to recognize (default: None, recognizes all elements from periodic table). '
                              'Used when --input-file is provided.')
@@ -191,7 +193,7 @@ def main():
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params). '
@@ -200,20 +202,26 @@ def main():
                              '"partial-cartesian-loose" uses non-strictly-equivariant Cartesian tensor products (norm product approximation, not strictly equivariant), '
                              '"pure-cartesian" uses full rank Cartesian tensors (3^L) with delta/epsilon contractions (most pure), '
                              '"pure-cartesian-sparse" uses a sparse pure-cartesian delta/epsilon tensor product (O(3) strict) by restricting rank-rank paths, '
+                             '"pure-cartesian-sparse-save" uses the same sparse pure-cartesian implementation under a dedicated save-mode name, '
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
                              '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, DDP supported). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--max-rank-other', type=int, default=None,
-                        help='Max rank for sparse tensor product in pure-cartesian-sparse mode. '
+                        help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
                              'If not set, restore from checkpoint when available, else use 1.')
     parser.add_argument('--k-policy', type=str, default=None,
                         choices=['k0', 'k1', 'both'],
-                        help='K policy for sparse tensor product in pure-cartesian-sparse mode. '
+                        help='K policy for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
                              'If not set, restore from checkpoint when available, else use k0.')
     parser.add_argument('--num-interaction', type=int, default=None,
                         help='Number of message-passing steps per block. '
                              'If not set, restore from checkpoint when available, else use 2. '
                              'Used by all tensor-product modes. Must match the value used at training. Must be >= 2.')
+    parser.add_argument('--invariant-channels', type=int, default=None,
+                        help='Per-interaction invariant readout channels used by product_3-style scalar invariant blocks. '
+                             'If not set, restore from checkpoint when available, else use 32. '
+                             'Applies to: spherical, spherical-save, partial-cartesian, partial-cartesian-loose, '
+                             'pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-save.')
     parser.add_argument('--ictd-tp-path-policy', type=str, default=None,
                         choices=['full', 'max_rank_other'],
                         help='Path policy for ICTD tensor products in pure-cartesian-ictd mode. '
@@ -364,6 +372,19 @@ def main():
     parser.set_defaults(feature_spectral_include_k0=None)
     parser.add_argument('--feature-spectral-gate-init', type=float, default=None,
                         help='Initial residual gate value for the feature spectral block.')
+    parser.add_argument('--zbl-enabled', dest='zbl_enabled', action='store_true',
+                        help='Enable ZBL short-range repulsion. If not set, restore from checkpoint metadata.')
+    parser.add_argument('--no-zbl-enabled', dest='zbl_enabled', action='store_false',
+                        help='Disable ZBL short-range repulsion.')
+    parser.set_defaults(zbl_enabled=None)
+    parser.add_argument('--zbl-inner-cutoff', type=float, default=None,
+                        help='Inner cutoff in Angstrom where full ZBL is applied.')
+    parser.add_argument('--zbl-outer-cutoff', type=float, default=None,
+                        help='Outer cutoff in Angstrom where ZBL decays to zero.')
+    parser.add_argument('--zbl-exponent', type=float, default=None,
+                        help='Screening exponent in the ZBL screening length formula.')
+    parser.add_argument('--zbl-energy-scale', type=float, default=None,
+                        help='Global multiplicative scale for the ZBL energy term.')
 
     parser.add_argument('--mp-context', type=str, default='auto',
                         choices=['auto', 'fork', 'spawn'],
@@ -400,6 +421,7 @@ def main():
             "function_type": args.function_type,
             "tensor_product_mode": args.tensor_product_mode,
             "num_interaction": args.num_interaction,
+            "invariant_channels": args.invariant_channels,
             "max_rank_other": args.max_rank_other,
             "k_policy": args.k_policy,
             "ictd_tp_path_policy": args.ictd_tp_path_policy,
@@ -440,6 +462,11 @@ def main():
             "feature_spectral_neutralize": args.feature_spectral_neutralize,
             "feature_spectral_include_k0": args.feature_spectral_include_k0,
             "feature_spectral_gate_init": args.feature_spectral_gate_init,
+            "zbl_enabled": args.zbl_enabled,
+            "zbl_inner_cutoff": args.zbl_inner_cutoff,
+            "zbl_outer_cutoff": args.zbl_outer_cutoff,
+            "zbl_exponent": args.zbl_exponent,
+            "zbl_energy_scale": args.zbl_energy_scale,
         },
     )
     args.dtype = resolved_arch["dtype"]
@@ -453,6 +480,7 @@ def main():
     args.function_type = resolved_arch["function_type"]
     args.tensor_product_mode = resolved_arch["tensor_product_mode"]
     args.num_interaction = resolved_arch["num_interaction"]
+    args.invariant_channels = resolved_arch["invariant_channels"]
     args.max_rank_other = resolved_arch["max_rank_other"]
     args.k_policy = resolved_arch["k_policy"]
     args.ictd_tp_path_policy = resolved_arch["ictd_tp_path_policy"]
@@ -493,6 +521,11 @@ def main():
     args.feature_spectral_neutralize = resolved_arch["feature_spectral_neutralize"]
     args.feature_spectral_include_k0 = resolved_arch["feature_spectral_include_k0"]
     args.feature_spectral_gate_init = resolved_arch["feature_spectral_gate_init"]
+    args.zbl_enabled = resolved_arch["zbl_enabled"]
+    args.zbl_inner_cutoff = resolved_arch["zbl_inner_cutoff"]
+    args.zbl_outer_cutoff = resolved_arch["zbl_outer_cutoff"]
+    args.zbl_exponent = resolved_arch["zbl_exponent"]
+    args.zbl_energy_scale = resolved_arch["zbl_energy_scale"]
     
     # Setup logging
     logging.basicConfig(level=logging.INFO)
@@ -539,11 +572,6 @@ def main():
         logging.info(f"Using device: {device}")
     if args.num_interaction < 2:
         raise ValueError(f"--num-interaction must be >= 2, got {args.num_interaction}")
-    if args.long_range_mode != "none" and args.tensor_product_mode not in {"pure-cartesian-ictd", "spherical-save-cue"}:
-        raise ValueError(
-            "--long-range-mode currently supports only --tensor-product-mode "
-            "pure-cartesian-ictd and spherical-save-cue"
-        )
     if args.long_range_mode == "latent-coulomb":
         if args.long_range_boundary not in {"nonperiodic", "periodic"}:
             raise ValueError("--long-range-mode latent-coulomb requires --long-range-boundary nonperiodic or periodic")
@@ -738,6 +766,46 @@ def main():
     logging.info(f"  max_radius: {config.max_radius}")
     logging.info(f"  dtype: {config.dtype}")
     logging.info("=" * 80)
+
+    common_long_range_kwargs = dict(
+        long_range_mode=args.long_range_mode,
+        long_range_hidden_dim=args.long_range_hidden_dim,
+        long_range_boundary=args.long_range_boundary,
+        long_range_neutralize=args.long_range_neutralize,
+        long_range_filter_hidden_dim=args.long_range_filter_hidden_dim,
+        long_range_kmax=args.long_range_kmax,
+        long_range_mesh_size=args.long_range_mesh_size,
+        long_range_slab_padding_factor=args.long_range_slab_padding_factor,
+        long_range_include_k0=args.long_range_include_k0,
+        long_range_source_channels=args.long_range_source_channels,
+        long_range_backend=args.long_range_backend,
+        long_range_reciprocal_backend=args.long_range_reciprocal_backend,
+        long_range_energy_partition=args.long_range_energy_partition,
+        long_range_green_mode=args.long_range_green_mode,
+        long_range_assignment=args.long_range_assignment,
+        long_range_theta=args.long_range_theta,
+        long_range_leaf_size=args.long_range_leaf_size,
+        long_range_multipole_order=args.long_range_multipole_order,
+        long_range_far_source_dim=args.long_range_far_source_dim,
+        long_range_far_num_shells=args.long_range_far_num_shells,
+        long_range_far_shell_growth=args.long_range_far_shell_growth,
+        long_range_far_tail=args.long_range_far_tail,
+        long_range_far_tail_bins=args.long_range_far_tail_bins,
+        long_range_far_stats=args.long_range_far_stats,
+        long_range_far_max_radius_multiplier=args.long_range_far_max_radius_multiplier,
+        long_range_far_source_norm=args.long_range_far_source_norm,
+        long_range_far_gate_init=args.long_range_far_gate_init,
+        feature_spectral_mode=args.feature_spectral_mode,
+        feature_spectral_bottleneck_dim=args.feature_spectral_bottleneck_dim,
+        feature_spectral_mesh_size=args.feature_spectral_mesh_size,
+        feature_spectral_filter_hidden_dim=args.feature_spectral_filter_hidden_dim,
+        feature_spectral_boundary=args.feature_spectral_boundary,
+        feature_spectral_slab_padding_factor=args.feature_spectral_slab_padding_factor,
+        feature_spectral_neutralize=args.feature_spectral_neutralize,
+        feature_spectral_include_k0=args.feature_spectral_include_k0,
+        feature_spectral_gate_init=args.feature_spectral_gate_init,
+    )
+    common_invariant_kwargs = dict(invariant_channels=args.invariant_channels)
     
     # Initialize model based on tensor product mode
     if tensor_product_mode == 'pure-cartesian':
@@ -759,7 +827,9 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            device=device
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
     elif tensor_product_mode == 'pure-cartesian-ictd':
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers_full, DDP sync), num_interaction=%d", args.num_interaction)
@@ -784,6 +854,7 @@ def main():
             physical_tensor_outputs=physical_tensor_outputs_ckpt,
             external_tensor_rank=external_tensor_rank_ckpt,
             device=device,
+            **common_invariant_kwargs,
             long_range_mode=args.long_range_mode,
             long_range_hidden_dim=args.long_range_hidden_dim,
             long_range_boundary=args.long_range_boundary,
@@ -840,10 +911,21 @@ def main():
             lmax=config.lmax,
             internal_compute_dtype=config.dtype,
             device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
-    elif tensor_product_mode == 'pure-cartesian-sparse':
-        logging.info("Using PURE Cartesian SPARSE mode (δ/ε path-sparse within 3^L, O(3) strict), num_interaction=%d", args.num_interaction)
-        e3trans = PureCartesianSparseTransformerLayer(
+    elif tensor_product_mode in {'pure-cartesian-sparse', 'pure-cartesian-sparse-save'}:
+        logging.info(
+            "Using PURE Cartesian SPARSE%s mode (δ/ε path-sparse within 3^L, O(3) strict), num_interaction=%d",
+            " SAVE" if tensor_product_mode == "pure-cartesian-sparse-save" else "",
+            args.num_interaction,
+        )
+        sparse_cls = (
+            PureCartesianSparseTransformerLayerSave
+            if tensor_product_mode == "pure-cartesian-sparse-save"
+            else PureCartesianSparseTransformerLayer
+        )
+        e3trans = sparse_cls(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
             main_number_of_basis=config.number_of_basis_main,
@@ -860,7 +942,13 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            device=device
+            max_rank_other=args.max_rank_other,
+            k_policy=args.k_policy,
+            physical_tensor_outputs=physical_tensor_outputs_ckpt,
+            external_tensor_rank=external_tensor_rank_ckpt,
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
     elif tensor_product_mode == 'partial-cartesian':
         logging.info("Using Partial-Cartesian tensor product mode (strict), num_interaction=%d", args.num_interaction)
@@ -881,7 +969,9 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            device=device
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
     elif tensor_product_mode == 'partial-cartesian-loose':
         logging.info("Using Partial-Cartesian LOOSE mode (non-strictly-equivariant, norm product approximation), num_interaction=%d", args.num_interaction)
@@ -902,7 +992,9 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            device=device
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
     elif tensor_product_mode == 'spherical-save':
         logging.info("Using Spherical (channelwise conv) tensor product mode (e3nn_layers_channelwise), num_interaction=%d", args.num_interaction)
@@ -927,7 +1019,9 @@ def main():
             num_layers=config.num_layers,
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
-            device=device
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
     elif tensor_product_mode == 'spherical-save-cue':
         logging.info("Using Spherical (channelwise conv) tensor product mode (cuEquivariance backend), num_interaction=%d", args.num_interaction)
@@ -1026,10 +1120,13 @@ def main():
             num_layers=config.num_layers,
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
-            device=device
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
         ).to(device)
     
     e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+    e3trans = maybe_wrap_model_with_zbl(e3trans, vars(args))
     e3trans.eval()
     
     logging.info("Loaded model from checkpoint.")

@@ -4,7 +4,7 @@ Supported tensor product modes (all modes that can be loaded via
 ``build_e3trans_from_checkpoint``):
   spherical, spherical-save, spherical-save-cue,
   partial-cartesian, partial-cartesian-loose,
-  pure-cartesian, pure-cartesian-sparse,
+  pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save,
   pure-cartesian-ictd, pure-cartesian-ictd-save
 
 The ``MyE3NNCalculator`` also supports ICTD models with:

@@ -90,7 +90,7 @@ mff-active-learn --explore-type ase --label-type local-script \
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--work-dir` | `al_work` | 主动学习工作目录 |
-| `--data-dir` | `data` | 训练数据目录（含 processed_train.h5 或 train.xyz） |
+| `--data-dir` | `data` | 训练数据目录（通常含 `processed_train.h5`，以及默认变长存储的 `read_train.h5` / `raw_energy_train.h5` 等原始文件） |
 | `--init-structure` | 自动从 data-dir 提取 | 一个或多个初始结构路径，或包含 .xyz 文件的目录（多结构并行探索） |
 | `--init-checkpoint` | 无 | 可选 warm start checkpoint。第 0 轮可跳过训练直接探索；1 个 checkpoint=bootstrap 模式，`n_models` 个 checkpoint=完整集成 |
 | `--n-models` | 4 | 集成模型数量 |
@@ -491,7 +491,7 @@ mff-active-learn --explore-type ase --explore-mode neb \
 
 ### Q: 初始结构从哪里来？
 
-若未指定 `--init-structure`，会从 `--data-dir` 的 `train.xyz` 或 `processed_train.h5` 取第一个结构。
+若未指定 `--init-structure`，会从 `--data-dir` 里可用的训练数据提取第一个结构，优先复用 `train.xyz`，否则从 `processed_train.h5` / `read_train.h5` 中读取。
 支持传入多个文件或一个目录实现**多结构并行探索**——详见上方「多结构并行探索」一节。
 
 ### Q: 如何从上次中断处继续？
@@ -603,5 +603,4 @@ polar  = pt["polarizability"][2]  # l=2 张量（5 个分量）
 
 > **注意**：只有使用 `--physical-tensors` 训练的 ICTD 检查点才有物理张量输出头。
 > 普通模型传入 `return_physical_tensors=True` 会引发错误。
-
 

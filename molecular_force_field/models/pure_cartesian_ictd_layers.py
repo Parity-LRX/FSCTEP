@@ -35,6 +35,7 @@ from molecular_force_field.models.ictd_irreps import (
 from molecular_force_field.models.ictd_fast import _counts_list
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
 from molecular_force_field.models.mlp import MainNet
+from molecular_force_field.models.long_range import apply_long_range_modules, configure_long_range_modules
 
 
 def _irreps_total_dim(channels: int, lmax: int) -> int:
@@ -673,6 +674,43 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # If None: keep current behavior (mul_l = channels for all l).
         # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
         product5_muls_by_l: dict[int, int] | None = None,
+        invariant_channels: int = 32,
+        long_range_mode: str = "none",
+        long_range_hidden_dim: int = 64,
+        long_range_boundary: str = "nonperiodic",
+        long_range_neutralize: bool = True,
+        long_range_filter_hidden_dim: int = 64,
+        long_range_kmax: int = 2,
+        long_range_mesh_size: int = 16,
+        long_range_slab_padding_factor: int = 2,
+        long_range_include_k0: bool = False,
+        long_range_source_channels: int = 1,
+        long_range_backend: str = "dense_pairwise",
+        long_range_reciprocal_backend: str = "direct_kspace",
+        long_range_energy_partition: str = "potential",
+        long_range_green_mode: str = "poisson",
+        long_range_assignment: str = "cic",
+        long_range_theta: float = 0.5,
+        long_range_leaf_size: int = 32,
+        long_range_multipole_order: int = 0,
+        long_range_far_source_dim: int = 16,
+        long_range_far_num_shells: int = 3,
+        long_range_far_shell_growth: float = 2.0,
+        long_range_far_tail: bool = True,
+        long_range_far_tail_bins: int = 2,
+        long_range_far_stats: str = "mean,count,mean_r,rms_r",
+        long_range_far_max_radius_multiplier: float | None = None,
+        long_range_far_source_norm: bool = True,
+        long_range_far_gate_init: float = 0.0,
+        feature_spectral_mode: str = "none",
+        feature_spectral_bottleneck_dim: int = 8,
+        feature_spectral_mesh_size: int = 16,
+        feature_spectral_filter_hidden_dim: int = 64,
+        feature_spectral_boundary: str = "periodic",
+        feature_spectral_slab_padding_factor: int = 2,
+        feature_spectral_neutralize: bool = True,
+        feature_spectral_include_k0: bool = False,
+        feature_spectral_gate_init: float = 0.0,
     ):
         super().__init__()
         if embed_size is None:
@@ -689,6 +727,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.num_interaction = int(num_interaction)
         if self.num_interaction < 2:
             raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
+        self.invariant_channels = int(invariant_channels)
 
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
@@ -737,7 +776,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         #  - scalars: per-l channel Gram -> 32
         #  - norms: per-l per-channel L2 over m
         combined_channels = self.channels * self.num_interaction
-        scalar_channels = (self.num_interaction - 1) * 32
+        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
         self.W_read = nn.ParameterList([
             nn.Parameter(torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02)
             for _ in range(self.lmax + 1)
@@ -783,6 +822,47 @@ class PureCartesianICTDTransformerLayer(nn.Module):
 
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
         self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+        configure_long_range_modules(
+            self,
+            feature_dim=self.num_interaction * sum_mul + scalar_channels,
+            cutoff_radius=self.max_radius,
+            long_range_mode=long_range_mode,
+            long_range_hidden_dim=long_range_hidden_dim,
+            long_range_boundary=long_range_boundary,
+            long_range_neutralize=long_range_neutralize,
+            long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+            long_range_kmax=long_range_kmax,
+            long_range_mesh_size=long_range_mesh_size,
+            long_range_slab_padding_factor=long_range_slab_padding_factor,
+            long_range_include_k0=long_range_include_k0,
+            long_range_source_channels=long_range_source_channels,
+            long_range_backend=long_range_backend,
+            long_range_reciprocal_backend=long_range_reciprocal_backend,
+            long_range_energy_partition=long_range_energy_partition,
+            long_range_green_mode=long_range_green_mode,
+            long_range_assignment=long_range_assignment,
+            long_range_theta=long_range_theta,
+            long_range_leaf_size=long_range_leaf_size,
+            long_range_multipole_order=long_range_multipole_order,
+            long_range_far_source_dim=long_range_far_source_dim,
+            long_range_far_num_shells=long_range_far_num_shells,
+            long_range_far_shell_growth=long_range_far_shell_growth,
+            long_range_far_tail=long_range_far_tail,
+            long_range_far_tail_bins=long_range_far_tail_bins,
+            long_range_far_stats=long_range_far_stats,
+            long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+            long_range_far_source_norm=long_range_far_source_norm,
+            long_range_far_gate_init=long_range_far_gate_init,
+            feature_spectral_mode=feature_spectral_mode,
+            feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+            feature_spectral_mesh_size=feature_spectral_mesh_size,
+            feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+            feature_spectral_boundary=feature_spectral_boundary,
+            feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+            feature_spectral_neutralize=feature_spectral_neutralize,
+            feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_gate_init=feature_spectral_gate_init,
+        )
 
     def forward(
         self,
@@ -797,7 +877,11 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         precomputed_edge_vec=None,
         return_combined_features: bool = False,
         sync_after_scatter: callable | None = None,
+        return_physical_tensors: bool = False,
+        return_reciprocal_source: bool = False,
     ):
+        if return_physical_tensors:
+            raise ValueError("pure-cartesian-ictd-save does not currently support return_physical_tensors=True")
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
         cell = cell.to(dtype=dtype)
@@ -862,7 +946,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         f_combine = torch.cat(features, dim=-1)  # (N, nC*(lmax+1)^2)
 
         xb = _split_irreps(f_combine, self.channels * self.num_interaction, self.lmax)
-        scalars = torch.zeros(f_combine.shape[0], (self.num_interaction - 1) * 32, device=f_combine.device, dtype=f_combine.dtype)
+        scalars = torch.zeros(
+            f_combine.shape[0],
+            (self.num_interaction - 1) * self.invariant_channels,
+            device=f_combine.device,
+            dtype=f_combine.dtype,
+        )
         for l in range(self.lmax + 1):
             t = xb[l]  # (N,nC,2l+1)
             # e3nn-style component normalization: divide by sqrt(2l+1)
@@ -888,11 +977,30 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             T_blocks[l] = torch.cat(parts, dim=-2)
         T_blocks[0] = torch.cat([T_blocks[0], scalars.unsqueeze(-1)], dim=-2)
         f_prod5 = self.product_5(T_blocks, T_blocks)
+        f_prod5, long_range_energy, reciprocal_source, defer_long_range_to_runtime = apply_long_range_modules(
+            self,
+            f_prod5,
+            pos,
+            batch,
+            cell,
+            edge_src=edge_src,
+            edge_dst=edge_dst,
+            return_reciprocal_source=return_reciprocal_source,
+        )
 
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)
         out = e_out.sum(dim=-1, keepdim=True)
+        if long_range_energy is not None and not defer_long_range_to_runtime:
+            out = out + long_range_energy
         if return_combined_features:
+            if return_reciprocal_source:
+                if reciprocal_source is None:
+                    reciprocal_source = out.new_empty((out.size(0), 0))
+                return out, f_combine, reciprocal_source
             return out, f_combine
+        if return_reciprocal_source:
+            if reciprocal_source is None:
+                reciprocal_source = out.new_empty((out.size(0), 0))
+            return out, reciprocal_source
         return out
-

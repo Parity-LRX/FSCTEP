@@ -500,7 +500,9 @@ class PureCartesianTensorProduct(nn.Module):
         else:
             assert weights is not None
             w = weights
-            per_sample = w.dim() > 1 and w.shape[:-1] == batch_shape
+            # Per-sample weights have one extra trailing weight dimension and otherwise
+            # match the input batch rank, which is trace-friendlier than shape tuple compares.
+            per_sample = w.dim() == x1.dim()
 
         A = split_by_rank(x1, self.C1, self.Lmax)
         B = split_by_rank(x2, self.C2, self.Lmax)
@@ -617,7 +619,7 @@ class PureCartesianTensorProductO3(nn.Module):
         else:
             assert weights is not None
             w = weights
-            per_sample = w.dim() > 1 and w.shape[:-1] == batch_shape
+            per_sample = w.dim() == x1.dim()
 
         A = split_by_rank_o3(x1, self.C1, self.Lmax)
         B = split_by_rank_o3(x2, self.C2, self.Lmax)
@@ -749,7 +751,7 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
         else:
             assert weights is not None
             w = weights
-            per_sample = w.dim() > 1 and w.shape[:-1] == batch_shape
+            per_sample = w.dim() == x1.dim()
 
         A = split_by_rank_o3(x1, self.C1, self.Lmax)
         B = split_by_rank_o3(x2, self.C2, self.Lmax)
@@ -881,4 +883,3 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
                         out_blocks[(s_out, p.Lout)] = out_blocks[(s_out, p.Lout)] + out_c
 
         return merge_by_rank_o3(out_blocks, self.Cout, self.Lmax)
-

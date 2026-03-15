@@ -155,7 +155,13 @@ def export_core(
     )
     from molecular_force_field.utils.config import ModelConfig
 
-    _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-save", "spherical-save-cue")
+    _ts_supported = (
+        "pure-cartesian-sparse",
+        "pure-cartesian-sparse-save",
+        "pure-cartesian-ictd",
+        "pure-cartesian-ictd-save",
+        "spherical-save-cue",
+    )
 
     # Resolve mode and metadata: explicit CLI override > checkpoint > fallback.
     if tensor_product_mode is not None:

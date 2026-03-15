@@ -20,8 +20,8 @@ def main():
                         help='Path to input XYZ file')
     parser.add_argument('--output-dir', type=str, default='data',
                         help='Output directory for preprocessed files (default: data)')
-    parser.add_argument('--max-atom', type=int, default=1,
-                        help='Maximum number of atoms (for padding)')
+    parser.add_argument('--max-atom', type=int, default=None,
+                        help='Legacy padded raw-storage size. Leave unset to use variable-length read_{train,val}.h5.')
     parser.add_argument('--train-ratio', type=float, default=0.95,
                         help='Ratio of training data')
     parser.add_argument('--seed', type=int, default=42,
@@ -33,6 +33,16 @@ def main():
     parser.add_argument('--elements', type=str, nargs='+', default=None,
                         help='Element symbols to recognize (default: None, recognizes all elements from periodic table). '
                              'If specified, only these elements will be recognized. Example: --elements C H O N Fe')
+    parser.add_argument('--energy-key', type=str, default=None,
+                        help='Override the structure-level energy metadata key in extxyz comments (default: energy)')
+    parser.add_argument('--force-key', type=str, default=None,
+                        help='Override the per-atom vector force property key in extxyz Properties (default search: force/forces/f)')
+    parser.add_argument('--species-key', type=str, default=None,
+                        help='Override the per-atom species property key in extxyz Properties (default search: species/symbol/element)')
+    parser.add_argument('--coord-key', type=str, default=None,
+                        help='Override the per-atom coordinate property key in extxyz Properties (default: pos)')
+    parser.add_argument('--atomic-number-key', type=str, default=None,
+                        help='Override the per-atom atomic-number property key in extxyz Properties (default search: Z/atomic_number)')
     parser.add_argument('--skip-h5', action='store_true',
                         help='Skip neighbor list preprocessing (only save raw data)')
     parser.add_argument('--max-radius', type=float, default=5.0,
@@ -50,7 +60,13 @@ def main():
     
     # Extract data blocks
     all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs, all_stresses = extract_data_blocks(
-        args.input_file, elements=args.elements
+        args.input_file,
+        elements=args.elements,
+        energy_key=args.energy_key,
+        force_key=args.force_key,
+        species_key=args.species_key,
+        coord_key=args.coord_key,
+        atomic_number_key=args.atomic_number_key,
     )
     print(f"Total frames: {len(all_blocks)}")
     

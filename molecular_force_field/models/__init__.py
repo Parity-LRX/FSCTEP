@@ -40,10 +40,19 @@ from molecular_force_field.models.pure_cartesian_ictd_layers import (
 from molecular_force_field.models.pure_cartesian_sparse_layers import (
     PureCartesianSparseTransformerLayer,
 )
+from molecular_force_field.models.pure_cartesian_sparse_layers_save import (
+    PureCartesianSparseTransformerLayerSave,
+)
 from molecular_force_field.models.ictd_fast import (
     FastSymmetricSTF,
     FastSymmetricTraceChain,
     decompose_rank2_generic,
+)
+from molecular_force_field.models.zbl import (
+    ZBLConfig,
+    ZBLRepulsionWrapper,
+    compute_zbl_pair_energy,
+    maybe_wrap_model_with_zbl,
 )
 
 __all__ = [
@@ -62,9 +71,14 @@ __all__ = [
     "PureCartesianTransformerLayer",
     "PureCartesianICTDTransformerLayer",
     "PureCartesianSparseTransformerLayer",
+    "PureCartesianSparseTransformerLayerSave",
     "FastSymmetricSTF",
     "FastSymmetricTraceChain",
     "decompose_rank2_generic",
+    "ZBLConfig",
+    "ZBLRepulsionWrapper",
+    "compute_zbl_pair_energy",
+    "maybe_wrap_model_with_zbl",
     "MainNet",
     "MainNet2",
     "RMSELoss",

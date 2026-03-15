@@ -14,6 +14,7 @@ from molecular_force_field.models import (
     CartesianTransformerLayerLoose,
     E3_TransformerLayer_multi,
     PureCartesianSparseTransformerLayer,
+    PureCartesianSparseTransformerLayerSave,
     PureCartesianTransformerLayer,
     PureCartesianICTDTransformerLayer,
 )
@@ -24,6 +25,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
     PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerFull,
 )
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
 )
@@ -126,6 +128,7 @@ def _build_model(
     feature_spectral_neutralize: bool,
     feature_spectral_include_k0: bool,
     feature_spectral_gate_init: float,
+    invariant_channels: int,
 ):
     if tensor_product_mode == "pure-cartesian":
         model = PureCartesianTransformerLayer(
@@ -143,6 +146,7 @@ def _build_model(
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
             num_interaction=num_interaction,
+            invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
             device=device,
@@ -163,6 +167,7 @@ def _build_model(
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
             num_interaction=num_interaction,
+            invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
             internal_compute_dtype=config.dtype,
@@ -218,13 +223,19 @@ def _build_model(
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
             num_interaction=num_interaction,
+            invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
             internal_compute_dtype=config.dtype,
             device=device,
         )
-    elif tensor_product_mode == "pure-cartesian-sparse":
-        model = PureCartesianSparseTransformerLayer(
+    elif tensor_product_mode in {"pure-cartesian-sparse", "pure-cartesian-sparse-save"}:
+        sparse_cls = (
+            PureCartesianSparseTransformerLayerSave
+            if tensor_product_mode == "pure-cartesian-sparse-save"
+            else PureCartesianSparseTransformerLayer
+        )
+        model = sparse_cls(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
             main_number_of_basis=config.number_of_basis_main,
@@ -239,8 +250,11 @@ def _build_model(
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
             num_interaction=num_interaction,
+            invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            max_rank_other=max_rank_other,
+            k_policy=k_policy,
             device=device,
         )
     elif tensor_product_mode == "partial-cartesian":
@@ -259,6 +273,7 @@ def _build_model(
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
             num_interaction=num_interaction,
+            invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
             device=device,
@@ -279,6 +294,7 @@ def _build_model(
             main_hidden_sizes3=config.main_hidden_sizes3,
             num_layers=config.num_layers,
             num_interaction=num_interaction,
+            invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
             device=device,
@@ -563,6 +579,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
         feature_spectral_gate_init=feature_spectral_gate_init,
+        invariant_channels=int(_get_resolved_option(None, arch_meta, "invariant_channels", 32)),
     )
 
     if tensor_product_mode == "spherical-save-cue":
@@ -581,6 +598,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
             )
     else:
         model.load_state_dict(state_dict_ckpt, strict=True)
+    model = maybe_wrap_model_with_zbl(model, arch_meta)
 
     model.eval()
     for param in model.parameters():

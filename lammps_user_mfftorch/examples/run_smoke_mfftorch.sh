@@ -26,7 +26,7 @@ if [[ ! -f "$OUT_DIR/core.pt" || ! -f "$OUT_DIR/core_phys.pt" ]]; then
   python - <<PY
 import os
 import torch
-from molecular_force_field.interfaces.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd
+from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd
 
 out_dir = r"$OUT_DIR"
 ckpt_plain = os.path.join(out_dir, "dummy.pth")

@@ -8,8 +8,10 @@ import torch
 
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
+    infer_physical_tensor_outputs_from_state_dict,
 )
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,11 @@ def build_e3trans_from_checkpoint(
         state = ckpt.get("e3trans_state_dict", {})
         if "e3_conv_emb.external_tensor_scale_by_l" in state:
             external_tensor_rank = 1
+    physical_tensor_outputs = ckpt.get("physical_tensor_outputs")
+    if physical_tensor_outputs is None:
+        physical_tensor_outputs = arch_meta.get("physical_tensor_outputs")
+    if physical_tensor_outputs is None:
+        physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(ckpt.get("e3trans_state_dict", {}))
 
     config = ModelConfig(dtype=torch.float64, max_radius=max_radius)
     if atomic_energy_file:
@@ -121,6 +128,45 @@ def build_e3trans_from_checkpoint(
     feature_spectral_neutralize = bool(arch_meta.get("feature_spectral_neutralize", True))
     feature_spectral_include_k0 = bool(arch_meta.get("feature_spectral_include_k0", False))
     feature_spectral_gate_init = float(arch_meta.get("feature_spectral_gate_init", 0.0))
+    common_long_range_kwargs = dict(
+        long_range_mode=long_range_mode,
+        long_range_hidden_dim=long_range_hidden_dim,
+        long_range_boundary=long_range_boundary,
+        long_range_neutralize=long_range_neutralize,
+        long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+        long_range_kmax=long_range_kmax,
+        long_range_mesh_size=long_range_mesh_size,
+        long_range_slab_padding_factor=long_range_slab_padding_factor,
+        long_range_include_k0=long_range_include_k0,
+        long_range_source_channels=long_range_source_channels,
+        long_range_backend=long_range_backend,
+        long_range_reciprocal_backend=long_range_reciprocal_backend,
+        long_range_energy_partition=long_range_energy_partition,
+        long_range_green_mode=long_range_green_mode,
+        long_range_assignment=long_range_assignment,
+        long_range_theta=long_range_theta,
+        long_range_leaf_size=long_range_leaf_size,
+        long_range_multipole_order=long_range_multipole_order,
+        long_range_far_source_dim=long_range_far_source_dim,
+        long_range_far_num_shells=long_range_far_num_shells,
+        long_range_far_shell_growth=long_range_far_shell_growth,
+        long_range_far_tail=long_range_far_tail,
+        long_range_far_tail_bins=long_range_far_tail_bins,
+        long_range_far_stats=long_range_far_stats,
+        long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+        long_range_far_source_norm=long_range_far_source_norm,
+        long_range_far_gate_init=long_range_far_gate_init,
+        feature_spectral_mode=feature_spectral_mode,
+        feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+        feature_spectral_mesh_size=feature_spectral_mesh_size,
+        feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+        feature_spectral_boundary=feature_spectral_boundary,
+        feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+        feature_spectral_neutralize=feature_spectral_neutralize,
+        feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_gate_init=feature_spectral_gate_init,
+    )
+    invariant_channels = int(arch_meta.get("invariant_channels", 32))
     k_spherical = dict(
         max_embed_radius=cfg.max_radius,
         main_max_radius=cfg.max_radius_main,
@@ -143,6 +189,7 @@ def build_e3trans_from_checkpoint(
         num_interaction=num_interaction,
         function_type_main=cfg.function_type,
         device=device,
+        **common_long_range_kwargs,
     )
     k_cartesian = dict(
         max_embed_radius=cfg.max_radius,
@@ -159,9 +206,11 @@ def build_e3trans_from_checkpoint(
         main_hidden_sizes3=cfg.main_hidden_sizes3,
         num_layers=cfg.num_layers,
         num_interaction=num_interaction,
+        invariant_channels=invariant_channels,
         function_type_main=cfg.function_type,
         lmax=cfg.lmax,
         device=device,
+        **common_long_range_kwargs,
     )
 
     from molecular_force_field.models import (
@@ -170,6 +219,7 @@ def build_e3trans_from_checkpoint(
         CartesianTransformerLayerLoose,
         PureCartesianTransformerLayer,
         PureCartesianSparseTransformerLayer,
+        PureCartesianSparseTransformerLayerSave,
         PureCartesianICTDTransformerLayer,
     )
     from molecular_force_field.models.e3nn_layers_channelwise import (
@@ -180,9 +230,9 @@ def build_e3trans_from_checkpoint(
     )
 
     if mode == "spherical":
-        e3trans = E3_TransformerLayer_multi(**k_spherical)
+        e3trans = E3_TransformerLayer_multi(**k_spherical, invariant_channels=invariant_channels)
     elif mode == "spherical-save":
-        e3trans = E3_TransformerLayer_multi_channelwise(**k_spherical)
+        e3trans = E3_TransformerLayer_multi_channelwise(**k_spherical, invariant_channels=invariant_channels)
     elif mode == "spherical-save-cue":
         from molecular_force_field.models.cue_layers_channelwise import (
             E3_TransformerLayer_multi as E3_TransformerLayer_multi_cue,
@@ -232,9 +282,18 @@ def build_e3trans_from_checkpoint(
         e3trans = CartesianTransformerLayerLoose(**k_cartesian)
     elif mode == "pure-cartesian":
         e3trans = PureCartesianTransformerLayer(**k_cartesian)
-    elif mode == "pure-cartesian-sparse":
-        e3trans = PureCartesianSparseTransformerLayer(
-            **k_cartesian, max_rank_other=1, k_policy="k0"
+    elif mode in {"pure-cartesian-sparse", "pure-cartesian-sparse-save"}:
+        sparse_cls = (
+            PureCartesianSparseTransformerLayerSave
+            if mode == "pure-cartesian-sparse-save"
+            else PureCartesianSparseTransformerLayer
+        )
+        e3trans = sparse_cls(
+            **k_cartesian,
+            max_rank_other=1,
+            k_policy="k0",
+            physical_tensor_outputs=physical_tensor_outputs,
+            external_tensor_rank=external_tensor_rank,
         )
     elif mode == "pure-cartesian-ictd":
         ictd_kwargs = dict(
@@ -282,6 +341,7 @@ def build_e3trans_from_checkpoint(
         ictd_kwargs["feature_spectral_gate_init"] = feature_spectral_gate_init
         e3trans = PureCartesianICTDTransformerLayerFull(
             **k_cartesian,
+            physical_tensor_outputs=physical_tensor_outputs,
             **ictd_kwargs,
         )
     elif mode == "pure-cartesian-ictd-save":
@@ -296,11 +356,12 @@ def build_e3trans_from_checkpoint(
             f"Unsupported tensor_product_mode: {mode}. "
             "Supported: spherical, spherical-save, spherical-save-cue, "
             "partial-cartesian, partial-cartesian-loose, pure-cartesian, "
-            "pure-cartesian-sparse, pure-cartesian-ictd, pure-cartesian-ictd-save"
+            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-save"
         )
 
     e3trans = e3trans.to(device=device, dtype=dtype)
     state = ckpt.get("e3trans_ema_state_dict") or ckpt["e3trans_state_dict"]
     e3trans.load_state_dict(state, strict=True)
+    e3trans = maybe_wrap_model_with_zbl(e3trans, arch_meta)
     e3trans.eval()
     return e3trans, config

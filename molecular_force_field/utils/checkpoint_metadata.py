@@ -19,6 +19,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "function_type": "gaussian",
     "tensor_product_mode": "spherical",
     "num_interaction": 2,
+    "invariant_channels": 32,
     "max_radius": 5.0,
     "max_rank_other": 1,
     "k_policy": "k0",
@@ -61,6 +62,11 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "feature_spectral_neutralize": True,
     "feature_spectral_include_k0": False,
     "feature_spectral_gate_init": 0.0,
+    "zbl_enabled": False,
+    "zbl_inner_cutoff": 0.8,
+    "zbl_outer_cutoff": 1.2,
+    "zbl_exponent": 0.23,
+    "zbl_energy_scale": 1.0,
 }
 
 
@@ -206,6 +212,15 @@ def resolve_model_architecture(
         )
     )
     resolved["num_interaction"] = int(_resolve_value(overrides, checkpoint, arch_meta, "num_interaction", DEFAULT_MODEL_ARCHITECTURE["num_interaction"]))
+    resolved["invariant_channels"] = int(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "invariant_channels",
+            DEFAULT_MODEL_ARCHITECTURE["invariant_channels"],
+        )
+    )
     resolved["max_rank_other"] = int(_resolve_value(overrides, checkpoint, arch_meta, "max_rank_other", DEFAULT_MODEL_ARCHITECTURE["max_rank_other"]))
     resolved["k_policy"] = str(_resolve_value(overrides, checkpoint, arch_meta, "k_policy", DEFAULT_MODEL_ARCHITECTURE["k_policy"]))
     resolved["ictd_tp_path_policy"] = str(
@@ -539,6 +554,51 @@ def resolve_model_architecture(
             arch_meta,
             "feature_spectral_gate_init",
             DEFAULT_MODEL_ARCHITECTURE["feature_spectral_gate_init"],
+        )
+    )
+    resolved["zbl_enabled"] = bool(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "zbl_enabled",
+            DEFAULT_MODEL_ARCHITECTURE["zbl_enabled"],
+        )
+    )
+    resolved["zbl_inner_cutoff"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "zbl_inner_cutoff",
+            DEFAULT_MODEL_ARCHITECTURE["zbl_inner_cutoff"],
+        )
+    )
+    resolved["zbl_outer_cutoff"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "zbl_outer_cutoff",
+            DEFAULT_MODEL_ARCHITECTURE["zbl_outer_cutoff"],
+        )
+    )
+    resolved["zbl_exponent"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "zbl_exponent",
+            DEFAULT_MODEL_ARCHITECTURE["zbl_exponent"],
+        )
+    )
+    resolved["zbl_energy_scale"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "zbl_energy_scale",
+            DEFAULT_MODEL_ARCHITECTURE["zbl_energy_scale"],
         )
     )
     resolved["long_range_num_k"] = _resolve_value(

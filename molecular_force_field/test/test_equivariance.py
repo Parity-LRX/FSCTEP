@@ -185,6 +185,29 @@ def build_e3trans(mode: str, config: ModelConfig, device: torch.device):
             k_policy="k0",
             device=device,
         ).to(device)
+    if mode == "pure-cartesian-sparse-save":
+        from molecular_force_field.models import PureCartesianSparseTransformerLayerSave
+        return PureCartesianSparseTransformerLayerSave(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=2,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            max_rank_other=1,
+            k_policy="k0",
+            device=device,
+        ).to(device)
     if mode == "partial-cartesian":
         from molecular_force_field.models import CartesianTransformerLayer
         return CartesianTransformerLayer(
@@ -456,7 +479,7 @@ def build_e3conv1_l2_module(mode: str, config: ModelConfig, device: torch.device
             function_type=config.function_type_main,
         )
         output_type = "rank2"
-    elif mode == "pure-cartesian-sparse":
+    elif mode in ("pure-cartesian-sparse", "pure-cartesian-sparse-save"):
         from molecular_force_field.models.pure_cartesian_sparse_layers import PureCartesianSparseE3Conv
         conv = PureCartesianSparseE3Conv(
             max_radius=config.max_radius,
@@ -633,7 +656,7 @@ def main():
     ALL_MODES = [
         "spherical", "spherical-save", "spherical-save-cue",
         "partial-cartesian", "partial-cartesian-loose",
-        "pure-cartesian", "pure-cartesian-sparse",
+        "pure-cartesian", "pure-cartesian-sparse", "pure-cartesian-sparse-save",
         "pure-cartesian-ictd", "pure-cartesian-ictd-save",
     ]
     modes = args.modes or ([args.mode] if args.mode else ALL_MODES)
@@ -672,7 +695,7 @@ def main():
         l2_modes = [
             "spherical", "spherical-save", "spherical-save-cue",
             "partial-cartesian", "partial-cartesian-loose",
-            "pure-cartesian", "pure-cartesian-sparse",
+            "pure-cartesian", "pure-cartesian-sparse", "pure-cartesian-sparse-save",
             "pure-cartesian-ictd", "pure-cartesian-ictd-save",
         ]
         for mode in l2_modes:

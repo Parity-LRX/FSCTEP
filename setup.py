@@ -85,6 +85,7 @@ setup(
             "mff-train=molecular_force_field.cli.train:main",
             "mff-evaluate=molecular_force_field.cli.evaluate:main",
             "mff-preprocess=molecular_force_field.cli.preprocess:main",
+            "mff-convert-dataset=molecular_force_field.cli.convert_dataset:main",
             "mff-lammps=molecular_force_field.cli.lammps_interface:main",
             "mff-export-core=molecular_force_field.cli.export_libtorch_core:main",
             "mff-evaluate-pes-coverage=molecular_force_field.cli.evaluate_pes_coverage:main",

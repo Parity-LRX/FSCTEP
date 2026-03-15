@@ -10,6 +10,7 @@ import pandas as pd
 from molecular_force_field.data.preprocessing import (
     extract_data_blocks,
     compute_correction,
+    load_read_blocks,
     save_set,
     save_to_h5_parallel,
 )
@@ -25,22 +26,10 @@ def _read_existing_blocks(data_dir: str, prefix: str = "train"):
     stress_file = os.path.join(data_dir, f"stress_{prefix}.h5")
     if not os.path.exists(read_file) or not os.path.exists(energy_file):
         return None, None, None, None, None
-    df_read = pd.read_hdf(read_file)
     df_energy = pd.read_hdf(energy_file)
     df_cell = pd.read_hdf(cell_file)
-    values = df_read.values
-    is_sep = values[:, 0] == 128128.0
-    group_ids = is_sep.cumsum()
-    clean_values = values[~is_sep]
-    clean_group_ids = group_ids[~is_sep]
-    _, unique_indices = np.unique(clean_group_ids, return_index=True)
-    raw_blocks = np.split(clean_values, unique_indices[1:])
-    blocks = []
-    for blk in raw_blocks:
-        block_list = []
-        for row in blk:
-            block_list.append([row[1], row[2], row[3], row[4], row[5], row[6], row[7]])
-        blocks.append(block_list)
+    raw_blocks = load_read_blocks(read_file)
+    blocks = [blk.tolist() for blk in raw_blocks]
     raw_E = df_energy.values.flatten().tolist()
     cols = list(df_cell.columns)
     if all(c in cols for c in ["ax", "ay", "az", "bx", "by", "bz", "cx", "cy", "cz"]):
@@ -138,7 +127,8 @@ def merge_training_data(
         e0_csv_path: Path to fitted_E0.csv (default: data_dir/fitted_E0.csv)
         max_radius: For save_to_h5_parallel
         num_workers: For save_to_h5_parallel
-        max_atom: Max atoms per structure for padding (default: infer from data)
+        max_atom: Optional legacy padded raw-storage size. Leave as None to keep
+            read_{prefix}.h5 in the default variable-length sample_i format.
 
     Returns:
         Number of new structures added
@@ -203,9 +193,6 @@ def merge_training_data(
             old_blocks, old_raw_E, e0_keys, e0_vals
         )
         correction_E = old_correction + new_correction
-
-    if max_atom is None:
-        max_atom = max(len(b) for b in blocks)
 
     indices = np.arange(len(blocks))
     save_set(

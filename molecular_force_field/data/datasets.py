@@ -9,6 +9,7 @@ from matscipy.neighbours import neighbour_list as matscipy_neighbour_list
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from typing import Tuple, Optional, Dict, Any
+from molecular_force_field.data.preprocessing import load_read_blocks
 
 
 def _load_struct_property_file(file_path: str, *, kind: str) -> torch.Tensor:
@@ -189,7 +190,6 @@ class CustomDataset(Dataset):
         self.max_radius = max_radius
         
         # 1. Read base HDF5 data
-        read_data = pd.read_hdf(read_file_path)
         energy_df = pd.read_hdf(energy_file_path)
         cell_df = pd.read_hdf(cell_file_path)
 
@@ -217,20 +217,15 @@ class CustomDataset(Dataset):
         cells, pbcs = _split_cell_and_pbc_from_cell_df(cell_df)
         
         # 3. Vectorized block splitting
-        values = read_data.values
-        stop_value = 128128.0
-        is_separator = (values == stop_value).any(axis=1)
-        group_ids = is_separator.cumsum()
-        clean_mask = ~is_separator
-        
-        clean_values = values[clean_mask]
-        clean_group_ids = group_ids[clean_mask]
-        _, unique_indices = np.unique(clean_group_ids, return_index=True)
-        
-        # Original block list
         blocks = [
-            torch.tensor(block, dtype=torch.float64)
-            for block in np.split(clean_values, unique_indices[1:])
+            torch.tensor(
+                np.column_stack([
+                    np.arange(len(block), dtype=np.float64),
+                    np.asarray(block, dtype=np.float64),
+                ]),
+                dtype=torch.float64,
+            )
+            for block in load_read_blocks(read_file_path)
         ]
 
         # 4. Multi-process precomputation of ASE neighbor lists

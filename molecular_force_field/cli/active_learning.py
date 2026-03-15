@@ -899,8 +899,15 @@ def main():
 
     if args.external_field_file and not args.external_tensor_rank:
         raise ValueError("--external-field-file requires --external-tensor-rank (e.g. 1 for electric field)")
-    if args.external_tensor_rank and args.tensor_product_mode != "pure-cartesian-ictd":
-        raise ValueError("--external-tensor-rank only supported for --tensor-product-mode pure-cartesian-ictd")
+    if args.external_tensor_rank and args.tensor_product_mode not in {
+        "pure-cartesian-ictd",
+        "pure-cartesian-sparse",
+        "pure-cartesian-sparse-save",
+    }:
+        raise ValueError(
+            "--external-tensor-rank only supported for --tensor-product-mode "
+            "pure-cartesian-ictd, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+        )
 
     # ------------------------------------------------------------------ #
     # Extra train args

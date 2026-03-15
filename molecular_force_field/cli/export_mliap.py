@@ -1,11 +1,16 @@
 """Export a checkpoint to LAMMPS ML-IAP unified format.
 
-Only the following five models support ML-IAP (precomputed_edge_vec / edge forces):
+Current ML-IAP export support is limited to the modes that implement the
+precomputed-edge-vector / edge-force interface:
 - e3nn_layers.py (spherical)
 - e3nn_layers_channelwise.py (spherical-save)
 - cue_layers_channelwise.py (spherical-save-cue, cuEquivariance GPU acceleration)
 - pure_cartesian_ictd_layers.py (pure-cartesian-ictd-save)
 - pure_cartesian_ictd_layers_full.py (pure-cartesian-ictd)
+
+Note:
+- long-range support in Python training/inference now covers all tensor-product modes
+- ML-IAP export support is still constrained by the existing export interface
 
 Usage:
     python -m molecular_force_field.cli.export_mliap checkpoint.pth \\
@@ -53,6 +58,8 @@ def main():
     parser.add_argument("--tensor-product-mode", type=str, default=None,
                         choices=["spherical", "spherical-save", "spherical-save-cue", "pure-cartesian-ictd", "pure-cartesian-ictd-save"],
                         help="Override tensor_product_mode. If not set, restore from checkpoint metadata, else fall back to spherical. "
+                             "ML-IAP export currently supports: spherical, spherical-save, spherical-save-cue, "
+                             "pure-cartesian-ictd, pure-cartesian-ictd-save. "
                              "spherical-save-cue uses cuEquivariance for GPU acceleration.")
     parser.add_argument("--num-interaction", type=int, default=None,
                         help="Override checkpoint num_interaction (applies to all tensor-product-mode). "

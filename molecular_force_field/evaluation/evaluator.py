@@ -7,8 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from molecular_force_field.utils.scatter import scatter
 
-from molecular_force_field.utils.tensor_utils import map_tensor_values
-from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
+from molecular_force_field.utils.tensor_utils import build_physical_tensor_label_blocks, map_tensor_values
 
 
 class Evaluator:
@@ -59,20 +58,16 @@ class Evaluator:
             base = name.replace("_per_atom", "")
             return self.physical_tensor_weights.get(name, self.physical_tensor_weights.get(base, 1.0))
 
-        def _get_embed(rank: int, *, include_trace_chain: bool):
-            key = (rank, include_trace_chain, lmax_model)
-            m = self._phys_label_embedders.get(key)
-            if m is None:
-                m = PhysicalTensorICTDEmbedding(
-                    rank=rank,
-                    lmax_out=lmax_model,
-                    channels_in=1,
-                    channels_out=1,
-                    input_repr="cartesian",
-                    include_trace_chain=include_trace_chain,
-                ).to(self.device)
-                self._phys_label_embedders[key] = m
-            return m
+        def _get_embed(y_tensor: torch.Tensor, rank: int, *, include_trace_chain: bool):
+            return build_physical_tensor_label_blocks(
+                y_tensor,
+                rank=rank,
+                lmax=lmax_model,
+                include_trace_chain=include_trace_chain,
+                representation=getattr(model, "physical_tensor_representation", "ictd"),
+                device=self.device,
+                cache=self._phys_label_embedders,
+            )
 
         for name in ("charge", "charge_per_atom"):
             if name in extras and name in phys_pred:
@@ -94,7 +89,7 @@ class Evaluator:
         for name in ("dipole", "dipole_per_atom"):
             if name in extras and name in phys_pred:
                 w = _phys_weight(name)
-                y_blocks = _get_embed(1, include_trace_chain=False)(extras[name], return_blocks=True)
+                y_blocks = _get_embed(extras[name], 1, include_trace_chain=False)
                 p1 = phys_pred[name].get(1) if isinstance(phys_pred[name], dict) else None
                 if p1 is not None and 1 in y_blocks:
                     phys_loss = phys_loss + w * F.smooth_l1_loss(p1.view(-1), y_blocks[1].view(-1), beta=0.5)
@@ -102,7 +97,7 @@ class Evaluator:
         for name in ("polarizability", "polarizability_per_atom"):
             if name in extras and name in phys_pred:
                 w = _phys_weight(name)
-                y_blocks = _get_embed(2, include_trace_chain=True)(extras[name], return_blocks=True)
+                y_blocks = _get_embed(extras[name], 2, include_trace_chain=True)
                 for l in (0, 2):
                     pl = phys_pred[name].get(l) if isinstance(phys_pred[name], dict) else None
                     if pl is not None and l in y_blocks:
@@ -111,7 +106,7 @@ class Evaluator:
         for name in ("quadrupole", "quadrupole_per_atom"):
             if name in extras and name in phys_pred:
                 w = _phys_weight(name)
-                y_blocks = _get_embed(2, include_trace_chain=True)(extras[name], return_blocks=True)
+                y_blocks = _get_embed(extras[name], 2, include_trace_chain=True)
                 p2 = phys_pred[name].get(2) if isinstance(phys_pred[name], dict) else None
                 if p2 is not None and 2 in y_blocks:
                     phys_loss = phys_loss + w * F.smooth_l1_loss(p2.view(-1), y_blocks[2].view(-1), beta=0.5)

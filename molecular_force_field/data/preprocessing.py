@@ -57,19 +57,52 @@ def _parse_lattice_from_comment(line: str):
         return None
 
 
-def _parse_energy_from_comment(line: str):
+def _canonical_property_name(name: str) -> str:
+    """Normalize property names for tolerant matching."""
+    return str(name).strip().lower()
+
+
+def _candidate_property_names(primary: str | None, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    """Build a de-duplicated candidate-name tuple with an optional override first."""
+    out = []
+    seen = set()
+    for name in ((primary,) if primary else ()) + tuple(defaults):
+        norm = _canonical_property_name(name)
+        if norm and norm not in seen:
+            out.append(norm)
+            seen.add(norm)
+    return tuple(out)
+
+
+def _parse_scalar_from_comment(line: str, key_candidates: tuple[str, ...]):
+    """
+    Parse a scalar metadata value from the extended XYZ comment line.
+
+    Returns np.float64 or None if no candidate key is found.
+    """
+    for key in key_candidates:
+        m = re.search(
+            rf'(^|\s){re.escape(key)}\s*=\s*([+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)',
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            continue
+        try:
+            return np.float64(m.group(2))
+        except Exception:
+            continue
+    return None
+
+
+def _parse_energy_from_comment(line: str, key_candidates: tuple[str, ...] | None = None):
     """
     Parse energy from extended XYZ comment line.
-    Accepts: energy=-29654.7, Energy=..., etc.
+    Accepts: energy=-29654.7, Energy=..., or a caller-specified metadata key.
     Returns: np.float64 or None
     """
-    m = re.search(r'\benergy\s*=\s*([+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)', line, flags=re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return np.float64(m.group(1))
-    except Exception:
-        return None
+    candidates = key_candidates or ("energy",)
+    return _parse_scalar_from_comment(line, candidates)
 
 
 def _parse_stress_from_comment(line: str, cell_9: list = None):
@@ -176,7 +209,16 @@ def _parse_properties_spec(line: str):
         return None
 
 
-def extract_data_blocks(file_path, elements=None):
+def extract_data_blocks(
+    file_path,
+    elements=None,
+    *,
+    energy_key: str | None = None,
+    force_key: str | None = None,
+    species_key: str | None = None,
+    coord_key: str | None = None,
+    atomic_number_key: str | None = None,
+):
     """
     Extract data blocks from XYZ file format.
     
@@ -226,6 +268,13 @@ def extract_data_blocks(file_path, elements=None):
 
     current_natoms = None
     current_properties = None
+    expect_comment = False
+
+    energy_keys = _candidate_property_names(energy_key, ("energy",))
+    force_keys = _candidate_property_names(force_key, ("force", "forces", "f"))
+    coord_keys = _candidate_property_names(coord_key, ("pos",))
+    species_keys = _candidate_property_names(species_key, ("species", "symbol", "element"))
+    atomic_number_keys = _candidate_property_names(atomic_number_key, ("z", "atomic_number"))
 
     for line in data:
         line = line.strip()
@@ -242,6 +291,7 @@ def extract_data_blocks(file_path, elements=None):
                 current_stress = np.zeros((3, 3), dtype=np.float64)
                 current_natoms = None
                 current_properties = None
+                expect_comment = False
             continue
 
         # Frame header: natoms line
@@ -258,17 +308,17 @@ def extract_data_blocks(file_path, elements=None):
                 current_stress = np.zeros((3, 3), dtype=np.float64)
                 current_properties = None
             current_natoms = int(line)
+            expect_comment = True
             continue
-        
-        # Comment line (extended XYZ) - contains energy/pbc/lattice/properties/stress/virial
-        if "energy=" in line.lower() or "properties" in line or "lattice" in line or "pbc" in line or "stress" in line.lower() or "virial" in line.lower():
+
+        if expect_comment:
             # Properties spec (optional)
             spec = _parse_properties_spec(line)
             if spec is not None:
                 current_properties = spec
 
             # Energy
-            raw_e = _parse_energy_from_comment(line)
+            raw_e = _parse_energy_from_comment(line, energy_keys)
             if raw_e is None:
                 raw_e = np.float64(0.0)
             raw_energy_list.append(np.float64(raw_e))
@@ -298,14 +348,12 @@ def extract_data_blocks(file_path, elements=None):
             if parsed_stress is not None:
                 current_stress = parsed_stress
 
+            expect_comment = False
             continue
 
         # Atom line
         parts = line.split()
         if len(parts) < 4:
-            continue
-        symbol = parts[0]
-        if symbol not in elements_set:
             continue
 
         # Parse based on Properties spec if available; otherwise use a tolerant positional fallback.
@@ -326,19 +374,33 @@ def extract_data_blocks(file_path, elements=None):
                     idx += count
 
                 # Normalize property keys to lower-case for tolerant matching
-                vals_lower = {k.lower(): v for k, v in vals.items()}
+                vals_lower = {_canonical_property_name(k): v for k, v in vals.items()}
 
-                # Species/symbol already known
-                pos_tokens = vals_lower.get("pos", None)
+                symbol = None
+                for key in species_keys:
+                    species_tokens = vals_lower.get(key, None)
+                    if species_tokens is not None and len(species_tokens) >= 1:
+                        symbol = species_tokens[0]
+                        break
+                if symbol is None:
+                    symbol = parts[0]
+                if symbol not in elements_set:
+                    continue
+
+                pos_tokens = None
+                for key in coord_keys:
+                    pos_tokens = vals_lower.get(key, None)
+                    if pos_tokens is not None:
+                        break
                 if pos_tokens is None or len(pos_tokens) != 3:
                     raise ValueError("missing pos in Properties")
                 x, y, z = (np.float64(pos_tokens[0]), np.float64(pos_tokens[1]), np.float64(pos_tokens[2]))
 
-                force_tokens = vals_lower.get("force", None)
-                if force_tokens is None:
-                    force_tokens = vals_lower.get("forces", None)
-                if force_tokens is None:
-                    force_tokens = vals_lower.get("f", None)
+                force_tokens = None
+                for key in force_keys:
+                    force_tokens = vals_lower.get(key, None)
+                    if force_tokens is not None:
+                        break
                 if force_tokens is not None and len(force_tokens) == 3:
                     fx, fy, fz = (np.float64(force_tokens[0]), np.float64(force_tokens[1]), np.float64(force_tokens[2]))
                 else:
@@ -351,9 +413,11 @@ def extract_data_blocks(file_path, elements=None):
                     else:
                         fx = fy = fz = np.float64(0.0)
 
-                z_tokens = vals_lower.get("z", None)
-                if z_tokens is None:
-                    z_tokens = vals_lower.get("atomic_number", None)
+                z_tokens = None
+                for key in atomic_number_keys:
+                    z_tokens = vals_lower.get(key, None)
+                    if z_tokens is not None:
+                        break
                 if z_tokens is not None and len(z_tokens) == 1:
                     A = np.int64(z_tokens[0])
                 else:
@@ -364,6 +428,9 @@ def extract_data_blocks(file_path, elements=None):
                 # sym x y z fx fy fz
                 # sym x y z A fx fy fz
                 # sym x y z Z
+                symbol = parts[0]
+                if symbol not in elements_set:
+                    continue
                 x, y, z = np.float64(parts[1]), np.float64(parts[2]), np.float64(parts[3])
                 fx = fy = fz = np.float64(0.0)
                 A = np.int64(atomic_numbers.get(symbol, 0))
@@ -505,7 +572,61 @@ def compute_correction(blocks, raw_energies, keys, fitted_vals):
     return corrections
 
 
-def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=None, stress_list=None, max_atom=1, output_dir='.'):
+def _infer_legacy_max_atom(blocks):
+    """Infer a legacy padding size when padded raw storage is explicitly requested."""
+    if not blocks:
+        return 0
+    return max(len(block) for block in blocks)
+
+
+def load_read_blocks(read_file):
+    """
+    Load raw blocks from read_{prefix}.h5.
+
+    Supports both:
+    - new variable-length HDF5 format: /sample_i/{pos,A,force}
+    - legacy pandas HDF flat table with separators
+
+    Returns:
+        list[np.ndarray] with shape (natoms, 7) columns [x, y, z, A, Fx, Fy, Fz]
+    """
+    try:
+        with h5py.File(read_file, 'r') as f:
+            sample_keys = sorted(
+                (k for k in f.keys() if k.startswith('sample_')),
+                key=lambda x: int(x.split('_', 1)[1]),
+            )
+            if sample_keys:
+                blocks = []
+                for key in sample_keys:
+                    g = f[key]
+                    pos = np.asarray(g['pos'][:], dtype=np.float64)
+                    A = np.asarray(g['A'][:], dtype=np.float64).reshape(-1, 1)
+                    force = np.asarray(g['force'][:], dtype=np.float64)
+                    blocks.append(np.concatenate([pos, A, force], axis=1))
+                return blocks
+    except OSError:
+        pass
+
+    df_read = pd.read_hdf(read_file)
+    values = df_read.values
+    is_sep = (values[:, 0] == 128128.0)
+    group_ids = is_sep.cumsum()
+    clean_values = values[~is_sep]
+    clean_group_ids = group_ids[~is_sep]
+    _, unique_indices = np.unique(clean_group_ids, return_index=True)
+    raw_blocks = np.split(clean_values, unique_indices[1:]) if len(clean_values) else []
+    blocks = []
+    for blk in raw_blocks:
+        arr = blk[:, 1:8].astype(np.float64)
+        # Legacy padded rows are all-zero placeholders with atomic number A=0.
+        # Drop them so downstream processing sees the true variable-length structure.
+        arr = arr[arr[:, 3] > 0]
+        blocks.append(arr)
+    return blocks
+
+
+def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=None, stress_list=None, max_atom=None, output_dir='.'):
     """
     Save dataset to HDF5 and CSV files.
     
@@ -516,7 +637,8 @@ def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=N
         raw_E: List of raw energies
         correction_E: List of correction energies
         cell_list: List of cell matrices
-        max_atom: Maximum number of atoms per structure (for padding)
+        max_atom: Legacy maximum number of atoms per structure for padded raw storage.
+                 If None, read_{prefix}.h5 is saved in variable-length sample groups.
         output_dir: Output directory for files (default: current directory)
     """
     # Create output directory if it doesn't exist
@@ -566,30 +688,43 @@ def save_set(prefix, indices, blocks, raw_E, correction_E, cell_list, pbc_list=N
     df_stress.to_csv(os.path.join(output_dir, f'stress_{prefix}.csv'), index=False)
 
     # 5. Save atomic detailed data (Atom Data / read_*.h5)
-    all_data = []
-    for block in blocks:
-        curr_len = len(block)
-        if curr_len < max_atom:
-            for _ in range(max_atom - curr_len):
-                all_data.append([np.float64(0.0)] * 8)
-        
-        for r_idx, row in enumerate(block):
-            # [Dimension, x, y, z, A, Fx, Fy, Fz]
-            all_data.append([np.float64(r_idx)] + [np.float64(x) for x in row])
-            
-        # Insert separator 128128.0
-        all_data.append([np.float64(128128.0)] + [np.float64(0.0)] * 7)
-    
-    # Remove last extra separator
-    if all_data and all_data[-1][0] == 128128.0:
-        all_data.pop()
-        
-    cols = ['Dimension', 'x', 'y', 'z', 'A', 'Fx', 'Fy', 'Fz']
-    df_atoms = pd.DataFrame(all_data, columns=cols).astype(np.float64)
-    df_atoms.to_hdf(os.path.join(output_dir, f'read_{prefix}.h5'), key='df', mode='w')
-    df_atoms.to_csv(os.path.join(output_dir, f'read_{prefix}.csv'), index=False)
-    
-    print(f"Saved {prefix} set (H5 and CSV) to {output_dir}/ as float64.")
+    read_h5_path = os.path.join(output_dir, f'read_{prefix}.h5')
+    read_csv_path = os.path.join(output_dir, f'read_{prefix}.csv')
+    if max_atom is None:
+        with h5py.File(read_h5_path, 'w') as f:
+            for sample_idx, block in enumerate(blocks):
+                arr = np.asarray(block, dtype=np.float64)
+                g = f.create_group(f'sample_{sample_idx}')
+                g.create_dataset('pos', data=arr[:, 0:3])
+                g.create_dataset('A', data=arr[:, 3].astype(np.int64))
+                g.create_dataset('force', data=arr[:, 4:7])
+        if os.path.exists(read_csv_path):
+            os.remove(read_csv_path)
+        print(f"Saved {prefix} set to {output_dir}/ with variable-length read_{prefix}.h5.")
+    else:
+        max_atom = int(max_atom) if max_atom is not None else _infer_legacy_max_atom(blocks)
+        all_data = []
+        for block in blocks:
+            curr_len = len(block)
+            if curr_len < max_atom:
+                for _ in range(max_atom - curr_len):
+                    all_data.append([np.float64(0.0)] * 8)
+
+            for r_idx, row in enumerate(block):
+                # [Dimension, x, y, z, A, Fx, Fy, Fz]
+                all_data.append([np.float64(r_idx)] + [np.float64(x) for x in row])
+
+            # Insert separator 128128.0
+            all_data.append([np.float64(128128.0)] + [np.float64(0.0)] * 7)
+
+        if all_data and all_data[-1][0] == 128128.0:
+            all_data.pop()
+
+        cols = ['Dimension', 'x', 'y', 'z', 'A', 'Fx', 'Fy', 'Fz']
+        df_atoms = pd.DataFrame(all_data, columns=cols).astype(np.float64)
+        df_atoms.to_hdf(read_h5_path, key='df', mode='w')
+        df_atoms.to_csv(read_csv_path, index=False)
+        print(f"Saved {prefix} set (legacy padded H5 and CSV) to {output_dir}/ as float64.")
 
 
 def process_single_frame(args):
@@ -739,7 +874,6 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
             f"Please run 'mff-preprocess' first to generate the required data files."
         )
             
-    df_read = pd.read_hdf(read_file)
     df_energy = pd.read_hdf(energy_file)
     df_cell = pd.read_hdf(cell_file)
 
@@ -767,14 +901,7 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
         # legacy fallback: periodic iff cell non-zero
         pbcs_all = np.array([(np.abs(c).sum() > 1e-9, np.abs(c).sum() > 1e-9, np.abs(c).sum() > 1e-9) for c in cells_all], dtype=bool)
     
-    # Split Blocks
-    values = df_read.values
-    is_sep = (values[:, 0] == 128128.0)
-    group_ids = is_sep.cumsum()
-    clean_values = values[~is_sep]
-    clean_group_ids = group_ids[~is_sep]
-    _, unique_indices = np.unique(clean_group_ids, return_index=True)
-    blocks = np.split(clean_values, unique_indices[1:])
+    blocks = load_read_blocks(read_file)
     
     total_frames = len(blocks)
     print(f"Total frames to process: {total_frames}")
@@ -782,8 +909,8 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
     tasks = []
     for idx in range(total_frames):
         block = blocks[idx]
-        pos = block[:, 1:4].astype(np.float64)
-        atom_types = block[:, 4].astype(np.int64)
+        pos = block[:, 0:3].astype(np.float64)
+        atom_types = block[:, 3].astype(np.int64)
         cell = cells_all[idx]
         pbc = pbcs_all[idx].tolist() if idx < len(pbcs_all) else None
         tasks.append((idx, pos, atom_types, cell, pbc, max_radius))
@@ -797,13 +924,15 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
     chunk_size = max(1, total_frames // (num_workers * 4))
     
     print(f"Starting Parallel Processing (Workers={num_workers})...")
-    
+
     with h5py.File(output_file, 'w') as f:
-        # Use ProcessPoolExecutor for parallel computation
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # map returns results in order, which is important for HDF5 writing
+        if num_workers <= 1:
+            result_iterator = map(process_single_frame, tasks)
+        else:
+            executor = ProcessPoolExecutor(max_workers=num_workers)
             result_iterator = executor.map(process_single_frame, tasks, chunksize=chunk_size)
-            
+
+        try:
             print("Writing results to HDF5...")
             for res in tqdm(
                 result_iterator,
@@ -815,23 +944,23 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
                 idx = res['idx']
                 block = blocks[idx]
                 # Validation
-                pos_original = block[:, 1:4].astype(np.float64)
-                pos = block[:, 1:4].astype(np.float64)
-                atom_types = block[:, 4].astype(np.int64)
-                forces = block[:, 5:8].astype(np.float64)
+                pos_original = block[:, 0:3].astype(np.float64)
+                pos = block[:, 0:3].astype(np.float64)
+                atom_types = block[:, 3].astype(np.int64)
+                forces = block[:, 4:7].astype(np.float64)
                 original_checksum = np.sum(pos_original)
                 returned_checksum = res['checksum']
-                
+
                 # If checksums don't match, data is corrupted, raise error and stop
                 if not np.isclose(original_checksum, returned_checksum, atol=1e-5):
                     raise ValueError(f"Data Mismatch at index {idx}! Worker processed wrong data.")
-                
+
                 g = f.create_group(f'sample_{idx}')
                 g.create_dataset('pos', data=pos)
                 g.create_dataset('A', data=atom_types)
                 g.create_dataset('y', data=targets[idx])
                 g.create_dataset('force', data=forces)
-                
+
                 # Write ASE computation results
                 g.create_dataset('edge_src', data=res['edge_src'])
                 g.create_dataset('edge_dst', data=res['edge_dst'])
@@ -841,5 +970,8 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
                     g.create_dataset('stress', data=stress_all[idx])
                 else:
                     g.create_dataset('stress', data=np.zeros((3, 3), dtype=np.float64))
+        finally:
+            if num_workers > 1:
+                executor.shutdown()
 
     print(f"Success! Saved to {output_file}")

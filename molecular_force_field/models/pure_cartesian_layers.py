@@ -28,6 +28,7 @@ from e3nn.math import soft_one_hot_linspace
 from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import MainNet, RobustScalarWeightedSum
+from molecular_force_field.models.long_range import apply_long_range_modules, configure_long_range_modules
 from molecular_force_field.models.pure_cartesian import (
     PureCartesianTensorProductO3,
     PureCartesianElementwiseTensorProductO3,
@@ -286,6 +287,7 @@ class PureCartesianTransformerLayer(nn.Module):
         embedding_dim: int = 16,
         max_atomvalue: int = 10,
         output_size: int = 8,
+        invariant_channels: int = 32,
         embed_size=None,
         main_hidden_sizes3=None,
         num_layers: int = 1,
@@ -293,6 +295,42 @@ class PureCartesianTransformerLayer(nn.Module):
         function_type_main: str = "gaussian",
         lmax: int = 2,
         num_interaction: int = 2,
+        long_range_mode: str = "none",
+        long_range_hidden_dim: int = 64,
+        long_range_boundary: str = "nonperiodic",
+        long_range_neutralize: bool = True,
+        long_range_filter_hidden_dim: int = 64,
+        long_range_kmax: int = 2,
+        long_range_mesh_size: int = 16,
+        long_range_slab_padding_factor: int = 2,
+        long_range_include_k0: bool = False,
+        long_range_source_channels: int = 1,
+        long_range_backend: str = "dense_pairwise",
+        long_range_reciprocal_backend: str = "direct_kspace",
+        long_range_energy_partition: str = "potential",
+        long_range_green_mode: str = "poisson",
+        long_range_assignment: str = "cic",
+        long_range_theta: float = 0.5,
+        long_range_leaf_size: int = 32,
+        long_range_multipole_order: int = 0,
+        long_range_far_source_dim: int = 16,
+        long_range_far_num_shells: int = 3,
+        long_range_far_shell_growth: float = 2.0,
+        long_range_far_tail: bool = True,
+        long_range_far_tail_bins: int = 2,
+        long_range_far_stats: str = "mean,count,mean_r,rms_r",
+        long_range_far_max_radius_multiplier: float | None = None,
+        long_range_far_source_norm: bool = True,
+        long_range_far_gate_init: float = 0.0,
+        feature_spectral_mode: str = "none",
+        feature_spectral_bottleneck_dim: int = 8,
+        feature_spectral_mesh_size: int = 16,
+        feature_spectral_filter_hidden_dim: int = 64,
+        feature_spectral_boundary: str = "periodic",
+        feature_spectral_slab_padding_factor: int = 2,
+        feature_spectral_neutralize: bool = True,
+        feature_spectral_include_k0: bool = False,
+        feature_spectral_gate_init: float = 0.0,
     ):
         super().__init__()
         if embed_size is None:
@@ -309,6 +347,7 @@ class PureCartesianTransformerLayer(nn.Module):
         self.num_interaction = int(num_interaction)
         if self.num_interaction < 2:
             raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
+        self.invariant_channels = int(invariant_channels)
 
         self.e3_conv_layers = nn.ModuleList()
         self.e3_conv_layers.append(
@@ -340,7 +379,7 @@ class PureCartesianTransformerLayer(nn.Module):
 
         # product_3: invariant bilinear to (num_interaction-1)*32 scalars
         # Note: product_3 receives combined_channels (num_interaction * channels) as input
-        scalar_channels = (self.num_interaction - 1) * 32
+        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
         self.product_3 = PureCartesianInvariantBilinear(
             channels=self.combined_channels,
             out_channels=scalar_channels,
@@ -357,8 +396,65 @@ class PureCartesianTransformerLayer(nn.Module):
             17,
         )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
+        configure_long_range_modules(
+            self,
+            feature_dim=self.num_interaction * self.product_5_o3.dim_out + scalar_channels,
+            cutoff_radius=max_embed_radius,
+            long_range_mode=long_range_mode,
+            long_range_hidden_dim=long_range_hidden_dim,
+            long_range_boundary=long_range_boundary,
+            long_range_neutralize=long_range_neutralize,
+            long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+            long_range_kmax=long_range_kmax,
+            long_range_mesh_size=long_range_mesh_size,
+            long_range_slab_padding_factor=long_range_slab_padding_factor,
+            long_range_include_k0=long_range_include_k0,
+            long_range_source_channels=long_range_source_channels,
+            long_range_backend=long_range_backend,
+            long_range_reciprocal_backend=long_range_reciprocal_backend,
+            long_range_energy_partition=long_range_energy_partition,
+            long_range_green_mode=long_range_green_mode,
+            long_range_assignment=long_range_assignment,
+            long_range_theta=long_range_theta,
+            long_range_leaf_size=long_range_leaf_size,
+            long_range_multipole_order=long_range_multipole_order,
+            long_range_far_source_dim=long_range_far_source_dim,
+            long_range_far_num_shells=long_range_far_num_shells,
+            long_range_far_shell_growth=long_range_far_shell_growth,
+            long_range_far_tail=long_range_far_tail,
+            long_range_far_tail_bins=long_range_far_tail_bins,
+            long_range_far_stats=long_range_far_stats,
+            long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+            long_range_far_source_norm=long_range_far_source_norm,
+            long_range_far_gate_init=long_range_far_gate_init,
+            feature_spectral_mode=feature_spectral_mode,
+            feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+            feature_spectral_mesh_size=feature_spectral_mesh_size,
+            feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+            feature_spectral_boundary=feature_spectral_boundary,
+            feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+            feature_spectral_neutralize=feature_spectral_neutralize,
+            feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_gate_init=feature_spectral_gate_init,
+        )
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+    def forward(
+        self,
+        pos,
+        A,
+        batch,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        *,
+        precomputed_edge_vec=None,
+        return_physical_tensors: bool = False,
+        return_reciprocal_source: bool = False,
+        **_unused,
+    ):
+        if return_physical_tensors:
+            raise ValueError("pure-cartesian does not currently support return_physical_tensors=True")
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
         cell = cell.to(dtype=dtype)
@@ -400,8 +496,24 @@ class PureCartesianTransformerLayer(nn.Module):
         invs = [self.product_5_o3(f, f) for f in features]
         inv3 = f_prod3 * f_prod3
         f_prod5 = torch.cat(invs + [inv3], dim=-1)
+        f_prod5, long_range_energy, reciprocal_source, defer_long_range_to_runtime = apply_long_range_modules(
+            self,
+            f_prod5,
+            pos,
+            batch,
+            cell,
+            edge_src=edge_src,
+            edge_dst=edge_dst,
+            return_reciprocal_source=return_reciprocal_source,
+        )
 
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)
-        return e_out.sum(dim=-1, keepdim=True)
-
+        atom_energies = e_out.sum(dim=-1, keepdim=True)
+        if long_range_energy is not None and not defer_long_range_to_runtime:
+            atom_energies = atom_energies + long_range_energy
+        if reciprocal_source is None and return_reciprocal_source:
+            reciprocal_source = atom_energies.new_empty((atom_energies.size(0), 0))
+        if return_reciprocal_source:
+            return atom_energies, reciprocal_source
+        return atom_energies

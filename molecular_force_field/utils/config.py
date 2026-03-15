@@ -52,6 +52,11 @@ class ModelConfig:
     # Atomic reference energies (keys, values)
     atomic_energy_keys: torch.Tensor = None
     atomic_energy_values: torch.Tensor = None
+    zbl_enabled: bool = False
+    zbl_inner_cutoff: float = 0.8
+    zbl_outer_cutoff: float = 1.2
+    zbl_exponent: float = 0.23
+    zbl_energy_scale: float = 1.0
     
     def __post_init__(self):
         """Set default values for lists if None."""

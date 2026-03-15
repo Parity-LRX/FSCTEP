@@ -921,4 +921,3 @@ class E3_TransformerLayer_multi(nn.Module):
             assert reciprocal_source is not None
             return atom_energies, reciprocal_source
         return atom_energies
-

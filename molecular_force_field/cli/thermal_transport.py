@@ -467,6 +467,7 @@ def _add_model_loading_args(parser: argparse.ArgumentParser) -> None:
             "partial-cartesian-loose",
             "pure-cartesian",
             "pure-cartesian-sparse",
+            "pure-cartesian-sparse-save",
             "pure-cartesian-ictd",
             "pure-cartesian-ictd-save",
         ],
