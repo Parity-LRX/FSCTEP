@@ -103,7 +103,14 @@ def collate_fn_h5(batch_list):
     src_l, dst_l, shift_l, cell_l, stress_l = [], [], [], [], []
     extras_lists = {}
     extras_masks = {}
-    per_node_keys = ("charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom")
+    per_node_keys = (
+        "charge_per_atom",
+        "dipole_per_atom",
+        "magnetic_moment_per_atom",
+        "polarizability_per_atom",
+        "quadrupole_per_atom",
+        "born_effective_charge_per_atom",
+    )
     
     node_offset = 0
     for i, data in enumerate(batch_list):
@@ -129,7 +136,7 @@ def collate_fn_h5(batch_list):
         node_offset += num_nodes
 
         # Optional extras (graph-level Cartesian labels / global tensors)
-        for k in ("charge", "dipole", "polarizability", "quadrupole", "external_field"):
+        for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in data:
                 extras_lists.setdefault(k, []).append(data[k])
                 extras_masks.setdefault(k, []).append(torch.tensor(True))
@@ -208,7 +215,7 @@ def on_the_fly_collate(batch_list):
         
         num_nodes_accum += num_atoms
 
-        for k in ("charge", "dipole", "polarizability", "quadrupole", "external_field"):
+        for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in item:
                 extras_lists.setdefault(k, []).append(item[k])
                 extras_masks.setdefault(k, []).append(torch.tensor(True))

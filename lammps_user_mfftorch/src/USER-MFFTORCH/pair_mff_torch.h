@@ -48,6 +48,7 @@ class PairMFFTorch : public Pair {
   void validate_external_field_configuration();
   void cache_physical_outputs(const mfftorch::MFFOutputs& out, int nlocal);
   void reset_physical_outputs();
+  torch::Tensor current_fidelity_tensor(const torch::Device& device);
 
   double cut_global_ = 0.0;
   double cutsq_global_ = 0.0;
@@ -57,9 +58,17 @@ class PairMFFTorch : public Pair {
 
   std::vector<int64_t> type2Z_;
   bool use_external_field_ = false;
-  int external_tensor_rank_ = 0;
+  bool use_electric_field_ = false;
+  bool use_magnetic_field_ = false;
+  bool use_rank2_external_field_ = false;
   bool external_field_symmetric_rank2_ = false;
-  std::vector<std::string> external_field_var_names_;
+  bool use_fidelity_input_ = false;
+  bool fidelity_is_variable_ = false;
+  std::string fidelity_var_name_;
+  int64_t fidelity_constant_ = 0;
+  std::vector<std::string> electric_field_var_names_;
+  std::vector<std::string> magnetic_field_var_names_;
+  std::vector<std::string> rank2_external_field_var_names_;
   std::vector<float> cached_external_field_values_;
   torch::Tensor external_tensor_cache_;
   torch::Tensor global_phys_cpu_;

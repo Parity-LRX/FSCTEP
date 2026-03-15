@@ -7,7 +7,7 @@ Supported tensor product modes (all modes that can be loaded via
   pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save,
   pure-cartesian-ictd, pure-cartesian-ictd-save
 
-The ``MyE3NNCalculator`` also supports ICTD models with:
+The ``MyE3NNCalculator`` also supports models with external fields / physical tensor heads:
   * **External field** — pass ``external_tensor`` (shape ``(rank_dim,)`` or
     ``(1, rank_dim)`` on the device) to ``__init__``.  This tensor is passed
     through to ``model.forward(external_tensor=...)`` every ``calculate()``
@@ -20,6 +20,7 @@ The ``MyE3NNCalculator`` also supports ICTD models with:
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -27,6 +28,7 @@ import torch
 from ase.calculators.calculator import Calculator, all_changes
 
 from molecular_force_field.utils.graph_utils import radius_graph_pbc_gpu
+from molecular_force_field.utils.external_tensor_specs import pack_external_tensor_dict
 from molecular_force_field.utils.tensor_utils import map_tensor_values
 
 logger = logging.getLogger(__name__)
@@ -40,13 +42,12 @@ class MyE3NNCalculator(Calculator):
         atomic_energies_dict: Mapping from atomic number (int) to E0 (float).
         device: Torch device.
         max_radius: Neighbour-search cutoff (Å).
-        external_tensor: Optional external field tensor for ICTD models trained
+        external_tensor: Optional external field tensor for models trained
             with ``--external-tensor-rank``.  Shape ``(rank_dim,)`` or
             ``(1, rank_dim)`` on *device*.  ``None`` for non-field models.
         return_physical_tensors: If ``True``, call
             ``model.forward(return_physical_tensors=True)`` and store outputs
-            in ``results["physical_tensors"]``.  Requires an ICTD model with
-            physical tensor heads.
+            in ``results["physical_tensors"]``.  Requires physical tensor heads.
         **kwargs: Forwarded to the ASE ``Calculator`` base class.
     """
 
@@ -59,6 +60,7 @@ class MyE3NNCalculator(Calculator):
         device: torch.device,
         max_radius: float,
         external_tensor: Optional[torch.Tensor] = None,
+        fidelity_id: Optional[int] = None,
         return_physical_tensors: bool = False,
         **kwargs: Any,
     ):
@@ -67,6 +69,7 @@ class MyE3NNCalculator(Calculator):
         self.device = device
         self.max_radius = max_radius
         self.external_tensor = external_tensor
+        self.fidelity_id = fidelity_id
         self.return_physical_tensors = return_physical_tensors
 
         self.keys = torch.tensor(
@@ -127,9 +130,22 @@ class MyE3NNCalculator(Calculator):
         # Build forward kwargs — only pass what the model accepts
         fwd_kwargs: Dict[str, Any] = {}
         if self.external_tensor is not None:
-            fwd_kwargs["external_tensor"] = self.external_tensor
+            external_specs = getattr(self.model, "external_tensor_specs", None)
+            if external_specs and isinstance(self.external_tensor, Mapping):
+                packed_external = pack_external_tensor_dict(
+                    self.external_tensor,
+                    external_specs,
+                    device=self.device,
+                    dtype=pos.dtype,
+                )
+                if packed_external is not None:
+                    fwd_kwargs["external_tensor"] = packed_external
+            else:
+                fwd_kwargs["external_tensor"] = self.external_tensor
         if self.return_physical_tensors:
             fwd_kwargs["return_physical_tensors"] = True
+        if self.fidelity_id is not None and int(getattr(self.model, "num_fidelity_levels", 0) or 0) > 0:
+            fwd_kwargs["fidelity_ids"] = torch.tensor([int(self.fidelity_id)], dtype=torch.long, device=self.device)
 
         out = self.model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, **fwd_kwargs)
 

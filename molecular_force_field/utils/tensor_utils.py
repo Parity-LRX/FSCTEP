@@ -4,6 +4,35 @@ import torch
 from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
 
 
+PHYSICAL_TENSOR_SPEC_MAP = {
+    "charge": [0],
+    "dipole": [1],
+    "magnetic_moment": [1],
+    "polarizability": [0, 2],
+    "quadrupole": [2],
+    "born_effective_charge": [0, 1, 2],
+}
+
+GLOBAL_PHYSICAL_TENSOR_NAMES = (
+    "charge",
+    "dipole",
+    "magnetic_moment",
+    "polarizability",
+    "quadrupole",
+)
+
+PER_ATOM_PHYSICAL_TENSOR_NAMES = (
+    "charge_per_atom",
+    "dipole_per_atom",
+    "magnetic_moment_per_atom",
+    "polarizability_per_atom",
+    "quadrupole_per_atom",
+    "born_effective_charge_per_atom",
+)
+
+ALL_PHYSICAL_TENSOR_NAMES = GLOBAL_PHYSICAL_TENSOR_NAMES + PER_ATOM_PHYSICAL_TENSOR_NAMES
+
+
 def map_tensor_values(x, keys, values):
     """
     Map tensor values according to key-value pairs.
@@ -54,6 +83,7 @@ def build_physical_tensor_label_blocks(
     rank: int,
     lmax: int,
     include_trace_chain: bool,
+    rank2_mode: str = "symmetric",
     representation: str,
     device: torch.device,
     cache: dict | None = None,
@@ -83,18 +113,29 @@ def build_physical_tensor_label_blocks(
                 raise ValueError(
                     f"rank-2 Cartesian label must have shape (...,3,3), (...,9), or (...,6), got {tuple(tensor.shape)}"
                 )
-            tensor = 0.5 * (tensor + tensor.transpose(-1, -2))
             out = {}
+            if rank2_mode == "full":
+                if include_trace_chain:
+                    trace = tensor.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / 3.0
+                    out[0] = trace.unsqueeze(-1).unsqueeze(-1)
+                anti = 0.5 * (tensor - tensor.transpose(-1, -2))
+                out[1] = torch.stack(
+                    (anti[..., 1, 2], anti[..., 2, 0], anti[..., 0, 1]),
+                    dim=-1,
+                ).unsqueeze(-2)
+                tensor = 0.5 * (tensor + tensor.transpose(-1, -2))
+            else:
+                tensor = 0.5 * (tensor + tensor.transpose(-1, -2))
             if include_trace_chain:
                 trace = tensor.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / 3.0
-                out[0] = trace.unsqueeze(-1).unsqueeze(-1)
+                out.setdefault(0, trace.unsqueeze(-1).unsqueeze(-1))
                 eye = torch.eye(3, device=tensor.device, dtype=tensor.dtype)
                 tensor = tensor - trace.unsqueeze(-1).unsqueeze(-1) * eye
             out[2] = tensor.unsqueeze(-3)
             return out
         raise ValueError(f"Unsupported Cartesian label rank={rank}")
 
-    key = (rank, include_trace_chain, lmax)
+    key = (rank, include_trace_chain, lmax, rank2_mode)
     if cache is None:
         cache = {}
     embedder = cache.get(key)
@@ -106,6 +147,57 @@ def build_physical_tensor_label_blocks(
             channels_out=1,
             input_repr="cartesian",
             include_trace_chain=include_trace_chain,
+            rank2_mode=rank2_mode,
         ).to(device)
         cache[key] = embedder
     return embedder(tensor.to(device), return_blocks=True)
+
+
+def derive_born_effective_charge_from_forces(
+    forces: torch.Tensor,
+    external_field: torch.Tensor,
+    batch_idx: torch.Tensor,
+    *,
+    create_graph: bool,
+) -> torch.Tensor:
+    """Compute per-atom BEC tensor as dF/dE for rank-1 external fields."""
+    if forces.ndim != 2 or forces.shape[-1] != 3:
+        raise ValueError(f"forces must have shape (N, 3), got {tuple(forces.shape)}")
+    if external_field.ndim != 2 or external_field.shape[-1] != 3:
+        raise ValueError(
+            f"external_field must have shape (B, 3) for BEC derivation, got {tuple(external_field.shape)}"
+        )
+    if batch_idx.ndim != 1 or batch_idx.shape[0] != forces.shape[0]:
+        raise ValueError(
+            f"batch_idx must have shape (N,), got {tuple(batch_idx.shape)} for N={forces.shape[0]}"
+        )
+
+    num_atoms = int(forces.shape[0])
+    atom_ids = torch.arange(num_atoms, device=forces.device)
+    bec = torch.zeros(num_atoms, 3, 3, dtype=forces.dtype, device=forces.device)
+    eye = torch.eye(num_atoms, dtype=forces.dtype, device=forces.device)
+
+    for alpha in range(3):
+        try:
+            grad = torch.autograd.grad(
+                forces[:, alpha],
+                external_field,
+                grad_outputs=eye,
+                retain_graph=True,
+                create_graph=create_graph,
+                is_grads_batched=True,
+            )[0]
+        except (RuntimeError, TypeError):
+            rows = []
+            for atom in range(num_atoms):
+                row = torch.autograd.grad(
+                    forces[atom, alpha],
+                    external_field,
+                    retain_graph=True,
+                    create_graph=create_graph,
+                )[0]
+                rows.append(row)
+            grad = torch.stack(rows, dim=0)
+        bec[:, alpha, :] = grad[atom_ids, batch_idx, :]
+
+    return bec

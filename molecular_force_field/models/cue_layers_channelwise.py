@@ -30,6 +30,11 @@ import torch.nn as nn
 
 from molecular_force_field.models.long_range import build_feature_spectral_module, build_long_range_module
 from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
+from molecular_force_field.utils.fidelity import (
+    apply_delta_energy_heads,
+    apply_fidelity_embedding,
+    zero_init_module_output,
+)
 
 
 def _require_cue():
@@ -422,6 +427,7 @@ class E3Conv(nn.Module):
         device=None,
         dtype=None,
         force_naive: bool = False,
+        num_fidelity_levels: int = 0,
         **_unused,
     ):
         super().__init__()
@@ -436,6 +442,12 @@ class E3Conv(nn.Module):
         )
         self.fitnet1 = MainNet2(
             input_size=embedding_dim, hidden_sizes=main_hidden_sizes3, output_size=output_size
+        )
+        self.num_fidelity_levels = int(num_fidelity_levels)
+        self.fidelity_embedding = (
+            nn.Embedding(self.num_fidelity_levels, output_size, dtype=default_dtype)
+            if self.num_fidelity_levels > 0
+            else None
         )
 
         self.node_irreps_in_str = f"{int(output_size)}x0e"
@@ -455,7 +467,19 @@ class E3Conv(nn.Module):
             force_naive=force_naive,
         )
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, precomputed_edge_vec=None):
+    def forward(
+        self,
+        pos,
+        A,
+        batch,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        *,
+        precomputed_edge_vec=None,
+        fidelity_ids=None,
+    ):
         if precomputed_edge_vec is not None:
             edge_vec = precomputed_edge_vec
         else:
@@ -468,6 +492,7 @@ class E3Conv(nn.Module):
         num_nodes = pos.size(0)
         atom_embeddings = self.atom_embedding(A.long())
         node_scalars = self.fitnet1(atom_embeddings)
+        node_scalars = apply_fidelity_embedding(node_scalars, batch, fidelity_ids, self.fidelity_embedding)
 
         return self.conv(
             node_feats=node_scalars,
@@ -612,6 +637,8 @@ class E3_TransformerLayer_multi(nn.Module):
         feature_spectral_neutralize: bool = True,
         feature_spectral_include_k0: bool = False,
         feature_spectral_gate_init: float = 0.0,
+        num_fidelity_levels: int = 0,
+        multi_fidelity_mode: str = "conditioning",
     ):
         super().__init__()
         cue, cuet, O3_e3nn = _require_cue()
@@ -666,6 +693,10 @@ class E3_TransformerLayer_multi(nn.Module):
         self.feature_spectral_neutralize = bool(feature_spectral_neutralize)
         self.feature_spectral_include_k0 = bool(feature_spectral_include_k0)
         self.feature_spectral_gate_init = float(feature_spectral_gate_init)
+        self.num_fidelity_levels = int(num_fidelity_levels)
+        self.multi_fidelity_mode = str(multi_fidelity_mode or "conditioning").strip().lower()
+        if self.multi_fidelity_mode not in {"conditioning", "delta-baseline"}:
+            raise ValueError(f"Unsupported multi_fidelity_mode {self.multi_fidelity_mode!r}")
 
         emb_number = [64, 64, 64] if not isinstance(hidden_dim, list) else hidden_dim
 
@@ -688,6 +719,7 @@ class E3_TransformerLayer_multi(nn.Module):
                 edge_attrs_lmax=2,
                 device=self.device,
                 force_naive=force_naive,
+                num_fidelity_levels=self.num_fidelity_levels,
             )
         )
         for _ in range(1, self.num_interaction):
@@ -746,6 +778,19 @@ class E3_TransformerLayer_multi(nn.Module):
 
         self.proj_total = MainNet(product_5_out_dim, embed_size, 17)
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
+        self.delta_proj_total: nn.ModuleDict | None = None
+        self.delta_weighted_sum: nn.ModuleDict | None = None
+        if self.multi_fidelity_mode == "delta-baseline" and self.num_fidelity_levels > 1:
+            self.delta_proj_total = nn.ModuleDict()
+            self.delta_weighted_sum = nn.ModuleDict()
+            for fid in range(1, self.num_fidelity_levels):
+                head = MainNet(product_5_out_dim, embed_size, 17)
+                zero_init_module_output(head)
+                self.delta_proj_total[str(fid)] = head
+                sum_head = RobustScalarWeightedSum(17)
+                with torch.no_grad():
+                    sum_head.weights.zero_()
+                self.delta_weighted_sum[str(fid)] = sum_head
         self.long_range_module = build_long_range_module(
             mode=self.long_range_mode,
             feature_dim=product_5_out_dim,
@@ -848,6 +893,7 @@ class E3_TransformerLayer_multi(nn.Module):
         sync_after_scatter=None,
         return_physical_tensors: bool = False,
         return_reciprocal_source: bool = False,
+        fidelity_ids=None,
     ):
         if return_physical_tensors:
             raise ValueError("spherical-save-cue does not currently support return_physical_tensors=True")
@@ -867,7 +913,17 @@ class E3_TransformerLayer_multi(nn.Module):
             edge_vec = None
 
         features: List[torch.Tensor] = []
-        f_prev = self.e3_conv_layers[0](pos, A, batch, edge_src, edge_dst, edge_shifts, cell, precomputed_edge_vec=edge_vec)
+        f_prev = self.e3_conv_layers[0](
+            pos,
+            A,
+            batch,
+            edge_src,
+            edge_dst,
+            edge_shifts,
+            cell,
+            precomputed_edge_vec=edge_vec,
+            fidelity_ids=fidelity_ids,
+        )
         features.append(f_prev)
         for conv in self.e3_conv_layers[1:]:
             f_prev = conv(f_prev, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, precomputed_edge_vec=edge_vec)
@@ -913,6 +969,15 @@ class E3_TransformerLayer_multi(nn.Module):
         e_out = torch.cat([product_proj], dim=-1)
         e_out = (1) * self.weighted_sum(e_out)
         atom_energies = e_out.sum(dim=-1, keepdim=True)
+        if self.multi_fidelity_mode == "delta-baseline":
+            atom_energies = apply_delta_energy_heads(
+                atom_energies,
+                f2_product_5,
+                batch,
+                fidelity_ids,
+                self.delta_proj_total,
+                self.delta_weighted_sum,
+            )
         if long_range_energy is not None and not defer_long_range_to_runtime:
             atom_energies = atom_energies + long_range_energy
         if reciprocal_source is None and return_reciprocal_source:

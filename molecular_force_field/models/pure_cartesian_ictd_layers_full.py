@@ -31,11 +31,25 @@ from molecular_force_field.models.long_range import build_feature_spectral_modul
 from molecular_force_field.models.ictd_irreps import (
     HarmonicElementwiseProduct,
     HarmonicFullyConnectedTensorProduct,
+    canonical_irrep_parity_sign,
     direction_harmonics,
     direction_harmonics_all,
+    parity_letter_to_sign,
+    parity_sign_to_letter,
+    parse_irreps_string,
 )
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
 from molecular_force_field.models.mlp import MainNet
+from molecular_force_field.utils.external_tensor_specs import (
+    external_tensor_total_numel,
+    normalize_external_tensor_specs,
+    unpack_external_tensor,
+)
+from molecular_force_field.utils.fidelity import (
+    apply_delta_energy_heads,
+    apply_fidelity_embedding,
+    zero_init_module_output,
+)
 
 
 def _irreps_total_dim(channels: int, lmax: int) -> int:
@@ -58,6 +72,79 @@ def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> 
     for l in range(lmax + 1):
         parts.append(blocks[l].reshape(*blocks[l].shape[:-2], channels * (2 * l + 1)))
     return torch.cat(parts, dim=-1)
+
+
+def _normalize_external_tensor_irrep(
+    *,
+    rank: int | None,
+    irrep: str | None,
+    parity: str | int | None,
+) -> str | None:
+    if rank is None:
+        if irrep is not None or parity is not None:
+            raise ValueError("external_tensor_irrep/parity requires external_tensor_rank to be set")
+        return None
+    if irrep is not None:
+        parts = parse_irreps_string(str(irrep))
+        if len(parts) != 1 or parts[0][0] != 1:
+            raise ValueError(f"external_tensor_irrep must describe exactly one irrep, got {irrep!r}")
+        _, l_val, p = parts[0]
+        if l_val != int(rank):
+            raise ValueError(f"external_tensor_irrep {irrep!r} does not match external_tensor_rank={rank}")
+        return f"{l_val}{parity_sign_to_letter(p)}"
+    if parity is None:
+        if int(rank) == 1:
+            return "1o"
+        return f"{int(rank)}{parity_sign_to_letter(canonical_irrep_parity_sign(int(rank)))}"
+    p = parity_letter_to_sign(str(parity)) if isinstance(parity, str) else int(parity)
+    return f"{int(rank)}{parity_sign_to_letter(p)}"
+
+
+def _normalize_physical_tensor_spec(name: str, spec_in: dict, *, lmax: int) -> dict:
+    spec = dict(spec_in)
+    irreps = spec.get("irreps", None)
+    ls = spec.get("ls", None)
+    parity_by_l: dict[int, int] = {}
+    if irreps is not None:
+        parsed = parse_irreps_string(" + ".join(str(x) for x in irreps) if isinstance(irreps, (list, tuple)) else str(irreps))
+        ls = []
+        for mul, l_val, parity in parsed:
+            if mul != 1:
+                raise ValueError(f"physical_tensor_outputs[{name!r}] irreps must use multiplicity 1 entries, got {irreps!r}")
+            if not (0 <= l_val <= lmax):
+                raise ValueError(f"physical_tensor_outputs[{name!r}] l={l_val} out of range 0..lmax={lmax}")
+            if l_val not in ls:
+                ls.append(l_val)
+            parity_by_l[l_val] = parity
+    if ls is None:
+        raise ValueError(f"physical_tensor_outputs[{name!r}] missing 'ls' or 'irreps'")
+    ls = [int(l) for l in ls]
+    for l in ls:
+        if not (0 <= l <= lmax):
+            raise ValueError(f"physical_tensor_outputs[{name!r}] l={l} out of range 0..lmax={lmax}")
+        parity_by_l.setdefault(l, canonical_irrep_parity_sign(l))
+    reduce = str(spec.get("reduce", "sum")).strip().lower()
+    if reduce not in ("sum", "mean", "none"):
+        raise ValueError(f"physical_tensor_outputs[{name!r}] reduce must be 'sum'|'mean'|'none', got {reduce!r}")
+    channels_out = spec.get("channels_out", 1)
+    if isinstance(channels_out, int):
+        ch_out_by_l = {l: int(channels_out) for l in ls}
+    elif isinstance(channels_out, dict):
+        ch_out_by_l = {int(k): int(v) for k, v in channels_out.items()}
+        for l in ls:
+            if l not in ch_out_by_l:
+                raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out missing l={l}")
+    else:
+        raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out must be int or dict, got {type(channels_out)}")
+    for l in ls:
+        if ch_out_by_l[l] <= 0:
+            raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out[{l}] must be positive")
+    spec["ls"] = ls
+    spec["channels_out"] = ch_out_by_l
+    spec["reduce"] = reduce
+    spec["irreps"] = [f"{l}{parity_sign_to_letter(parity_by_l[l])}" for l in ls]
+    spec["parity_by_l"] = {int(l): int(parity_by_l[l]) for l in ls}
+    return spec
 
 def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:
     """
@@ -142,9 +229,13 @@ class ICTDIrrepsE3Conv(nn.Module):
         # Optional: external physical tensor input (e.g. uniform electric field).
         # If set, you may pass `external_tensor` to forward() and it will be embedded into ICTD irreps blocks.
         external_tensor_rank: int | None = None,
+        external_tensor_irrep: str | None = None,
+        external_tensor_parity: str | int | None = None,
+        external_tensor_specs: list[dict] | None = None,
         external_tensor_input_repr: str = "cartesian",
         external_tensor_channels_in: int = 1,
         external_tensor_include_trace_chain: bool = True,
+        num_fidelity_levels: int = 0,
         # Learnable per-l scale for external injection; default 0 keeps behavior unchanged at init.
         external_tensor_scale_init: float = 0.0,
     ):
@@ -161,6 +252,10 @@ class ICTDIrrepsE3Conv(nn.Module):
             nn.Linear(embedding_dim, 64),
             nn.SiLU(),
             nn.Linear(64, output_size),
+        )
+        self.num_fidelity_levels = int(num_fidelity_levels)
+        self.fidelity_embedding = (
+            nn.Embedding(self.num_fidelity_levels, output_size) if self.num_fidelity_levels > 0 else None
         )
 
         self.tp2 = HarmonicFullyConnectedTensorProduct(
@@ -182,8 +277,38 @@ class ICTDIrrepsE3Conv(nn.Module):
         )
 
         # External tensor embedding (optional)
-        self.external_tensor_rank = int(external_tensor_rank) if external_tensor_rank is not None else None
-        if self.external_tensor_rank is not None:
+        self.external_tensor_specs = normalize_external_tensor_specs(
+            external_tensor_specs,
+            external_tensor_rank=external_tensor_rank,
+            external_tensor_irrep=external_tensor_irrep,
+            external_tensor_parity=external_tensor_parity,
+        )
+        self.external_tensor_total_numel = external_tensor_total_numel(self.external_tensor_specs)
+        single_external_spec = self.external_tensor_specs[0] if self.external_tensor_specs and len(self.external_tensor_specs) == 1 else None
+        self.external_tensor_rank = int(single_external_spec["rank"]) if single_external_spec is not None else None
+        self.external_tensor_irrep = str(single_external_spec["irrep"]) if single_external_spec is not None else None
+        if self.external_tensor_specs is not None and len(self.external_tensor_specs) > 1:
+            self.external_tensor_embed = None
+            self.external_tensor_scale_by_l = None
+            self.external_tensor_embeds = nn.ModuleDict(
+                {
+                    str(spec["name"]): PhysicalTensorICTDEmbedding(
+                        rank=int(spec["rank"]),
+                        lmax_out=self.lmax,
+                        channels_in=int(external_tensor_channels_in),
+                        channels_out=1,
+                        input_repr=str(external_tensor_input_repr),
+                        include_trace_chain=bool(external_tensor_include_trace_chain),
+                        rank2_mode="full" if int(spec["rank"]) == 2 else "symmetric",
+                        internal_compute_dtype=internal_compute_dtype,
+                    )
+                    for spec in self.external_tensor_specs
+                }
+            )
+            self.external_tensor_scale_by_spec_l = nn.Parameter(
+                torch.full((len(self.external_tensor_specs), self.lmax + 1), float(external_tensor_scale_init))
+            )
+        elif self.external_tensor_rank is not None:
             self.external_tensor_embed = PhysicalTensorICTDEmbedding(
                 rank=self.external_tensor_rank,
                 lmax_out=self.lmax,
@@ -191,14 +316,19 @@ class ICTDIrrepsE3Conv(nn.Module):
                 channels_out=1,
                 input_repr=str(external_tensor_input_repr),
                 include_trace_chain=bool(external_tensor_include_trace_chain),
+                rank2_mode="full" if self.external_tensor_rank == 2 else "symmetric",
                 internal_compute_dtype=internal_compute_dtype,
             )
             self.external_tensor_scale_by_l = nn.Parameter(
                 torch.full((self.lmax + 1,), float(external_tensor_scale_init))
             )
+            self.external_tensor_embeds = None
+            self.external_tensor_scale_by_spec_l = None
         else:
             self.external_tensor_embed = None
             self.external_tensor_scale_by_l = None
+            self.external_tensor_embeds = None
+            self.external_tensor_scale_by_spec_l = None
 
         self.output_dim = _irreps_total_dim(channels_out, lmax)
 
@@ -218,6 +348,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         # Optional external tensor:
         external_tensor: torch.Tensor | None = None,
         external_tensor_blocks: dict[int, torch.Tensor] | None = None,
+        fidelity_ids: torch.Tensor | None = None,
     ):
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
@@ -236,6 +367,7 @@ class ICTDIrrepsE3Conv(nn.Module):
             edge_length = precomputed_edge_length
 
         Ai = self.atom_mlp(self.atom_embedding(A.long()))  # (N, output_size)
+        Ai = apply_fidelity_embedding(Ai, batch, fidelity_ids, self.fidelity_embedding)
         n = n.to(dtype=Ai.dtype)
         edge_length = edge_length.to(dtype=Ai.dtype)
 
@@ -245,11 +377,21 @@ class ICTDIrrepsE3Conv(nn.Module):
         if external_tensor_blocks is not None:
             ext_blocks = external_tensor_blocks
         elif external_tensor is not None:
-            if self.external_tensor_embed is None:
+            if self.external_tensor_specs is not None and len(self.external_tensor_specs) > 1:
+                unpacked = unpack_external_tensor(external_tensor, self.external_tensor_specs)
+                ext_blocks = {}
+                for spec_idx, spec in enumerate(self.external_tensor_specs):
+                    embed = self.external_tensor_embeds[str(spec["name"])]
+                    blocks_i = embed(unpacked[str(spec["name"])], return_blocks=True)
+                    for l, blk in blocks_i.items():
+                        scale = self.external_tensor_scale_by_spec_l[spec_idx, int(l)]
+                        ext_blocks[l] = blk * scale if l not in ext_blocks else ext_blocks[l] + blk * scale
+            elif self.external_tensor_embed is None:
                 raise ValueError(
                     "external_tensor was provided but ICTDIrrepsE3Conv was not configured with external_tensor_rank"
                 )
-            ext_blocks = self.external_tensor_embed(external_tensor, return_blocks=True)
+            else:
+                ext_blocks = self.external_tensor_embed(external_tensor, return_blocks=True)
 
         if ext_blocks is not None:
             num_nodes = Ai.shape[0]
@@ -377,9 +519,14 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         physical_tensor_outputs: dict[str, dict] | None = None,
         # Optional: external tensor (e.g. electric field) embedding configuration for conv1.
         external_tensor_rank: int | None = None,
+        external_tensor_irrep: str | None = None,
+        external_tensor_parity: str | int | None = None,
+        external_tensor_specs: list[dict] | None = None,
         external_tensor_input_repr: str = "cartesian",
         external_tensor_channels_in: int = 1,
         external_tensor_include_trace_chain: bool = True,
+        num_fidelity_levels: int = 0,
+        multi_fidelity_mode: str = "conditioning",
         external_tensor_scale_init: float = 0.0,
         # Optional prototype long-range module driven by readout invariants.
         long_range_mode: str = "none",
@@ -439,7 +586,21 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
         self.function_type = str(function_type_main)
-        self.external_tensor_rank = int(external_tensor_rank) if external_tensor_rank is not None else None
+        self.external_tensor_specs = normalize_external_tensor_specs(
+            external_tensor_specs,
+            external_tensor_rank=external_tensor_rank,
+            external_tensor_irrep=external_tensor_irrep,
+            external_tensor_parity=external_tensor_parity,
+        )
+        self.external_tensor_total_numel = external_tensor_total_numel(self.external_tensor_specs)
+        single_external_spec = self.external_tensor_specs[0] if self.external_tensor_specs and len(self.external_tensor_specs) == 1 else None
+        self.external_tensor_rank = int(single_external_spec["rank"]) if single_external_spec is not None else None
+        self.external_tensor_irrep = str(single_external_spec["irrep"]) if single_external_spec is not None else None
+        self.num_fidelity_levels = int(num_fidelity_levels)
+        self.multi_fidelity_mode = str(multi_fidelity_mode or "conditioning").strip().lower()
+        if self.multi_fidelity_mode not in {"conditioning", "delta-baseline"}:
+            raise ValueError(f"Unsupported multi_fidelity_mode {self.multi_fidelity_mode!r}")
+        self.physical_tensor_representation = "ictd"
         self.long_range_mode = str(long_range_mode)
         self.long_range_hidden_dim = int(long_range_hidden_dim)
         self.long_range_boundary = str(long_range_boundary)
@@ -493,9 +654,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             ictd_tp_max_rank_other=ictd_tp_max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
             external_tensor_rank=external_tensor_rank,
+            external_tensor_irrep=self.external_tensor_irrep,
+            external_tensor_specs=self.external_tensor_specs,
             external_tensor_input_repr=external_tensor_input_repr,
             external_tensor_channels_in=external_tensor_channels_in,
             external_tensor_include_trace_chain=external_tensor_include_trace_chain,
+            num_fidelity_levels=self.num_fidelity_levels,
             external_tensor_scale_init=external_tensor_scale_init,
         )
 
@@ -573,6 +737,19 @@ class PureCartesianICTDTransformerLayer(nn.Module):
 
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
         self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+        self.delta_proj_total: nn.ModuleDict | None = None
+        self.delta_weighted_sum: nn.ModuleDict | None = None
+        if self.multi_fidelity_mode == "delta-baseline" and self.num_fidelity_levels > 1:
+            self.delta_proj_total = nn.ModuleDict()
+            self.delta_weighted_sum = nn.ModuleDict()
+            for fid in range(1, self.num_fidelity_levels):
+                head = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+                zero_init_module_output(head)
+                self.delta_proj_total[str(fid)] = head
+                sum_head = RobustScalarWeightedSum(17)
+                with torch.no_grad():
+                    sum_head.weights.zero_()
+                self.delta_weighted_sum[str(fid)] = sum_head
         self.long_range_module = build_long_range_module(
             mode=self.long_range_mode,
             feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul + scalar_channels,
@@ -658,38 +835,18 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             for name, spec_in in physical_tensor_outputs.items():
                 if not isinstance(spec_in, dict):
                     raise ValueError(f"physical_tensor_outputs[{name!r}] must be a dict, got {type(spec_in)}")
-                spec = dict(spec_in)
-                ls = spec.get("ls", None)
-                if ls is None:
-                    raise ValueError(f"physical_tensor_outputs[{name!r}] missing 'ls' (list of l to output)")
-                ls = [int(l) for l in ls]
-                for l in ls:
-                    if not (0 <= l <= self.lmax):
-                        raise ValueError(f"physical_tensor_outputs[{name!r}] l={l} out of range 0..lmax={self.lmax}")
-                reduce = str(spec.get("reduce", "sum")).strip().lower()
-                if reduce not in ("sum", "mean", "none"):
-                    raise ValueError(f"physical_tensor_outputs[{name!r}] reduce must be 'sum'|'mean'|'none', got {reduce!r}")
-                channels_out = spec.get("channels_out", 1)
-                if isinstance(channels_out, int):
-                    ch_out_by_l = {l: int(channels_out) for l in ls}
-                elif isinstance(channels_out, dict):
-                    ch_out_by_l = {int(k): int(v) for k, v in channels_out.items()}
-                    for l in ls:
-                        if l not in ch_out_by_l:
-                            raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out missing l={l}")
-                else:
-                    raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out must be int or dict, got {type(channels_out)}")
-
+                spec = _normalize_physical_tensor_spec(name, spec_in, lmax=self.lmax)
+                ls = spec["ls"]
+                reduce = spec["reduce"]
+                ch_out_by_l = spec["channels_out"]
                 per_l = nn.ModuleDict()
                 for l in ls:
-                    if ch_out_by_l[l] <= 0:
-                        raise ValueError(f"physical_tensor_outputs[{name!r}] channels_out[{l}] must be positive")
                     if ch_out_by_l[l] == combined_channels:
                         per_l[str(l)] = nn.Identity()
                     else:
                         per_l[str(l)] = nn.Linear(combined_channels, ch_out_by_l[l], bias=False)
                 heads[name] = per_l
-                self._physical_tensor_specs[name] = {"ls": ls, "reduce": reduce, "channels_out": ch_out_by_l}
+                self._physical_tensor_specs[name] = spec
             self.physical_tensor_heads = heads
 
     def forward(
@@ -707,6 +864,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # Optional external tensor injected at conv1:
         external_tensor: torch.Tensor | None = None,
         external_tensor_blocks: dict[int, torch.Tensor] | None = None,
+        fidelity_ids: torch.Tensor | None = None,
         # Optional physical tensor outputs (default False：推理/MD 仅需能量和力时不计算物理张量头).
         return_physical_tensors: bool = False,
         return_reciprocal_source: bool = False,
@@ -745,6 +903,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             precomputed_Y_list=Y_list,
             external_tensor=external_tensor,
             external_tensor_blocks=external_tensor_blocks,
+            fidelity_ids=fidelity_ids,
         )  # (N, C*(lmax+1)^2)
         if sync_after_scatter is not None:
             f1 = sync_after_scatter(f1)
@@ -878,6 +1037,15 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)
         e_scalar = e_out.sum(dim=-1, keepdim=True)
+        if self.multi_fidelity_mode == "delta-baseline":
+            e_scalar = apply_delta_energy_heads(
+                e_scalar,
+                f_prod5,
+                batch,
+                fidelity_ids,
+                self.delta_proj_total,
+                self.delta_weighted_sum,
+            )
         if long_range_energy is not None and not defer_long_range_to_runtime:
             e_scalar = e_scalar + long_range_energy
         if reciprocal_source is None and return_reciprocal_source:

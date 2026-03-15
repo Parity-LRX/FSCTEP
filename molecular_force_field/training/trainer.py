@@ -17,7 +17,24 @@ import copy
 
 from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
 from molecular_force_field.models.losses import RMSELoss
-from molecular_force_field.utils.tensor_utils import build_physical_tensor_label_blocks, map_tensor_values
+from molecular_force_field.utils.tensor_utils import (
+    ALL_PHYSICAL_TENSOR_NAMES,
+    build_physical_tensor_label_blocks,
+    derive_born_effective_charge_from_forces,
+    map_tensor_values,
+)
+from molecular_force_field.utils.external_tensor_specs import (
+    get_external_tensor_spec,
+    pack_external_tensor_from_extras,
+)
+from molecular_force_field.utils.fidelity import (
+    finalize_per_fidelity_metric_sums,
+    flatten_per_fidelity_metrics,
+    get_graph_fidelity_weights,
+    init_per_fidelity_metric_sums,
+    smooth_l1_loss_stats,
+    update_per_fidelity_metric_sums,
+)
 from molecular_force_field.utils.config import ModelConfig
 
 
@@ -116,6 +133,10 @@ class Trainer:
         inference_output_physical_tensors: bool = False,
         # 物理张量 loss 系数：{"charge": 1.0, "dipole": 2.0, ...}，未指定则 1.0；charge_per_atom 用 charge
         physical_tensor_weights: dict[str, float] | None = None,
+        fidelity_loss_weights: dict[int, float] | None = None,
+        delta_regularization_weight: float = 0.0,
+        bec_derivative_weight: float = 1.0,
+        bec_consistency_weight: float = 0.25,
     ):
         """
         Initialize trainer.
@@ -180,6 +201,10 @@ class Trainer:
         self.tensor_product_mode = tensor_product_mode
         self.inference_output_physical_tensors = inference_output_physical_tensors
         self.physical_tensor_weights = physical_tensor_weights or {}
+        self.fidelity_loss_weights = {int(k): float(v) for k, v in (fidelity_loss_weights or {}).items()}
+        self.delta_regularization_weight = float(delta_regularization_weight)
+        self.bec_derivative_weight = float(bec_derivative_weight)
+        self.bec_consistency_weight = float(bec_consistency_weight)
 
         # Validation-only compile settings
         self.compile_val = str(compile_val)
@@ -375,6 +400,10 @@ class Trainer:
             logging.info(f"  Energy Loss Weight (a): {self.a}")
             logging.info(f"  Force Loss Weight (b): {self.b}")
             logging.info(f"  Stress Loss Weight (c): {self.c}")
+            if self.fidelity_loss_weights:
+                logging.info(f"  Fidelity Loss Weights: {self.fidelity_loss_weights}")
+            if self.delta_regularization_weight > 0:
+                logging.info(f"  Delta Regularization Weight: {self.delta_regularization_weight}")
             if self.swa_start_epoch is not None:
                 logging.info(f"  SWA enabled: Will switch to a={self.swa_a}, b={self.swa_b} at epoch {self.swa_start_epoch}")
             if self.ema_start_epoch is not None:
@@ -444,6 +473,9 @@ class Trainer:
             try:
                 (pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell) = batch_tensors
                 with torch.no_grad():
+                    prewarm = getattr(eval_model, "prewarm_caches", None)
+                    if callable(prewarm):
+                        prewarm(device=self.device, dtype=next(eval_model.parameters()).dtype)
                     self._cudagraph_step_begin_if_available()
                     _ = eval_model(pos.detach(), A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
             except Exception as e:
@@ -562,6 +594,10 @@ class Trainer:
             if invariant_channels is not None:
                 model_hparams["invariant_channels"] = int(invariant_channels)
             for attr_name in (
+                "multi_fidelity_mode",
+                "o3_irrep_preset",
+                "o3_active_irreps_config",
+                "num_fidelity_levels",
                 "max_rank_other",
                 "k_policy",
                 "ictd_tp_path_policy",
@@ -603,17 +639,28 @@ class Trainer:
                 if hasattr(base, attr_name):
                     value = getattr(base, attr_name)
                     if value is not None:
-                        model_hparams[attr_name] = value
+                        model_hparams["o3_active_irreps" if attr_name == "o3_active_irreps_config" else attr_name] = value
             meta["model_hyperparameters"] = model_hparams
 
         phys_specs = getattr(base, "_physical_tensor_specs", None)
         if phys_specs:
             meta["physical_tensor_outputs"] = copy.deepcopy(phys_specs)
+        symmetry_mode = getattr(base, "symmetry_mode", None)
+        if symmetry_mode is not None:
+            meta["symmetry_mode"] = str(symmetry_mode)
 
         e3_conv_emb = getattr(base, "e3_conv_emb", None)
         ext_rank = getattr(e3_conv_emb, "external_tensor_rank", None) if e3_conv_emb is not None else None
         if ext_rank is not None:
             meta["external_tensor_rank"] = int(ext_rank)
+        ext_irrep = getattr(e3_conv_emb, "external_tensor_irrep", None) if e3_conv_emb is not None else None
+        if ext_irrep is not None:
+            meta["external_tensor_irrep"] = str(ext_irrep)
+        ext_specs = getattr(base, "external_tensor_specs", None)
+        if ext_specs is None and e3_conv_emb is not None:
+            ext_specs = getattr(e3_conv_emb, "external_tensor_specs", None)
+        if ext_specs is not None:
+            meta["external_tensor_specs"] = copy.deepcopy(ext_specs)
 
         return meta
 
@@ -633,12 +680,13 @@ class Trainer:
             base = name.replace("_per_atom", "")
             return phys_weights.get(name, phys_weights.get(base, 1.0))
 
-        def _get_embed(y_tensor: torch.Tensor, rank: int, *, include_trace_chain: bool):
+        def _get_embed(y_tensor: torch.Tensor, rank: int, *, include_trace_chain: bool, rank2_mode: str = "symmetric"):
             return build_physical_tensor_label_blocks(
                 y_tensor,
                 rank=rank,
                 lmax=lmax_model,
                 include_trace_chain=include_trace_chain,
+                rank2_mode=rank2_mode,
                 representation=getattr(base_e3, "physical_tensor_representation", "ictd"),
                 device=self.device,
                 cache=emb_cache,
@@ -667,6 +715,21 @@ class Trainer:
 
         # dipole / dipole_per_atom: rank1 -> l=1
         for name in ("dipole", "dipole_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                mask = extras.get(f"{name}_mask", None)
+                mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+                y_cart = extras[name]
+                y_blocks = _get_embed(y_cart, 1, include_trace_chain=False)
+                p1 = phys_pred[name].get(1) if isinstance(phys_pred[name], dict) else None
+                if p1 is None or 1 not in y_blocks:
+                    continue
+                if mask is not None and mask.shape[0] == p1.shape[0]:
+                    phys_loss = phys_loss + w * self.criterion(p1[mask].view(-1), y_blocks[1][mask].view(-1))
+                else:
+                        phys_loss = phys_loss + w * self.criterion(p1.view(-1), y_blocks[1].view(-1))
+
+        for name in ("magnetic_moment", "magnetic_moment_per_atom"):
             if name in extras and name in phys_pred:
                 w = _phys_weight(name)
                 mask = extras.get(f"{name}_mask", None)
@@ -714,7 +777,145 @@ class Trainer:
                 else:
                     phys_loss = phys_loss + w * self.criterion(p2.view(-1), y_blocks[2].view(-1))
 
+        for name in ("born_effective_charge_per_atom",):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                mask = extras.get(f"{name}_mask", None)
+                mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+                y_blocks = _get_embed(extras[name], 2, include_trace_chain=True, rank2_mode="full")
+                for l in (0, 1, 2):
+                    pl = phys_pred[name].get(l) if isinstance(phys_pred[name], dict) else None
+                    if pl is None or l not in y_blocks:
+                        continue
+                    if mask is not None and mask.shape[0] == pl.shape[0]:
+                        phys_loss = phys_loss + w * self.criterion(pl[mask].view(-1), y_blocks[l][mask].view(-1))
+                    else:
+                        phys_loss = phys_loss + w * self.criterion(pl.view(-1), y_blocks[l].view(-1))
+
         return phys_loss
+
+    def _compute_bec_consistency_loss(self, extras, phys_pred, batch_idx, base_e3, f_pred):
+        """Compute BEC derivative supervision and head-vs-derivative consistency."""
+        name = "born_effective_charge_per_atom"
+        external_specs = getattr(base_e3, "external_tensor_specs", None)
+        electric_spec = get_external_tensor_spec(external_specs, "external_field")
+        has_rank1_electric = electric_spec is not None and int(electric_spec["rank"]) == 1
+        if (
+            name not in extras
+            or not isinstance(phys_pred, dict)
+            or name not in phys_pred
+            or "external_field" not in extras
+        ):
+            return torch.tensor(0.0, device=self.device)
+        external_field = extras["external_field"]
+        if external_field.ndim != 2 or external_field.shape[-1] != 3:
+            return torch.tensor(0.0, device=self.device)
+
+        e3_conv_emb = getattr(base_e3, "e3_conv_emb", None)
+        ext_rank = getattr(e3_conv_emb, "external_tensor_rank", None) if e3_conv_emb is not None else None
+        if not has_rank1_electric and ext_rank != 1:
+            return torch.tensor(0.0, device=self.device)
+
+        bec_from_force = derive_born_effective_charge_from_forces(
+            f_pred,
+            external_field,
+            batch_idx,
+            create_graph=True,
+        )
+        mask = extras.get(f"{name}_mask", None)
+        mask = mask.to(dtype=torch.bool) if torch.is_tensor(mask) else None
+        y_blocks = build_physical_tensor_label_blocks(
+            extras[name],
+            rank=2,
+            lmax=int(getattr(base_e3, "lmax", 2)),
+            include_trace_chain=True,
+            rank2_mode="full",
+            representation=getattr(base_e3, "physical_tensor_representation", "ictd"),
+            device=self.device,
+            cache=getattr(self, "_phys_label_embedders", None),
+        )
+        bec_blocks = build_physical_tensor_label_blocks(
+            bec_from_force,
+            rank=2,
+            lmax=int(getattr(base_e3, "lmax", 2)),
+            include_trace_chain=True,
+            rank2_mode="full",
+            representation=getattr(base_e3, "physical_tensor_representation", "ictd"),
+            device=self.device,
+            cache=getattr(self, "_phys_label_embedders", None),
+        )
+
+        loss = torch.tensor(0.0, device=self.device)
+        for l in (0, 1, 2):
+            pred_l = phys_pred[name].get(l)
+            if pred_l is None or l not in y_blocks or l not in bec_blocks:
+                continue
+            y_l = y_blocks[l]
+            bec_l = bec_blocks[l]
+            if mask is not None and mask.shape[0] == pred_l.shape[0]:
+                pred_l = pred_l[mask]
+                y_l = y_l[mask]
+                bec_l = bec_l[mask]
+            if self.bec_derivative_weight > 0:
+                loss = loss + self.bec_derivative_weight * self.criterion(bec_l.view(-1), y_l.view(-1))
+            if self.bec_consistency_weight > 0:
+                loss = loss + self.bec_consistency_weight * self.criterion(pred_l.view(-1), bec_l.view(-1))
+        return loss
+
+    def _get_fidelity_weight_tensors(self, fidelity_ids, batch_idx, *, dtype):
+        """Build graph- and atom-level fidelity weights for optional weighted loss."""
+        graph_weights = get_graph_fidelity_weights(
+            fidelity_ids,
+            self.fidelity_loss_weights,
+            device=self.device,
+            dtype=dtype,
+        )
+        if graph_weights is None:
+            return None, None
+        atom_weights = graph_weights[batch_idx]
+        return graph_weights, atom_weights
+
+    def _compute_delta_regularization(self, base_e3) -> torch.Tensor:
+        """L2 penalty on delta-head parameters, averaged over delta-head parameter count."""
+        if self.delta_regularization_weight <= 0:
+            return torch.tensor(0.0, device=self.device)
+        if str(getattr(base_e3, "multi_fidelity_mode", "conditioning") or "conditioning") != "delta-baseline":
+            return torch.tensor(0.0, device=self.device)
+        reg_sum = torch.tensor(0.0, device=self.device)
+        reg_count = 0
+        for attr_name in ("delta_proj_total", "delta_weighted_sum"):
+            module_dict = getattr(base_e3, attr_name, None)
+            if module_dict is None:
+                continue
+            for module in module_dict.values():
+                for param in module.parameters():
+                    reg_sum = reg_sum + param.pow(2).sum()
+                    reg_count += int(param.numel())
+        if reg_count <= 0:
+            return torch.tensor(0.0, device=self.device)
+        return reg_sum / float(reg_count)
+
+    def _log_per_fidelity_metrics(self, label: str, metrics: dict[int, dict[str, float]]):
+        if not self.is_main_process or not metrics:
+            return
+        for fid, fid_metrics in sorted(metrics.items()):
+            parts = [
+                f"{label} fidelity {fid}",
+                f"N={int(fid_metrics.get('num_graphs', 0))}",
+                f"E_RMSE={fid_metrics.get('energy_rmse', 0.0):.6f}",
+                f"E_MAE={fid_metrics.get('energy_mae', 0.0):.6f}",
+                f"Eatom_RMSE={fid_metrics.get('energy_rmse_avg', 0.0):.6f}",
+                f"Eatom_MAE={fid_metrics.get('energy_mae_avg', 0.0):.6f}",
+            ]
+            if "force_rmse" in fid_metrics:
+                parts.append(f"F_RMSE={fid_metrics['force_rmse']:.6f}")
+            if "force_mae" in fid_metrics:
+                parts.append(f"F_MAE={fid_metrics['force_mae']:.6f}")
+            if "stress_rmse" in fid_metrics:
+                parts.append(f"S_RMSE={fid_metrics['stress_rmse']:.6f}")
+            if "stress_mae" in fid_metrics:
+                parts.append(f"S_MAE={fid_metrics['stress_mae']:.6f}")
+            logging.info(" | ".join(parts))
 
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint and restore training state."""
@@ -789,6 +990,12 @@ class Trainer:
             self.patience_counter = checkpoint['patience_counter']
         if 'physical_tensor_weights' in checkpoint:
             self.physical_tensor_weights = checkpoint['physical_tensor_weights']
+        if 'fidelity_loss_weights' in checkpoint:
+            self.fidelity_loss_weights = {
+                int(k): float(v) for k, v in (checkpoint['fidelity_loss_weights'] or {}).items()
+            }
+        if 'delta_regularization_weight' in checkpoint:
+            self.delta_regularization_weight = float(checkpoint['delta_regularization_weight'])
         
         self.resumed_from_checkpoint = True
         
@@ -809,6 +1016,10 @@ class Trainer:
                 logging.info(f"  Loss weights (from checkpoint): a={self.a:.4f}, b={self.b:.4f}")
             else:
                 logging.info(f"  Loss weights (new, ignoring checkpoint): a={self.a:.4f}, b={self.b:.4f}")
+            if self.fidelity_loss_weights:
+                logging.info(f"  Fidelity Loss Weights: {self.fidelity_loss_weights}")
+            if self.delta_regularization_weight > 0:
+                logging.info(f"  Delta Regularization Weight: {self.delta_regularization_weight}")
             logging.info(f"  Best validation metric (E_RMSE + b/a * F_RMSE): {self.best_val_loss:.6f}")
             logging.info(f"  Early stopping patience counter: {self.patience_counter}/{self.patience}")
             logging.info("=" * 80)
@@ -831,6 +1042,7 @@ class Trainer:
         total_batch_stress_loss = []
         total_batch_stress_rmse = []
         total_batch_phys_loss = []
+        total_batch_delta_reg_loss = []
         
         all_nets = [self.e3trans, self.model]
         all_parameters = [param for net in all_nets for param in net.parameters()]
@@ -972,17 +1184,40 @@ class Trainer:
                 cell_input = cell
 
             # Forward pass (optional external field + optional physical tensor heads)
+            base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
             forward_kwargs = {}
-            if "external_field" in extras:
-                forward_kwargs["external_tensor"] = extras["external_field"]
+            external_specs = getattr(base_e3, "external_tensor_specs", None)
+            num_fidelity_levels = int(getattr(base_e3, "num_fidelity_levels", 0) or 0)
+            fidelity_ids = None
+            if external_specs:
+                if "external_field" in extras:
+                    ext = extras["external_field"]
+                    if "born_effective_charge_per_atom" in extras and ext.ndim == 2 and ext.shape[-1] == 3:
+                        ext = ext.clone().detach().requires_grad_(True)
+                    extras["external_field"] = ext
+                packed_external = pack_external_tensor_from_extras(
+                    extras,
+                    external_specs,
+                    device=self.device,
+                    dtype=pos_input.dtype,
+                )
+                if packed_external is not None:
+                    forward_kwargs["external_tensor"] = packed_external
+            elif "external_field" in extras:
+                ext = extras["external_field"]
+                if "born_effective_charge_per_atom" in extras and ext.ndim == 2 and ext.shape[-1] == 3:
+                    ext = ext.clone().detach().requires_grad_(True)
+                forward_kwargs["external_tensor"] = ext
+                extras["external_field"] = ext
+            if num_fidelity_levels > 0:
+                if "fidelity_id" not in extras:
+                    raise ValueError("Model was configured with num_fidelity_levels but batch extras do not contain fidelity_id")
+                fidelity_ids = extras["fidelity_id"].to(self.device, dtype=torch.long).view(-1)
+                forward_kwargs["fidelity_ids"] = fidelity_ids
 
             want_phys = any(
-                k in extras for k in (
-                    "charge", "dipole", "polarizability", "quadrupole",
-                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
-                )
+                k in extras for k in ALL_PHYSICAL_TENSOR_NAMES
             )
-            base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
             supports_phys = hasattr(base_e3, "physical_tensor_heads") and base_e3.physical_tensor_heads is not None
 
             phys_pred = None
@@ -1032,14 +1267,29 @@ class Trainer:
                 stress_pred = stress_grads / volume.view(-1, 1, 1)  # [B, 3, 3]
             
             force_ref_scaled = force_ref * self.force_shift_value
-            force_loss = self.criterion(f_pred.view(-1), force_ref_scaled.view(-1))
+            graph_fidelity_weights, atom_fidelity_weights = self._get_fidelity_weight_tensors(
+                fidelity_ids,
+                batch_idx,
+                dtype=pos.dtype,
+            )
+            force_loss, _, _ = smooth_l1_loss_stats(
+                f_pred,
+                force_ref_scaled,
+                beta=0.5,
+                weights=atom_fidelity_weights,
+            )
             
             with torch.no_grad():
                 force_rmse = torch.sqrt(self.criterion_2(f_pred.view(-1), force_ref_scaled.view(-1)))
             
             # Stress loss
             if compute_stress:
-                stress_loss = self.criterion(stress_pred.view(-1), stress_ref.view(-1))
+                stress_loss, _, _ = smooth_l1_loss_stats(
+                    stress_pred,
+                    stress_ref,
+                    beta=0.5,
+                    weights=graph_fidelity_weights,
+                )
                 with torch.no_grad():
                     stress_rmse = torch.sqrt(self.criterion_2(stress_pred.view(-1), stress_ref.view(-1)))
             else:
@@ -1050,7 +1300,12 @@ class Trainer:
             num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
             E_avg_pred = E_mean / num_atoms_per_mol
             target_energy_avg = target_energies / num_atoms_per_mol
-            energy_loss = self.criterion(E_avg_pred, target_energy_avg)
+            energy_loss, _, _ = smooth_l1_loss_stats(
+                E_avg_pred,
+                target_energy_avg,
+                beta=0.5,
+                weights=graph_fidelity_weights,
+            )
             
             # Log energy predictions every N batches (only to log file, not console, only on main process)
             if self.is_main_process and self.batch_count % self.energy_log_frequency == 0:
@@ -1094,7 +1349,11 @@ class Trainer:
             phys_loss = torch.tensor(0.0, device=self.device)
             if want_phys and supports_phys and phys_pred is not None:
                 phys_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, base_e3)
+                phys_loss = phys_loss + self._compute_bec_consistency_loss(extras, phys_pred, batch_idx, base_e3, f_pred)
                 total_loss = total_loss + phys_loss
+            delta_reg_loss = self._compute_delta_regularization(base_e3)
+            if self.delta_regularization_weight > 0:
+                total_loss = total_loss + self.delta_regularization_weight * delta_reg_loss
             total_loss.backward()
             
             # Gradient clipping
@@ -1136,6 +1395,7 @@ class Trainer:
             total_batch_stress_loss.append(stress_loss.item())
             total_batch_stress_rmse.append(stress_rmse.item())
             total_batch_phys_loss.append(phys_loss.item())
+            total_batch_delta_reg_loss.append(delta_reg_loss.item())
             
             # Record batch time
             batch_end_time = time.time()
@@ -1150,6 +1410,7 @@ class Trainer:
                     current_force_loss = np.mean(total_batch_force_loss[-10:]) if len(total_batch_force_loss) >= 10 else total_batch_force_loss[-1] if total_batch_force_loss else 0
                     current_stress_loss = np.mean(total_batch_stress_loss[-10:]) if len(total_batch_stress_loss) >= 10 else total_batch_stress_loss[-1] if total_batch_stress_loss else 0
                     current_phys_loss = np.mean(total_batch_phys_loss[-10:]) if len(total_batch_phys_loss) >= 10 else total_batch_phys_loss[-1] if total_batch_phys_loss else 0
+                    current_delta_reg_loss = np.mean(total_batch_delta_reg_loss[-10:]) if len(total_batch_delta_reg_loss) >= 10 else total_batch_delta_reg_loss[-1] if total_batch_delta_reg_loss else 0
                     current_lr = self.optimizer.param_groups[0]['lr']
                     avg_batch_time = np.mean(batch_times[-10:]) if len(batch_times) >= 10 else np.mean(batch_times)
                     elapsed_time = batch_end_time - epoch_start_time
@@ -1159,9 +1420,10 @@ class Trainer:
                     # Log to file only
                     stress_log = f" | Stress Loss: {current_stress_loss:.6f}" if self.c > 0 else ""
                     phys_log = f" | Phys Loss: {current_phys_loss:.6f}" if current_phys_loss > 0 else ""
+                    delta_reg_log = f" | DeltaReg: {current_delta_reg_loss:.6f}" if self.delta_regularization_weight > 0 else ""
                     logging.info(
                         f"Epoch {epoch} | Batch {batch_idx_loader + 1}/{total_batches} | "
-                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log}{phys_log} | "
+                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log}{phys_log}{delta_reg_log} | "
                         f"LR: {current_lr:.2e} | Batch Count: {self.batch_count} | "
                         f"Batch Time: {batch_time:.3f}s | Avg: {avg_batch_time:.3f}s | "
                         f"Elapsed: {elapsed_time:.1f}s | ETA: {eta:.1f}s"
@@ -1191,6 +1453,7 @@ class Trainer:
             'stress_loss': np.mean(total_batch_stress_loss) if total_batch_stress_loss else 0,
             'stress_rmse': np.mean(total_batch_stress_rmse) if total_batch_stress_rmse else 0,
             'phys_loss': np.mean(total_batch_phys_loss) if total_batch_phys_loss else 0,
+            'delta_reg_loss': np.mean(total_batch_delta_reg_loss) if total_batch_delta_reg_loss else 0,
             'epoch_time': epoch_time,
             'avg_batch_time': avg_batch_time,
         }
@@ -1262,6 +1525,15 @@ class Trainer:
         val_S_preds = []
         val_S_targets = []
         val_phys_loss_list = []
+        val_energy_loss_sum = 0.0
+        val_energy_loss_norm = 0.0
+        val_force_loss_sum = 0.0
+        val_force_loss_norm = 0.0
+        val_stress_loss_sum = 0.0
+        val_stress_loss_norm = 0.0
+        meta_eval_model = self.e3trans_ema if (self.use_ema_for_validation and self.ema_enabled and self.e3trans_ema is not None) else (self.e3trans.module if self.distributed else self.e3trans)
+        val_num_fidelity_levels = int(getattr(meta_eval_model, "num_fidelity_levels", 0) or 0)
+        per_fidelity_sums = init_per_fidelity_metric_sums(val_num_fidelity_levels, device=self.device)
         
         total_batches = len(self.val_loader)
         if self.is_main_process:
@@ -1332,13 +1604,27 @@ class Trainer:
                 cell_input = cell
 
             forward_kwargs = {}
-            if "external_field" in extras:
-                forward_kwargs["external_tensor"] = extras["external_field"]
-            want_phys = any(
-                k in extras for k in (
-                    "charge", "dipole", "polarizability", "quadrupole",
-                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+            external_specs = getattr(eval_model, "external_tensor_specs", None)
+            num_fidelity_levels = int(getattr(eval_model, "num_fidelity_levels", 0) or 0)
+            fidelity_ids = None
+            if external_specs:
+                packed_external = pack_external_tensor_from_extras(
+                    extras,
+                    external_specs,
+                    device=self.device,
+                    dtype=pos_input.dtype,
                 )
+                if packed_external is not None:
+                    forward_kwargs["external_tensor"] = packed_external
+            elif "external_field" in extras:
+                forward_kwargs["external_tensor"] = extras["external_field"]
+            if num_fidelity_levels > 0:
+                if "fidelity_id" not in extras:
+                    raise ValueError("Model was configured with num_fidelity_levels but batch extras do not contain fidelity_id")
+                fidelity_ids = extras["fidelity_id"].to(self.device, dtype=torch.long).view(-1)
+                forward_kwargs["fidelity_ids"] = fidelity_ids
+            want_phys = any(
+                k in extras for k in ALL_PHYSICAL_TENSOR_NAMES
             )
             supports_phys = hasattr(eval_model, "physical_tensor_heads") and eval_model.physical_tensor_heads is not None
             phys_pred = None
@@ -1384,7 +1670,40 @@ class Trainer:
                 stress_pred = stress_grads / volume.view(-1, 1, 1)
             
             f_ref_final = force_ref * self.force_shift_value
-            
+            num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
+            E_avg_pred = E_mean_val / num_atoms_per_mol
+            E_avg_target = target_energies / num_atoms_per_mol
+            graph_fidelity_weights, atom_fidelity_weights = self._get_fidelity_weight_tensors(
+                fidelity_ids,
+                batch_idx,
+                dtype=pos.dtype,
+            )
+            _, batch_energy_loss_sum, batch_energy_loss_norm = smooth_l1_loss_stats(
+                E_avg_pred,
+                E_avg_target,
+                beta=0.5,
+                weights=graph_fidelity_weights,
+            )
+            _, batch_force_loss_sum, batch_force_loss_norm = smooth_l1_loss_stats(
+                f_pred_final,
+                f_ref_final,
+                beta=0.5,
+                weights=atom_fidelity_weights,
+            )
+            val_energy_loss_sum += float(batch_energy_loss_sum.item())
+            val_energy_loss_norm += float(batch_energy_loss_norm.item())
+            val_force_loss_sum += float(batch_force_loss_sum.item())
+            val_force_loss_norm += float(batch_force_loss_norm.item())
+            if compute_stress:
+                _, batch_stress_loss_sum, batch_stress_loss_norm = smooth_l1_loss_stats(
+                    stress_pred,
+                    stress_ref,
+                    beta=0.5,
+                    weights=graph_fidelity_weights,
+                )
+                val_stress_loss_sum += float(batch_stress_loss_sum.item())
+                val_stress_loss_norm += float(batch_stress_loss_norm.item())
+
             # Detach and move to CPU (no gradients needed after force calculation)
             with torch.no_grad():
                 E_pred_batch = E_mean_val.detach().cpu()
@@ -1393,9 +1712,8 @@ class Trainer:
                 val_E_preds.append(E_pred_batch)
                 val_E_targets.append(E_target_batch)
                 
-                num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
-                val_E_avg_preds.append((E_mean_val / num_atoms_per_mol).detach().cpu())
-                val_E_avg_targets.append((target_energies / num_atoms_per_mol).detach().cpu())
+                val_E_avg_preds.append(E_avg_pred.detach().cpu())
+                val_E_avg_targets.append(E_avg_target.detach().cpu())
                 
                 val_F_preds.append(f_pred_final.detach().cpu())
                 val_F_targets.append(f_ref_final.detach().cpu())
@@ -1403,10 +1721,22 @@ class Trainer:
                 if compute_stress:
                     val_S_preds.append(stress_pred.detach().cpu())
                     val_S_targets.append(stress_ref.detach().cpu())
+                update_per_fidelity_metric_sums(
+                    per_fidelity_sums,
+                    graph_fidelity_ids=fidelity_ids,
+                    batch_idx=batch_idx,
+                    energy_preds=E_mean_val.detach(),
+                    energy_targets=target_energies.detach(),
+                    energy_avg_preds=E_avg_pred.detach(),
+                    energy_avg_targets=E_avg_target.detach(),
+                    force_preds=f_pred_final.detach(),
+                    force_targets=f_ref_final.detach(),
+                    stress_preds=stress_pred.detach() if compute_stress else None,
+                    stress_targets=stress_ref.detach() if compute_stress else None,
+                )
                 if want_phys and supports_phys and phys_pred is not None:
-                    val_phys_loss_list.append(
-                        self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, eval_model).detach().item()
-                    )
+                    p_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, eval_model)
+                    val_phys_loss_list.append(p_loss.detach().item())
                 
                 # Stream output: log first sample's restored energy (consistent with original train-val.py)
                 # Only log on main process
@@ -1471,6 +1801,29 @@ class Trainer:
             if all_S_preds.numel() > 0:
                 all_S_preds = self._gather_variable_tensors(all_S_preds)
                 all_S_targets = self._gather_variable_tensors(all_S_targets)
+            loss_stats = torch.tensor(
+                [
+                    val_energy_loss_sum,
+                    val_energy_loss_norm,
+                    val_force_loss_sum,
+                    val_force_loss_norm,
+                    val_stress_loss_sum,
+                    val_stress_loss_norm,
+                ],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
+            (
+                val_energy_loss_sum,
+                val_energy_loss_norm,
+                val_force_loss_sum,
+                val_force_loss_norm,
+                val_stress_loss_sum,
+                val_stress_loss_norm,
+            ) = loss_stats.tolist()
+            if per_fidelity_sums is not None:
+                dist.all_reduce(per_fidelity_sums, op=dist.ReduceOp.SUM)
         
         # Verify shapes match
         assert all_E_preds.shape == all_E_targets.shape, \
@@ -1498,24 +1851,30 @@ class Trainer:
         val_energy_mae_avg = F.l1_loss(all_E_avg_preds, all_E_avg_targets).item()
         val_energy_mae_avg = self.val_dataset.restore_energy(val_energy_mae_avg)  # Restore units
         
-        val_energy_loss = F.mse_loss(all_E_avg_preds, all_E_avg_targets).item()  # For logging
+        val_energy_loss = val_energy_loss_sum / max(1.0, val_energy_loss_norm)
         
         # Force metrics (already restored in loop, but restore again for consistency)
         val_force_rmse = torch.sqrt(F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1))).item()
         val_force_rmse = self.val_dataset.restore_force(val_force_rmse)  # Restore units for consistency
         val_force_mae = F.l1_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()
         val_force_mae = self.val_dataset.restore_force(val_force_mae)  # Restore units for consistency
-        val_force_loss = F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()  # For logging
+        val_force_loss = val_force_loss_sum / max(1.0, val_force_loss_norm)
         
         # Stress metrics
         if all_S_preds.numel() > 0:
             val_stress_rmse = torch.sqrt(F.mse_loss(all_S_preds.view(-1), all_S_targets.view(-1))).item()
             val_stress_mae = F.l1_loss(all_S_preds.view(-1), all_S_targets.view(-1)).item()
-            val_stress_loss = F.mse_loss(all_S_preds.view(-1), all_S_targets.view(-1)).item()
+            val_stress_loss = val_stress_loss_sum / max(1.0, val_stress_loss_norm)
         else:
             val_stress_rmse = 0.0
             val_stress_mae = 0.0
             val_stress_loss = 0.0
+
+        per_fidelity_metrics = finalize_per_fidelity_metric_sums(
+            per_fidelity_sums,
+            restore_energy=self.val_dataset.restore_energy,
+            restore_force=self.val_dataset.restore_force,
+        )
 
         # Keep total loss for logging, but use a composite metric for best/early-stop:
         # metric = val_energy_rmse + (b/a) * val_force_rmse
@@ -1530,15 +1889,15 @@ class Trainer:
             stress_log_lines = ""
             if self.c > 0:
                 stress_log_lines = f"""
-                                "Val Stress Loss (MSE)": {val_stress_loss},
+                                "Val Stress Loss (weighted SmoothL1)": {val_stress_loss},
                                 "Val Stress RMSE": {val_stress_rmse},
                                 "Val Stress MAE": {val_stress_mae},"""
             phys_log_lines = f"""
                                 "Val Phys Loss (weighted)": {val_phys_loss},""" if val_phys_loss > 0 else ""
             logging.info(f"""
-                                "Val Loss (MSE)": {val_energy_loss},
-                                "Val Force Loss (MSE)": {val_force_loss},{stress_log_lines}{phys_log_lines}
-                                "Val Total Loss (E+F+S, weighted)": {current_val_loss},
+                                "Val Energy Loss (weighted SmoothL1)": {val_energy_loss},
+                                "Val Force Loss (weighted SmoothL1)": {val_force_loss},{stress_log_lines}{phys_log_lines}
+                                "Val Total Loss (a*E+b*F+c*S+phys)": {current_val_loss},
                                 "Val Energy RMSE": {val_energy_rmse},
                                 "Val Energy MAE": {val_energy_mae},
                                 "Val Energy RMSE/atom": {val_energy_rmse_avg},
@@ -1551,6 +1910,7 @@ class Trainer:
                                 "b (force weight)": {self.b},
                                 "c (stress weight)": {self.c}
                                 """)
+            self._log_per_fidelity_metrics("Val", per_fidelity_metrics)
 
         # Save validation results (only on main process)
         if self.is_main_process:
@@ -1611,6 +1971,8 @@ class Trainer:
                     'tensor_product_mode': self.tensor_product_mode,
                     'inference_output_physical_tensors': self.inference_output_physical_tensors,
                     'physical_tensor_weights': self.physical_tensor_weights,
+                    'fidelity_loss_weights': self.fidelity_loss_weights,
+                    'delta_regularization_weight': self.delta_regularization_weight,
                     'atomic_energy_keys': self.keys.detach().cpu(),
                     'atomic_energy_values': self.values.detach().cpu(),
                 }
@@ -1691,6 +2053,8 @@ class Trainer:
                 'train_stress_rmse': train_metrics.get('train_stress_rmse', 0),
                 'train_stress_mae': train_metrics.get('train_stress_mae', 0),
             })
+            record.update(flatten_per_fidelity_metrics(train_metrics.get('train_per_fidelity', {}), prefix='train'))
+        record.update(flatten_per_fidelity_metrics(per_fidelity_metrics, prefix='val'))
         
         # Only save on main process
         if self.is_main_process:
@@ -1723,6 +2087,8 @@ class Trainer:
                 'tensor_product_mode': self.tensor_product_mode,
                 'inference_output_physical_tensors': self.inference_output_physical_tensors,
                 'physical_tensor_weights': self.physical_tensor_weights,
+                'fidelity_loss_weights': self.fidelity_loss_weights,
+                'delta_regularization_weight': self.delta_regularization_weight,
                 'atomic_energy_keys': self.keys.detach().cpu(),
                 'atomic_energy_values': self.values.detach().cpu(),
             }
@@ -1752,6 +2118,7 @@ class Trainer:
         self.e3trans.eval()
 
         eval_model = self.e3trans.module if self.distributed else self.e3trans
+        num_fidelity_levels_model = int(getattr(eval_model, "num_fidelity_levels", 0) or 0)
 
         energy_loss_sum = 0.0
         force_loss_sum = 0.0
@@ -1770,6 +2137,7 @@ class Trainer:
         energy_mae_avg_sum = 0.0
         force_mae_sum = 0.0
         stress_mae_sum = 0.0
+        per_fidelity_sums = init_per_fidelity_metric_sums(num_fidelity_levels_model, device=self.device)
 
         # Determine if we should use sampling
         use_sampling = self.train_eval_sample_ratio < 1.0
@@ -1858,11 +2226,28 @@ class Trainer:
             E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
 
             extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
-            want_phys = any(
-                k in extras for k in (
-                    "charge", "dipole", "polarizability", "quadrupole",
-                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+            forward_kwargs = {}
+            external_specs = getattr(eval_model, "external_tensor_specs", None)
+            num_fidelity_levels = int(getattr(eval_model, "num_fidelity_levels", 0) or 0)
+            fidelity_ids = None
+            if external_specs:
+                packed_external = pack_external_tensor_from_extras(
+                    extras,
+                    external_specs,
+                    device=self.device,
+                    dtype=pos_input.dtype,
                 )
+                if packed_external is not None:
+                    forward_kwargs["external_tensor"] = packed_external
+            elif "external_field" in extras:
+                forward_kwargs["external_tensor"] = extras["external_field"]
+            if num_fidelity_levels > 0:
+                if "fidelity_id" not in extras:
+                    raise ValueError("Model was configured with num_fidelity_levels but batch extras do not contain fidelity_id")
+                fidelity_ids = extras["fidelity_id"].to(self.device, dtype=torch.long).view(-1)
+                forward_kwargs["fidelity_ids"] = fidelity_ids
+            want_phys = any(
+                k in extras for k in ALL_PHYSICAL_TENSOR_NAMES
             )
             supports_phys = hasattr(eval_model, "physical_tensor_heads") and eval_model.physical_tensor_heads is not None
             phys_pred = None
@@ -1871,11 +2256,12 @@ class Trainer:
                     out = eval_model(
                         pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
                         return_physical_tensors=True,
+                        **forward_kwargs,
                     )
                 except TypeError:
                     out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
             else:
-                out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+                out = eval_model(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
             E_per_atom = out[0] if isinstance(out, tuple) else out
             if isinstance(out, tuple) and len(out) >= 2:
                 phys_pred = out[1]
@@ -1906,21 +2292,33 @@ class Trainer:
                 stress_pred = stress_grads / volume.view(-1, 1, 1)
 
             force_ref_scaled = force_ref * self.force_shift_value
-            force_loss = self.criterion(f_pred.view(-1), force_ref_scaled.view(-1))
+            graph_fidelity_weights, atom_fidelity_weights = self._get_fidelity_weight_tensors(
+                fidelity_ids,
+                batch_idx,
+                dtype=pos.dtype,
+            )
+            force_loss, force_loss_sum_batch, force_loss_norm_batch = smooth_l1_loss_stats(
+                f_pred,
+                force_ref_scaled,
+                beta=0.5,
+                weights=atom_fidelity_weights,
+            )
 
             num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
             E_avg_pred = E_mean / num_atoms_per_mol
             target_energy_avg = target_energies / num_atoms_per_mol
-            energy_loss = self.criterion(E_avg_pred, target_energy_avg)
+            energy_loss, energy_loss_sum_batch, energy_loss_norm_batch = smooth_l1_loss_stats(
+                E_avg_pred,
+                target_energy_avg,
+                beta=0.5,
+                weights=graph_fidelity_weights,
+            )
 
             # Accumulate sums for weighted averages
-            num_molecules = int(E_avg_pred.numel())
-            num_force_elements = int(force_ref_scaled.numel())
-
-            energy_loss_sum += energy_loss.item() * num_molecules
-            force_loss_sum += force_loss.item() * num_force_elements
-            energy_count += num_molecules
-            force_count += num_force_elements
+            energy_loss_sum += energy_loss_sum_batch.item()
+            force_loss_sum += force_loss_sum_batch.item()
+            energy_count += energy_loss_norm_batch.item()
+            force_count += force_loss_norm_batch.item()
             if want_phys and supports_phys and phys_pred is not None:
                 p_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, eval_model)
                 phys_loss_sum += p_loss.item()
@@ -1934,12 +2332,30 @@ class Trainer:
             force_mae_sum += F.l1_loss(f_pred.view(-1), force_ref_scaled.view(-1), reduction='sum').item()
 
             if compute_stress:
-                num_stress_elements = int(stress_ref.numel())
-                s_loss = self.criterion(stress_pred.view(-1), stress_ref.view(-1))
-                stress_loss_sum += s_loss.item() * num_stress_elements
-                stress_count += num_stress_elements
+                _, stress_loss_sum_batch, stress_loss_norm_batch = smooth_l1_loss_stats(
+                    stress_pred,
+                    stress_ref,
+                    beta=0.5,
+                    weights=graph_fidelity_weights,
+                )
+                stress_loss_sum += stress_loss_sum_batch.item()
+                stress_count += stress_loss_norm_batch.item()
                 stress_mse_sum += F.mse_loss(stress_pred.view(-1), stress_ref.view(-1), reduction='sum').item()
                 stress_mae_sum += F.l1_loss(stress_pred.view(-1), stress_ref.view(-1), reduction='sum').item()
+
+            update_per_fidelity_metric_sums(
+                per_fidelity_sums,
+                graph_fidelity_ids=fidelity_ids,
+                batch_idx=batch_idx,
+                energy_preds=E_mean.detach(),
+                energy_targets=target_energies.detach(),
+                energy_avg_preds=E_avg_pred.detach(),
+                energy_avg_targets=target_energy_avg.detach(),
+                force_preds=f_pred.detach(),
+                force_targets=force_ref_scaled.detach(),
+                stress_preds=stress_pred.detach() if compute_stress else None,
+                stress_targets=stress_ref.detach() if compute_stress else None,
+            )
 
         # Sync metrics across processes
         if self.distributed:
@@ -1956,6 +2372,8 @@ class Trainer:
                 energy_mse_sum, energy_mse_avg_sum, force_mse_sum, stress_mse_sum,
                 energy_mae_sum, energy_mae_avg_sum, force_mae_sum, stress_mae_sum,
             ) = stats.tolist()
+            if per_fidelity_sums is not None:
+                dist.all_reduce(per_fidelity_sums, op=dist.ReduceOp.SUM)
 
         energy_loss_avg = energy_loss_sum / max(1, energy_count)
         force_loss_avg = force_loss_sum / max(1, force_count)
@@ -1992,6 +2410,12 @@ class Trainer:
                 f"Train Energy Loss: {energy_loss_avg:.6f} | "
                 f"Train Force Loss: {force_loss_avg:.6f}{stress_log}{phys_log}"
             )
+        train_per_fidelity = finalize_per_fidelity_metric_sums(
+            per_fidelity_sums,
+            restore_energy=self.train_dataset.restore_energy,
+            restore_force=self.train_dataset.restore_force,
+        )
+        self._log_per_fidelity_metrics("Train", train_per_fidelity)
 
         # Restore training mode
         self.model.train()
@@ -2011,6 +2435,7 @@ class Trainer:
             'train_force_mae': force_mae,
             'train_stress_rmse': stress_rmse,
             'train_stress_mae': stress_mae,
+            'train_per_fidelity': train_per_fidelity,
         }
     
     def run_training(self):
@@ -2099,6 +2524,8 @@ class Trainer:
                     'tensor_product_mode': self.tensor_product_mode,
                     'inference_output_physical_tensors': self.inference_output_physical_tensors,
                     'physical_tensor_weights': self.physical_tensor_weights,
+                    'fidelity_loss_weights': self.fidelity_loss_weights,
+                    'delta_regularization_weight': self.delta_regularization_weight,
                     'atomic_energy_keys': self.keys.detach().cpu(),
                     'atomic_energy_values': self.values.detach().cpu(),
                 }

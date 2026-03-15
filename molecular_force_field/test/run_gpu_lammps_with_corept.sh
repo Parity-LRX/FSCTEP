@@ -29,6 +29,15 @@ Also supports auto dummy pth (option 1 pure-cartesian-ictd):
     --cutoff 5.0 \
     --steps 200
 
+Also supports auto dummy pth (option 1b pure-cartesian-ictd-o3):
+  bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+    --lmp /root/lammps-22Jul2025/build-mfftorch/lmp \
+    --dummy-ictd-o3 \
+    --elements H O \
+    --dtype float32 \
+    --cutoff 5.0 \
+    --steps 200
+
 Option 2 spherical-save-cue (requires cuEquivariance):
   bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
     --lmp /root/lammps-22Jul2025/build-mfftorch/lmp \
@@ -46,6 +55,25 @@ Runtime external field smoke test (rank-1):
     --cutoff 5.0 \
     --steps 50
 
+Runtime magnetic field smoke test (rank-1 axial):
+  bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+    --lmp /root/lammps-22Jul2025/build-mfftorch/lmp \
+    --dummy-ictd \
+    --elements H O \
+    --mfield-values 0.0 0.0 0.01 \
+    --cutoff 5.0 \
+    --steps 50
+
+Runtime simultaneous electric + magnetic field smoke test (rank-1 + rank-1):
+  bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+    --lmp /root/lammps-22Jul2025/build-mfftorch/lmp \
+    --dummy-ictd \
+    --elements H O \
+    --field-values 0.0 0.0 0.01 \
+    --mfield-values 0.0 0.0 0.02 \
+    --cutoff 5.0 \
+    --steps 50
+
 Runtime external field smoke test (rank-2 full 3x3, row-major):
   bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
     --lmp /root/lammps-22Jul2025/build-mfftorch/lmp \
@@ -55,7 +83,7 @@ Runtime external field smoke test (rank-2 full 3x3, row-major):
     --cutoff 5.0 \
     --steps 50
 
-Runtime external field + physical tensor compute smoke test:
+Runtime external field + physical tensor compute smoke test (including per-atom BEC):
   bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
     --lmp /root/lammps-22Jul2025/build-mfftorch/lmp \
     --dummy-ictd \
@@ -246,8 +274,9 @@ Options:
   --lmp <path>        LAMMPS executable
   --pth <path>        Real checkpoint (.pth)
   --dummy-ictd        Auto-generate pure-cartesian-ictd dummy checkpoint when --pth not provided
+  --dummy-ictd-o3     Auto-generate pure-cartesian-ictd-o3 dummy checkpoint when --pth not provided
   --dummy-cue         Auto-generate spherical-save-cue dummy checkpoint when --pth not provided (requires cuEquivariance)
-  --dummy-phys-heads  In --dummy-ictd mode, also add dipole/polarizability physical tensor heads
+  --dummy-phys-heads  In --dummy-ictd / --dummy-ictd-o3 mode, also add fixed-schema physical tensor heads
   --dummy-e0          Auto-generate fitted_E0.csv for embed E0 test in dummy mode (default on)
   --no-dummy-e0       Disable auto dummy E0
   --elements ...      Element order (LAMMPS type order)
@@ -264,7 +293,8 @@ Options:
   --n2 <int>          Random type2 atoms (default 1000)
   --box <float>       Box side length (default auto)
   --native-ops        spherical-save-cue: keep native cuEquivariance ops (requires MFF_CUSTOM_OPS_LIB)
-  --field-values Ex Ey Ez   Enable runtime external field via pair_style field v_Ex v_Ey v_Ez
+  --field-values Ex Ey Ez   Enable runtime electric field via pair_style field v_Ex v_Ey v_Ez
+  --mfield-values Bx By Bz Enable runtime magnetic field via pair_style mfield v_Bx v_By v_Bz
   --field6-values xx yy zz xy xz yz
                       Enable symmetric rank-2 runtime external field via pair_style field6
   --field9-values xx xy xz yx yy yz zx zy zz
@@ -362,27 +392,37 @@ Notes:
 - For custom system: edit input section, replace with read_data for your data file.
 - Four common test combinations:
   1) No field, no physical tensor:
-     --dummy-ictd
+     --dummy-ictd or --dummy-ictd-o3
   2) Field, no physical tensor:
-     --dummy-ictd + one of --field-values / --field6-values / --field9-values
+     --dummy-ictd / --dummy-ictd-o3 + one of:
+       --field-values
+       --mfield-values
+       --field-values + --mfield-values
+       --field6-values
+       --field9-values
   3) No field, with physical tensor:
-     --dummy-ictd --dummy-phys-heads --test-phys-compute
+     --dummy-ictd / --dummy-ictd-o3 --dummy-phys-heads --test-phys-compute
   4) Field, with physical tensor:
-     --dummy-ictd --dummy-phys-heads --test-phys-compute + one field option
+     --dummy-ictd / --dummy-ictd-o3 --dummy-phys-heads --test-phys-compute + one rank-1/2 field configuration
 - --dummy-phys-heads currently adds fixed-schema heads only:
-    dipole, dipole_per_atom, polarizability, polarizability_per_atom
+    dipole, dipole_per_atom, polarizability, polarizability_per_atom,
+    born_effective_charge_per_atom
   and is intended to validate the current mfftorch/LAMMPS export path.
 - Current LAMMPS mfftorch physical tensor interface exposes only fixed-schema quantities:
     charge, dipole, polarizability, quadrupole
-    charge_per_atom, dipole_per_atom, polarizability_per_atom, quadrupole_per_atom
+    charge_per_atom, dipole_per_atom, polarizability_per_atom, quadrupole_per_atom,
+    born_effective_charge_per_atom
   Missing heads are allowed: masks become 0 and corresponding outputs are filled with 0.
 - Rank/l compatibility of the fixed schema:
     charge / charge_per_atom correspond to l=0 scalar outputs
     dipole / dipole_per_atom correspond to l=1 vector outputs
     polarizability is expected as a rank-2 Cartesian tensor (typically l=0+2)
     quadrupole is expected as a rank-2 traceless tensor (typically l=2)
+    born_effective_charge_per_atom is expected as a full rank-2 Cartesian tensor (typically l=0+1+2)
 - External field compatibility:
-    --field-values tests rank-1 external tensor (l=1-like vector case)
+    --field-values tests rank-1 electric-like `1o`
+    --mfield-values tests rank-1 magnetic-like `1e`
+    --field-values + --mfield-values tests simultaneous rank-1 multi-field packing
     --field6-values / --field9-values test rank-2 external tensor input
 - Arbitrary custom physical head names are not auto-exposed to LAMMPS yet.
   If your model trains a custom scalar/tensor head outside the fixed schema above,
@@ -426,6 +466,7 @@ EOF
 LMP=""
 PTH=""
 DUMMY_ICTD=0
+DUMMY_ICTD_O3=0
 DUMMY_CUE=0
 DUMMY_PHYS_HEADS=0
 DUMMY_E0=1
@@ -444,8 +485,13 @@ N1="2000"
 N2="1000"
 BOX=""
 FIELD_VALUES=()
+MFIELD_VALUES=()
 FIELD6_VALUES=()
 FIELD9_VALUES=()
+FIDELITY_VALUE=""
+EXPORT_FIDELITY_ID=""
+NUM_FIDELITY_LEVELS=0
+MULTI_FIDELITY_MODE="conditioning"
 TEST_PHYS_COMPUTE=0
 TEST_PBC_MINIMUM_IMAGE=0
 TEST_PBC_SLAB=0
@@ -475,6 +521,7 @@ while [[ $# -gt 0 ]]; do
     --lmp) LMP="${2:-}"; shift 2;;
     --pth) PTH="${2:-}"; shift 2;;
     --dummy-ictd) DUMMY_ICTD=1; shift;;
+    --dummy-ictd-o3) DUMMY_ICTD_O3=1; shift;;
     --dummy-cue) DUMMY_CUE=1; shift;;
     --dummy-phys-heads) DUMMY_PHYS_HEADS=1; shift;;
     --dummy-e0) DUMMY_E0=1; shift;;
@@ -502,6 +549,11 @@ while [[ $# -gt 0 ]]; do
       FIELD_VALUES=("${1:-}" "${2:-}" "${3:-}")
       shift 3
       ;;
+    --mfield-values)
+      shift
+      MFIELD_VALUES=("${1:-}" "${2:-}" "${3:-}")
+      shift 3
+      ;;
     --field6-values)
       shift
       FIELD6_VALUES=("${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}")
@@ -512,6 +564,10 @@ while [[ $# -gt 0 ]]; do
       FIELD9_VALUES=("${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}")
       shift 9
       ;;
+    --fidelity-value) FIDELITY_VALUE="${2:-}"; shift 2;;
+    --export-fidelity-id) EXPORT_FIDELITY_ID="${2:-}"; shift 2;;
+    --num-fidelity-levels) NUM_FIDELITY_LEVELS="${2:-}"; shift 2;;
+    --multi-fidelity-mode) MULTI_FIDELITY_MODE="${2:-}"; shift 2;;
     --test-phys-compute) TEST_PHYS_COMPUTE=1; shift;;
     --test-pbc-minimum-image) TEST_PBC_MINIMUM_IMAGE=1; shift;;
     --test-pbc-slab) TEST_PBC_SLAB=1; shift;;
@@ -544,29 +600,39 @@ if [[ -z "$LMP" || ${#ELEMENTS[@]} -eq 0 ]]; then
   usage
   exit 2
 fi
-if [[ -z "$PTH" && $DUMMY_ICTD -ne 1 && $DUMMY_CUE -ne 1 ]]; then
-  echo "Must provide --pth, or use --dummy-ictd / --dummy-cue to auto-generate"
+if [[ -z "$PTH" && $DUMMY_ICTD -ne 1 && $DUMMY_ICTD_O3 -ne 1 && $DUMMY_CUE -ne 1 ]]; then
+  echo "Must provide --pth, or use --dummy-ictd / --dummy-ictd-o3 / --dummy-cue to auto-generate"
   usage
   exit 2
 fi
-if [[ $DUMMY_ICTD -eq 1 && $DUMMY_CUE -eq 1 ]]; then
-  echo "Cannot use both --dummy-ictd and --dummy-cue"
+if [[ $((DUMMY_ICTD + DUMMY_ICTD_O3 + DUMMY_CUE)) -gt 1 ]]; then
+  echo "Cannot use more than one of --dummy-ictd, --dummy-ictd-o3, and --dummy-cue"
   exit 2
 fi
-if [[ $DUMMY_PHYS_HEADS -eq 1 && $DUMMY_ICTD -ne 1 ]]; then
-  echo "--dummy-phys-heads currently requires --dummy-ictd"
+if [[ $DUMMY_PHYS_HEADS -eq 1 && $DUMMY_ICTD -ne 1 && $DUMMY_ICTD_O3 -ne 1 ]]; then
+  echo "--dummy-phys-heads currently requires --dummy-ictd or --dummy-ictd-o3"
   exit 2
 fi
-FIELD_MODE_COUNT=0
-[[ ${#FIELD_VALUES[@]} -ne 0 ]] && FIELD_MODE_COUNT=$((FIELD_MODE_COUNT+1))
-[[ ${#FIELD6_VALUES[@]} -ne 0 ]] && FIELD_MODE_COUNT=$((FIELD_MODE_COUNT+1))
-[[ ${#FIELD9_VALUES[@]} -ne 0 ]] && FIELD_MODE_COUNT=$((FIELD_MODE_COUNT+1))
-if [[ $FIELD_MODE_COUNT -gt 1 ]]; then
-  echo "Use only one of --field-values, --field6-values, --field9-values"
+HAS_RANK1_FIELD=0
+[[ ${#FIELD_VALUES[@]} -eq 3 ]] && HAS_RANK1_FIELD=1
+[[ ${#MFIELD_VALUES[@]} -eq 3 ]] && HAS_RANK1_FIELD=1
+RANK2_MODE_COUNT=0
+[[ ${#FIELD6_VALUES[@]} -eq 6 ]] && RANK2_MODE_COUNT=$((RANK2_MODE_COUNT+1))
+[[ ${#FIELD9_VALUES[@]} -eq 9 ]] && RANK2_MODE_COUNT=$((RANK2_MODE_COUNT+1))
+if [[ $RANK2_MODE_COUNT -gt 1 ]]; then
+  echo "Use only one of --field6-values or --field9-values"
+  exit 2
+fi
+if [[ $HAS_RANK1_FIELD -eq 1 && $RANK2_MODE_COUNT -gt 0 ]]; then
+  echo "Do not combine --field6-values/--field9-values with --field-values/--mfield-values"
   exit 2
 fi
 if [[ ${#FIELD_VALUES[@]} -ne 0 && ${#FIELD_VALUES[@]} -ne 3 ]]; then
   echo "--field-values expects exactly 3 values: Ex Ey Ez"
+  exit 2
+fi
+if [[ ${#MFIELD_VALUES[@]} -ne 0 && ${#MFIELD_VALUES[@]} -ne 3 ]]; then
+  echo "--mfield-values expects exactly 3 values: Bx By Bz"
   exit 2
 fi
 if [[ ${#FIELD6_VALUES[@]} -ne 0 && ${#FIELD6_VALUES[@]} -ne 6 ]]; then
@@ -577,16 +643,48 @@ if [[ ${#FIELD9_VALUES[@]} -ne 0 && ${#FIELD9_VALUES[@]} -ne 9 ]]; then
   echo "--field9-values expects exactly 9 values in row-major order"
   exit 2
 fi
+if [[ -n "$FIDELITY_VALUE" ]]; then
+  if ! [[ "$FIDELITY_VALUE" =~ ^-?[0-9]+$ ]]; then
+    echo "--fidelity-value expects an integer"
+    exit 2
+  fi
+fi
+if [[ -n "$EXPORT_FIDELITY_ID" ]]; then
+  if ! [[ "$EXPORT_FIDELITY_ID" =~ ^-?[0-9]+$ ]]; then
+    echo "--export-fidelity-id expects an integer"
+    exit 2
+  fi
+fi
+if ! [[ "$NUM_FIDELITY_LEVELS" =~ ^[0-9]+$ ]]; then
+  echo "--num-fidelity-levels expects a non-negative integer"
+  exit 2
+fi
+if [[ "$MULTI_FIDELITY_MODE" != "conditioning" && "$MULTI_FIDELITY_MODE" != "delta-baseline" ]]; then
+  echo "--multi-fidelity-mode must be conditioning or delta-baseline"
+  exit 2
+fi
+if [[ -n "$EXPORT_FIDELITY_ID" && -n "$FIDELITY_VALUE" ]]; then
+  echo "Do not combine --export-fidelity-id with --fidelity-value; fixed-fidelity export does not accept runtime fidelity"
+  exit 2
+fi
+if [[ "$NUM_FIDELITY_LEVELS" != "0" && -z "$EXPORT_FIDELITY_ID" && -z "$FIDELITY_VALUE" ]]; then
+  echo "With --num-fidelity-levels > 0, provide either --fidelity-value for runtime fidelity or --export-fidelity-id to freeze a branch"
+  exit 2
+fi
 if [[ ${#FIELD_VALUES[@]} -ne 0 && $DUMMY_CUE -eq 1 ]]; then
-  echo "Runtime external field is currently supported only for pure-cartesian-ictd"
+  echo "Runtime external field is currently supported only for pure-cartesian-ictd / pure-cartesian-ictd-o3"
+  exit 2
+fi
+if [[ ${#MFIELD_VALUES[@]} -ne 0 && $DUMMY_CUE -eq 1 ]]; then
+  echo "Runtime magnetic field is currently supported only for pure-cartesian-ictd / pure-cartesian-ictd-o3"
   exit 2
 fi
 if [[ ${#FIELD6_VALUES[@]} -ne 0 && $DUMMY_CUE -eq 1 ]]; then
-  echo "Runtime external field is currently supported only for pure-cartesian-ictd"
+  echo "Runtime external field is currently supported only for pure-cartesian-ictd / pure-cartesian-ictd-o3"
   exit 2
 fi
 if [[ ${#FIELD9_VALUES[@]} -ne 0 && $DUMMY_CUE -eq 1 ]]; then
-  echo "Runtime external field is currently supported only for pure-cartesian-ictd"
+  echo "Runtime external field is currently supported only for pure-cartesian-ictd / pure-cartesian-ictd-o3"
   exit 2
 fi
 if [[ $DUMMY_PHYS_HEADS -eq 1 ]]; then
@@ -620,6 +718,10 @@ if [[ $COMPARE_THROUGHPUT -eq 1 ]]; then
       TREE_FMM_THROUGHPUT_AUTO_TUNED=1
     fi
   fi
+fi
+if [[ $DUMMY_ICTD_O3 -eq 1 && ($TEST_LONG_RANGE -eq 1 || $TEST_RECIPROCAL_LONG_RANGE -eq 1 || $TEST_TREE_FMM_LONG_RANGE -eq 1 || $TEST_ISOLATED_FAR_FIELD -eq 1 || $TEST_ISOLATED_FAR_FIELD_V2 -eq 1 || $TEST_FEATURE_SPECTRAL_FFT -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_SLAB -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_SLAB_Z_OPEN -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_TRICLINIC -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_MPI_CONSISTENCY -eq 1 || $COMPARE_THROUGHPUT -eq 1) ]]; then
+  echo "--dummy-ictd-o3 currently supports the core field/phys smoke paths only; long-range and throughput modes still use --dummy-ictd"
+  exit 2
 fi
 MD_ONLY_MODE=0
 if [[ $FORCE_MD_RUN -eq 1 || $COMPARE_THROUGHPUT -eq 1 ]]; then
@@ -875,6 +977,7 @@ append_common_cli_args() {
   _out+=(--lmp "$LMP")
   if [[ -n "$PTH" ]]; then _out+=(--pth "$PTH"); fi
   [[ $DUMMY_ICTD -eq 1 ]] && _out+=(--dummy-ictd)
+  [[ $DUMMY_ICTD_O3 -eq 1 ]] && _out+=(--dummy-ictd-o3)
   [[ $DUMMY_CUE -eq 1 ]] && _out+=(--dummy-cue)
   [[ $DUMMY_PHYS_HEADS -eq 1 ]] && _out+=(--dummy-phys-heads)
   if [[ $DUMMY_E0 -eq 0 ]]; then _out+=(--no-dummy-e0); fi
@@ -895,8 +998,13 @@ append_common_cli_args() {
   [[ $TREE_FMM_DEVICE_LOCAL_EVAL -eq 1 ]] && _out+=(--tree-fmm-device-local-eval)
   [[ -n "$TREE_FMM_REUSE_POSITION_TOL" ]] && _out+=(--tree-fmm-reuse-position-tol "$TREE_FMM_REUSE_POSITION_TOL")
   [[ ${#FIELD_VALUES[@]} -eq 3 ]] && _out+=(--field-values "${FIELD_VALUES[@]}")
+  [[ ${#MFIELD_VALUES[@]} -eq 3 ]] && _out+=(--mfield-values "${MFIELD_VALUES[@]}")
   [[ ${#FIELD6_VALUES[@]} -eq 6 ]] && _out+=(--field6-values "${FIELD6_VALUES[@]}")
   [[ ${#FIELD9_VALUES[@]} -eq 9 ]] && _out+=(--field9-values "${FIELD9_VALUES[@]}")
+  [[ -n "$FIDELITY_VALUE" ]] && _out+=(--fidelity-value "$FIDELITY_VALUE")
+  [[ -n "$EXPORT_FIDELITY_ID" ]] && _out+=(--export-fidelity-id "$EXPORT_FIDELITY_ID")
+  [[ "$NUM_FIDELITY_LEVELS" != "0" ]] && _out+=(--num-fidelity-levels "$NUM_FIDELITY_LEVELS")
+  [[ "$MULTI_FIDELITY_MODE" != "conditioning" ]] && _out+=(--multi-fidelity-mode "$MULTI_FIDELITY_MODE")
   [[ $TEST_PHYS_COMPUTE -eq 1 ]] && _out+=(--test-phys-compute)
   [[ $OPEN_BOUNDARY_MD -eq 1 ]] && _out+=(--open-boundary-md)
   return 0
@@ -1097,12 +1205,21 @@ if [[ -z "$PTH" && $DUMMY_ICTD -eq 1 ]]; then
     echo "[0/3] Generating pure-cartesian-ictd dummy checkpoint"
   fi
   PTH="$OUT_DIR/dummy_ictd.pth"
+  EXTERNAL_IRREP_PY="None"
+  EXTERNAL_SPECS_PY="None"
+  if [[ ${#FIELD_VALUES[@]} -eq 3 && ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+    EXTERNAL_SPECS_PY="[{\"name\": \"external_field\", \"rank\": 1, \"irrep\": \"1o\"}, {\"name\": \"magnetic_field\", \"rank\": 1, \"irrep\": \"1e\"}]"
+  elif [[ ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+    EXTERNAL_IRREP_PY="'1e'"
+  elif [[ ${#FIELD_VALUES[@]} -eq 3 ]]; then
+    EXTERNAL_IRREP_PY="'1o'"
+  fi
   python - <<PY
 import torch
 from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd
 out = r"$PTH"
 external_rank = None
-if ${#FIELD_VALUES[@]} == 3:
+if ${#FIELD_VALUES[@]} == 3 or ${#MFIELD_VALUES[@]} == 3:
     external_rank = 1
 elif ${#FIELD6_VALUES[@]} == 6 or ${#FIELD9_VALUES[@]} == 9:
     external_rank = 2
@@ -1113,6 +1230,7 @@ if $DUMMY_PHYS_HEADS == 1:
         "dipole_per_atom": {"ls": [1], "channels_out": 1, "reduce": "none"},
         "polarizability": {"ls": [0, 2], "channels_out": 1, "reduce": "sum"},
         "polarizability_per_atom": {"ls": [0, 2], "channels_out": 1, "reduce": "none"},
+        "born_effective_charge_per_atom": {"ls": [0, 1, 2], "channels_out": 1, "reduce": "none"},
     }
 if $TEST_RECIPROCAL_LONG_RANGE == 1:
     long_range_mode = "reciprocal-spectral-v1"
@@ -1168,6 +1286,10 @@ _make_dummy_checkpoint_pure_cartesian_ictd(
     out,
     device=torch.device("cpu"),
     external_tensor_rank=external_rank,
+    external_tensor_irrep=$EXTERNAL_IRREP_PY,
+    external_tensor_specs=$EXTERNAL_SPECS_PY,
+    num_fidelity_levels=int("$NUM_FIDELITY_LEVELS"),
+    multi_fidelity_mode="$MULTI_FIDELITY_MODE",
     physical_tensor_outputs=physical_tensor_outputs,
     long_range_mode=long_range_mode,
     long_range_hidden_dim=32,
@@ -1196,6 +1318,55 @@ _make_dummy_checkpoint_pure_cartesian_ictd(
     feature_spectral_neutralize=True,
     feature_spectral_include_k0=False,
     feature_spectral_gate_init=0.0,
+)
+print("wrote", out)
+PY
+fi
+if [[ -z "$PTH" && $DUMMY_ICTD_O3 -eq 1 ]]; then
+  echo "[0/3] Generating pure-cartesian-ictd-o3 dummy checkpoint"
+  PTH="$OUT_DIR/dummy_ictd_o3.pth"
+  EXTERNAL_IRREP_PY="None"
+  EXTERNAL_SPECS_PY="None"
+  O3_ACTIVE_IRREPS_PY="None"
+  if [[ ${#FIELD_VALUES[@]} -eq 3 && ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+    EXTERNAL_SPECS_PY="[{\"name\": \"external_field\", \"rank\": 1, \"irrep\": \"1o\"}, {\"name\": \"magnetic_field\", \"rank\": 1, \"irrep\": \"1e\"}]"
+    O3_ACTIVE_IRREPS_PY="'0e,1e,1o,2e'"
+  elif [[ ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+    EXTERNAL_IRREP_PY="'1e'"
+    O3_ACTIVE_IRREPS_PY="'0e,1e,2e'"
+  elif [[ ${#FIELD_VALUES[@]} -eq 3 ]]; then
+    EXTERNAL_IRREP_PY="'1o'"
+    O3_ACTIVE_IRREPS_PY="'0e,1o,2e'"
+  fi
+  python - <<PY
+import torch
+from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd_o3
+out = r"$PTH"
+external_rank = None
+if ${#FIELD_VALUES[@]} == 3 or ${#MFIELD_VALUES[@]} == 3:
+    external_rank = 1
+elif ${#FIELD6_VALUES[@]} == 6 or ${#FIELD9_VALUES[@]} == 9:
+    external_rank = 2
+physical_tensor_outputs = None
+if $DUMMY_PHYS_HEADS == 1:
+    physical_tensor_outputs = {
+        "dipole": {"ls": [1], "channels_out": 1, "reduce": "sum"},
+        "dipole_per_atom": {"ls": [1], "channels_out": 1, "reduce": "none"},
+        "polarizability": {"ls": [0, 2], "channels_out": 1, "reduce": "sum"},
+        "polarizability_per_atom": {"ls": [0, 2], "channels_out": 1, "reduce": "none"},
+        "born_effective_charge_per_atom": {"irreps": ["0e", "1e", "2e"], "channels_out": 1, "reduce": "none"},
+    }
+_make_dummy_checkpoint_pure_cartesian_ictd_o3(
+    out,
+    device=torch.device("cpu"),
+    external_tensor_rank=external_rank,
+    external_tensor_irrep=$EXTERNAL_IRREP_PY,
+    external_tensor_specs=$EXTERNAL_SPECS_PY,
+    num_fidelity_levels=int("$NUM_FIDELITY_LEVELS"),
+    multi_fidelity_mode="$MULTI_FIDELITY_MODE",
+    physical_tensor_outputs=physical_tensor_outputs,
+    o3_irrep_preset="auto",
+    o3_active_irreps=$O3_ACTIVE_IRREPS_PY,
 )
 print("wrote", out)
 PY
@@ -1297,6 +1468,7 @@ if [[ -n "$MODE" ]]; then EXPORT_ARGS+=(--mode "$MODE"); fi
 if [[ $NATIVE_OPS -eq 1 ]]; then EXPORT_ARGS+=(--native-ops); fi
 if [[ -n "$DTYPE" ]]; then EXPORT_ARGS+=(--dtype "$DTYPE"); fi
 if [[ -n "$E0CSV" ]]; then EXPORT_ARGS+=(--e0-csv "$E0CSV"); fi
+if [[ -n "$EXPORT_FIDELITY_ID" ]]; then EXPORT_ARGS+=(--export-fidelity-id "$EXPORT_FIDELITY_ID"); fi
 if [[ $FEATURE_SPECTRAL_EXPORT -eq 1 || $TEST_RECIPROCAL_LONG_RANGE -eq 1 || $TEST_TREE_FMM_LONG_RANGE -eq 1 ]]; then EXPORT_ARGS+=(--export-reciprocal-source); fi
 # Export always on cuda:0 to avoid MPI env interference
 CUDA_VISIBLE_DEVICES=0 python "$REPO_ROOT/molecular_force_field/cli/export_libtorch_core.py" "${EXPORT_ARGS[@]}"
@@ -2247,11 +2419,30 @@ PY
 }
 
 FIELD_LMP="pair_style mff/torch $CUTOFF cuda"
+if [[ ${#FIELD_VALUES[@]} -eq 3 || ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+  FIELD_LMP=""
+fi
 if [[ ${#FIELD_VALUES[@]} -eq 3 ]]; then
   FIELD_LMP=$'variable Ex equal '"${FIELD_VALUES[0]}"$'\n'
   FIELD_LMP+=$'variable Ey equal '"${FIELD_VALUES[1]}"$'\n'
   FIELD_LMP+=$'variable Ez equal '"${FIELD_VALUES[2]}"$'\n'
-  FIELD_LMP+=$'pair_style mff/torch '"$CUTOFF"$' cuda field v_Ex v_Ey v_Ez'
+fi
+if [[ ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+  FIELD_LMP+=$'variable Bx equal '"${MFIELD_VALUES[0]}"$'\n'
+  FIELD_LMP+=$'variable By equal '"${MFIELD_VALUES[1]}"$'\n'
+  FIELD_LMP+=$'variable Bz equal '"${MFIELD_VALUES[2]}"$'\n'
+fi
+if [[ ${#FIELD_VALUES[@]} -eq 3 || ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+  FIELD_LMP+=$'pair_style mff/torch '"$CUTOFF"$' cuda'
+  if [[ ${#FIELD_VALUES[@]} -eq 3 ]]; then
+    FIELD_LMP+=$' field v_Ex v_Ey v_Ez'
+  fi
+  if [[ ${#MFIELD_VALUES[@]} -eq 3 ]]; then
+    FIELD_LMP+=$' mfield v_Bx v_By v_Bz'
+  fi
+  if [[ -n "$FIDELITY_VALUE" ]]; then
+    FIELD_LMP+=$' fidelity '"$FIDELITY_VALUE"
+  fi
 elif [[ ${#FIELD6_VALUES[@]} -eq 6 ]]; then
   FIELD_LMP=$'variable Txx equal '"${FIELD6_VALUES[0]}"$'\n'
   FIELD_LMP+=$'variable Tyy equal '"${FIELD6_VALUES[1]}"$'\n'
@@ -2260,6 +2451,9 @@ elif [[ ${#FIELD6_VALUES[@]} -eq 6 ]]; then
   FIELD_LMP+=$'variable Txz equal '"${FIELD6_VALUES[4]}"$'\n'
   FIELD_LMP+=$'variable Tyz equal '"${FIELD6_VALUES[5]}"$'\n'
   FIELD_LMP+=$'pair_style mff/torch '"$CUTOFF"$' cuda field6 v_Txx v_Tyy v_Tzz v_Txy v_Txz v_Tyz'
+  if [[ -n "$FIDELITY_VALUE" ]]; then
+    FIELD_LMP+=$' fidelity '"$FIDELITY_VALUE"
+  fi
 elif [[ ${#FIELD9_VALUES[@]} -eq 9 ]]; then
   FIELD_LMP=$'variable Txx equal '"${FIELD9_VALUES[0]}"$'\n'
   FIELD_LMP+=$'variable Txy equal '"${FIELD9_VALUES[1]}"$'\n'
@@ -2271,6 +2465,11 @@ elif [[ ${#FIELD9_VALUES[@]} -eq 9 ]]; then
   FIELD_LMP+=$'variable Tzy equal '"${FIELD9_VALUES[7]}"$'\n'
   FIELD_LMP+=$'variable Tzz equal '"${FIELD9_VALUES[8]}"$'\n'
   FIELD_LMP+=$'pair_style mff/torch '"$CUTOFF"$' cuda field9 v_Txx v_Txy v_Txz v_Tyx v_Tyy v_Tyz v_Tzx v_Tzy v_Tzz'
+  if [[ -n "$FIDELITY_VALUE" ]]; then
+    FIELD_LMP+=$' fidelity '"$FIDELITY_VALUE"
+  fi
+elif [[ -n "$FIDELITY_VALUE" ]]; then
+  FIELD_LMP+=$' fidelity '"$FIDELITY_VALUE"
 fi
 
 PHYS_LMP=""
@@ -2290,10 +2489,13 @@ if [[ $TEST_PHYS_COMPUTE -eq 1 ]]; then
   PHYS_LMP+=$'compute mffp all mff/torch/phys global polarizability\n'
   PHYS_LMP+=$'compute mffpxx all mff/torch/phys global polarizability xx\n'
   PHYS_LMP+=$'compute mffa all mff/torch/phys atom\n'
+  PHYS_LMP+=$'compute mffam all mff/torch/phys atom/mask\n'
   PHYS_LMP+=$'compute mffad all mff/torch/phys atom dipole\n'
   PHYS_LMP+=$'compute mffadx all mff/torch/phys atom dipole x\n'
-  PHYS_LMP+=$'thermo_style custom step pe c_mffgm[2] c_mffgm[3] c_mffdx c_mffpxx\n'
-  PHYS_LMP+=$'dump 1 all custom '"$DUMP_FREQ"$' dump.phys id type x y z c_mffadx c_mffad[1] c_mffad[2] c_mffad[3] c_mffa[1] c_mffa[2] c_mffa[3] c_mffa[4]\n'
+  PHYS_LMP+=$'compute mffab all mff/torch/phys atom born_effective_charge\n'
+  PHYS_LMP+=$'compute mffabxx all mff/torch/phys atom born_effective_charge xx\n'
+  PHYS_LMP+=$'thermo_style custom step pe c_mffgm[2] c_mffgm[3] c_mffdx c_mffpxx c_mffam[5]\n'
+  PHYS_LMP+=$'dump 1 all custom '"$DUMP_FREQ"$' dump.phys id type x y z c_mffadx c_mffad[1] c_mffad[2] c_mffad[3] c_mffa[1] c_mffa[2] c_mffa[3] c_mffa[4] c_mffabxx c_mffab[1] c_mffab[2] c_mffab[3] c_mffab[4] c_mffab[5] c_mffab[6] c_mffab[7] c_mffab[8] c_mffab[9]\n'
 fi
 
 ATOM_TYPE_COUNT=${#ELEMENTS[@]}
@@ -2482,4 +2684,3 @@ if [[ $TEST_PHYS_COMPUTE -eq 1 ]]; then
 fi
 
 echo "DONE. out_dir=$OUT_DIR"
-

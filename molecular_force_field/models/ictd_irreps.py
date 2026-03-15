@@ -328,12 +328,32 @@ def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
     return t @ P
 
 
-def parse_irreps_string(irreps: str) -> List[Tuple[int, int]]:
+def parity_letter_to_sign(parity: str) -> int:
+    p = str(parity).strip().lower()
+    if p == "e":
+        return 1
+    if p == "o":
+        return -1
+    raise ValueError(f"parity must be 'e' or 'o', got {parity!r}")
+
+
+def parity_sign_to_letter(parity: int) -> str:
+    if int(parity) == 1:
+        return "e"
+    if int(parity) == -1:
+        return "o"
+    raise ValueError(f"parity sign must be +1 or -1, got {parity!r}")
+
+
+def canonical_irrep_parity_sign(l: int) -> int:
+    return 1 if (int(l) % 2 == 0) else -1
+
+
+def parse_irreps_string(irreps: str) -> List[Tuple[int, int, int]]:
     """
-    Parse e3nn-style irreps string into (mul, l) list.
-    Examples: "0e + 1o + 2e" -> [(1,0), (1,1), (1,2)]; "5x0e + 2x2e" -> [(5,0), (2,2)].
+    Parse e3nn-style irreps string into (mul, l, parity_sign) list.
     """
-    out: List[Tuple[int, int]] = []
+    out: List[Tuple[int, int, int]] = []
     for part in irreps.replace(",", " ").split("+"):
         part = part.strip()
         if not part:
@@ -341,11 +361,15 @@ def parse_irreps_string(irreps: str) -> List[Tuple[int, int]]:
         m = re.match(r"^(\d*)x?(\d+)(e|o)$", part.strip(), re.IGNORECASE)
         if not m:
             raise ValueError(f"Invalid irreps token: {part!r}")
-        mul_s, l_s, _ = m.groups()
+        mul_s, l_s, p_s = m.groups()
         mul = int(mul_s) if mul_s else 1
         l_val = int(l_s)
-        out.append((mul, l_val))
+        out.append((mul, l_val, parity_letter_to_sign(p_s)))
     return out
+
+
+def parse_irreps_string_l_only(irreps: str) -> List[Tuple[int, int]]:
+    return [(mul, l_val) for mul, l_val, _ in parse_irreps_string(irreps)]
 
 
 def parse_irreps_to_l3_list(irreps: str, allowed_l3: Optional[List[int]] = None) -> List[int]:
@@ -357,7 +381,7 @@ def parse_irreps_to_l3_list(irreps: str, allowed_l3: Optional[List[int]] = None)
     parts = parse_irreps_string(irreps)
     out: List[int] = []
     seen: Set[int] = set()
-    for _, l_val in parts:
+    for _, l_val, _ in parts:
         if allowed_l3 is not None and l_val not in allowed_l3:
             continue
         if l_val not in seen:
@@ -376,7 +400,13 @@ def direction_harmonics_irreps(n: torch.Tensor, irreps: str) -> torch.Tensor:
     """
     parts = parse_irreps_string(irreps)
     chunks: List[torch.Tensor] = []
-    for mul, l_val in parts:
+    for mul, l_val, parity in parts:
+        canonical = canonical_irrep_parity_sign(l_val)
+        if parity != canonical:
+            raise ValueError(
+                f"direction_harmonics_irreps only supports geometric parity {l_val}{parity_sign_to_letter(canonical)}; "
+                f"got {l_val}{parity_sign_to_letter(parity)}"
+            )
         h = direction_harmonics_fast(n, l_val)  # (..., 2l+1)
         chunks.append(h.unsqueeze(-2).expand(*h.shape[:-1], mul, 2 * l_val + 1).reshape(*h.shape[:-1], mul * (2 * l_val + 1)))
     return torch.cat(chunks, dim=-1)
@@ -1085,3 +1115,350 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
         return out
 
+
+def _normalize_irrep_key(l: int, parity: int) -> Tuple[int, int]:
+    return (int(l), 1 if int(parity) >= 0 else -1)
+
+
+def o3_irrep_keys(lmax: int) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    for l in range(int(lmax) + 1):
+        out.append((l, 1))
+        out.append((l, -1))
+    return out
+
+
+class HarmonicElementwiseProductO3(nn.Module):
+    """
+    O(3) version of HarmonicElementwiseProduct with parity-aware keys.
+
+    Inputs are dict[(l, p)] -> (..., mul, 2l+1). For irreps_out="0e", only
+    same-(l,p) self-pair invariants are produced.
+    """
+
+    def __init__(
+        self,
+        active_irreps: List[Tuple[int, int]],
+        mul: int,
+        irreps_out: str | None = "0e",
+        normalization: str = "component",
+        internal_compute_dtype: torch.dtype = torch.float64,
+    ):
+        super().__init__()
+        self.active_irreps = [_normalize_irrep_key(l, p) for l, p in active_irreps]
+        self.mul = int(mul)
+        self.internal_compute_dtype = internal_compute_dtype
+        self._normalization = normalization
+        self._irreps_out = irreps_out.strip().lower() if (irreps_out and isinstance(irreps_out, str)) else "full"
+        self._output_0e_only = self._irreps_out == "0e"
+
+        self._paths: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        for key in self.active_irreps:
+            l, p = key
+            if p * p != 1:
+                continue
+            self._paths.append((key, (0, 1)))
+
+        self._0e_factors: Dict[Tuple[int, int], float] = {}
+        for l, p in self.active_irreps:
+            if (l, p) not in self._0e_factors:
+                C = build_cg_tensor(l, l, 0)
+                C_fn = C.norm().item()
+                if normalization == "component" and C_fn > 1e-30:
+                    C = C * (1.0 / C_fn)
+                elif normalization == "norm" and C_fn > 1e-30:
+                    C = C * (1.0 / C_fn)
+                self._0e_factors[(l, p)] = float(C[0, 0, 0].item())
+    def forward(
+        self,
+        x1: Dict[Tuple[int, int], torch.Tensor],
+        x2: Dict[Tuple[int, int], torch.Tensor],
+    ) -> torch.Tensor:
+        if not self._output_0e_only:
+            raise NotImplementedError("HarmonicElementwiseProductO3 currently supports irreps_out='0e' only")
+        sample = next(iter(x1.values()))
+        outs = []
+        for key in self.active_irreps:
+            a = x1[key]
+            b = x2[key]
+            outs.append((a * b).sum(dim=-1) * self._0e_factors[key])
+        return torch.cat(outs, dim=-1)
+
+
+class HarmonicFullyConnectedTensorProductO3(nn.Module):
+    """
+    Parity-aware O(3) fully-connected tensor product in ICTD basis.
+
+    Inputs / outputs are keyed by (l, parity_sign), where parity_sign is +1/-1.
+    CG tensors are reused from the SO(3) ICTD basis; parity only filters valid paths.
+    """
+
+    def __init__(
+        self,
+        mul_in1: int,
+        mul_in2: int,
+        mul_out: int,
+        lmax: int,
+        active_irreps: List[Tuple[int, int]] | None = None,
+        internal_weights: bool = True,
+        *,
+        allowed_paths: List[Tuple[int, int, int, int, int, int]] | None = None,
+        path_policy: str = "full",
+        max_rank_other: int | None = None,
+        normalization: str = "component",
+        internal_compute_dtype: torch.dtype = torch.float64,
+    ):
+        super().__init__()
+        self.mul_in1 = int(mul_in1)
+        self.mul_in2 = int(mul_in2)
+        self.mul_out = int(mul_out)
+        self.lmax = int(lmax)
+        self.internal_weights = bool(internal_weights)
+        self._normalization = normalization
+        self.internal_compute_dtype = internal_compute_dtype
+        self.active_irreps = (
+            [_normalize_irrep_key(l, p) for l, p in active_irreps]
+            if active_irreps is not None
+            else o3_irrep_keys(self.lmax)
+        )
+        active_set = set(self.active_irreps)
+
+        all_paths: List[Tuple[int, int, int, int, int, int]] = []
+        for l1, p1 in self.active_irreps:
+            for l2, p2 in self.active_irreps:
+                for l3 in range(abs(l1 - l2), min(l1 + l2, self.lmax) + 1):
+                    if (l1 + l2 + l3) % 2 == 1:
+                        continue
+                    p3 = p1 * p2
+                    if (l3, p3) not in active_set:
+                        continue
+                    all_paths.append((l1, p1, l2, p2, l3, p3))
+
+        if allowed_paths is not None:
+            allowed_set = {tuple(map(int, p)) for p in allowed_paths}
+            self.paths = [p for p in all_paths if p in allowed_set]
+        else:
+            if path_policy == "full":
+                self.paths = all_paths
+            elif path_policy == "max_rank_other":
+                if max_rank_other is None:
+                    raise ValueError("path_policy='max_rank_other' requires max_rank_other")
+                self.paths = [p for p in all_paths if min(p[0], p[2]) <= int(max_rank_other)]
+            else:
+                raise ValueError(f"Unknown path_policy={path_policy!r}")
+
+        self.num_paths = len(self.paths)
+        self.weight_numel = self.num_paths * self.mul_out * self.mul_in1 * self.mul_in2
+        if self.internal_weights:
+            self.weight = nn.Parameter(torch.randn(self.num_paths, self.mul_out, self.mul_in1, self.mul_in2) * 0.02)
+        else:
+            self.register_parameter("weight", None)
+
+        self._cg_cpu_f64: List[torch.Tensor] | None = None
+        self._cg_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+        self._groups: List[Dict[str, object]] = []
+        groups_tmp: Dict[Tuple[int, int, int, int], List[Tuple[int, int, int]]] = {}
+        for p_idx, (l1, p1, l2, p2, l3, p3) in enumerate(self.paths):
+            groups_tmp.setdefault((l1, p1, l2, p2), []).append((p_idx, l3, p3))
+        for (l1, p1, l2, p2), items in sorted(groups_tmp.items()):
+            segments = []
+            start = 0
+            for p_idx, l3, p3 in items:
+                kdim = 2 * l3 + 1
+                segments.append((p_idx, l3, p3, start, start + kdim))
+                start += kdim
+            self._groups.append(
+                {
+                    "l1": l1,
+                    "p1": p1,
+                    "l2": l2,
+                    "p2": p2,
+                    "segments": segments,
+                    "k_total": start,
+                }
+            )
+        self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+        self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
+
+    @_dynamo_disable
+    def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._cg_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        if self._cg_cpu_f64 is None:
+            self._cg_cpu_f64 = []
+            for (l1, _p1, l2, _p2, l3, _p3) in self.paths:
+                C = build_cg_tensor(l1, l2, l3)
+                C_fn = C.norm().item()
+                if self._normalization == "component" and C_fn > 1e-30:
+                    C = C * (math.sqrt(2 * l3 + 1) / C_fn)
+                elif self._normalization == "norm" and C_fn > 1e-30:
+                    C = C * (1.0 / C_fn)
+                self._cg_cpu_f64.append(C)
+        cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
+        self._cg_cache_by_dev_dtype[key] = cg_list
+        return cg_list
+
+    @_dynamo_disable
+    def _get_proj_group_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._proj_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        cg_list = self._get_cg_list(device=device, dtype=dtype)
+        proj_list: List[torch.Tensor] = []
+        sparse_list: List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
+        for g in self._groups:
+            l1 = int(g["l1"])
+            l2 = int(g["l2"])
+            segments = g["segments"]
+            k_total = int(g["k_total"])
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = torch.zeros(m1 * m2, k_total, device=device, dtype=compute_dtype)
+            for p_idx, _l3, _p3, s, e in segments:
+                C = cg_list[int(p_idx)]
+                U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
+            proj_list.append(U)
+            if device.type == "cuda":
+                n = U.numel()
+                nz = (U.abs() > _SPARSE_ZERO_THRESHOLD).sum().item()
+                zero_frac = 1.0 - (nz / n) if n else 0.0
+                if zero_frac >= _SPARSE_MIN_ZERO_FRAC:
+                    mask = U.abs() > _SPARSE_ZERO_THRESHOLD
+                    nz_flat = mask.nonzero(as_tuple=False)
+                    d_idx = nz_flat[:, 0].contiguous()
+                    k_idx = nz_flat[:, 1].contiguous()
+                    vals = U[mask].contiguous()
+                    sparse_list.append((d_idx, k_idx, vals))
+                else:
+                    sparse_list.append(None)
+            else:
+                sparse_list.append(None)
+        self._proj_group_cache_by_dev_dtype[key] = proj_list
+        self._proj_sparse_cache_by_dev_dtype[key] = sparse_list
+        return proj_list
+
+    @_dynamo_disable
+    def _get_proj_sparse_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        self._get_proj_group_list(device=device, dtype=dtype)
+        key = (str(device), str(self.internal_compute_dtype))
+        return self._proj_sparse_cache_by_dev_dtype[key]
+
+    @_dynamo_disable
+    def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
+        _ = self._get_cg_list(device=device, dtype=dtype)
+        _ = self._get_proj_group_list(device=device, dtype=dtype)
+        _ = self._get_proj_sparse_list(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x1: Dict[Tuple[int, int], torch.Tensor],
+        x2: Dict[Tuple[int, int], torch.Tensor],
+        weights: torch.Tensor | None = None,
+    ) -> Dict[Tuple[int, int], torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+
+        if self.internal_weights:
+            w_param = self.weight
+        else:
+            assert weights is not None
+            if weights.shape[-1] not in (self.weight_numel, self.num_paths):
+                raise ValueError(f"weights last-dim must be weight_numel={self.weight_numel} or num_paths={self.num_paths}, got {weights.shape[-1]}")
+        if weights is not None and (weights.device != device or weights.dtype != dtype):
+            weights = weights.to(device=device, dtype=dtype)
+
+        out: Dict[Tuple[int, int], torch.Tensor] = {}
+        for key_ir in self.active_irreps:
+            l, _p = key_ir
+            out[key_ir] = torch.zeros(*batch_shape, self.mul_out, 2 * l + 1, device=device, dtype=dtype)
+
+        if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
+            proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
+            for g_idx, g in enumerate(self._groups):
+                l1 = int(g["l1"])
+                p1 = int(g["p1"])
+                l2 = int(g["l2"])
+                p2 = int(g["p2"])
+                segments = g["segments"]
+                k_total = int(g["k_total"])
+                a = x1.get((l1, p1))
+                b = x2.get((l2, p2))
+                if a is None or b is None:
+                    continue
+                m1 = 2 * l1 + 1
+                m2 = 2 * l2 + 1
+                U = proj_list[g_idx]
+                a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+                b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+                y = None
+                used_fused_mix = False
+                if a_comp.is_cuda and a_comp.dim() >= 2:
+                    B_flat = 1
+                    for s in batch_shape:
+                        B_flat *= int(s)
+                    a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
+                    b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
+                    num_paths_in_group = len(segments)
+                    if _tp_fused_outer_proj_channel_mix is not None and num_paths_in_group <= 16:
+                        W_stack = torch.stack(
+                            [w_param[int(p_idx)].to(dtype=compute_dtype) for p_idx, _, _, _, _ in segments],
+                            dim=0,
+                        )
+                        W_stack = W_stack.to(device=a_comp.device).contiguous().view(
+                            num_paths_in_group, self.mul_out, self.mul_in1 * self.mul_in2
+                        )
+                        fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, _p3, s, e in segments]
+                        out_buf = _tp_fused_outer_proj_channel_mix(
+                            a_flat, b_flat, U, W_stack, fused_segments, k_total, self.mul_out, m1, m2
+                        )
+                        if out_buf is not None:
+                            out_buf = out_buf.to(dtype=dtype) if out_buf.dtype != dtype else out_buf
+                            for seg_idx, (p_idx, l3, p3, s, e) in enumerate(segments):
+                                seg_out = out_buf[:, seg_idx, :, int(s): int(e)]
+                                if weights is not None:
+                                    seg_out = seg_out * weights[..., int(p_idx), None, None]
+                                out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + seg_out
+                            used_fused_mix = True
+                    if not used_fused_mix:
+                        sparse_repr = (sparse_list[g_idx] if _USE_SPARSE_TP else None) if sparse_list is not None else None
+                        if sparse_repr is not None and _tp_fused_outer_proj_sparse is not None:
+                            d_idx, k_idx, vals = sparse_repr
+                            y_flat = _tp_fused_outer_proj_sparse(a_flat, b_flat, d_idx, k_idx, vals, m1, m2, k_total)
+                            if y_flat is not None:
+                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
+                        if y is None and _tp_fused_outer_proj is not None:
+                            y_flat = _tp_fused_outer_proj(a_flat, b_flat, U, m1, m2)
+                            if y_flat is not None:
+                                y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
+                if not used_fused_mix:
+                    if y is None:
+                        t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                        t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                        if not t_flat.is_contiguous():
+                            t_flat = t_flat.contiguous()
+                        y = torch.matmul(t_flat, U)
+                    ij = self.mul_in1 * self.mul_in2
+                    for p_idx, l3, p3, s, e in segments:
+                        Wp = w_param[int(p_idx)]
+                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        y_seg = y[..., :, :, int(s): int(e)]
+                        kdim = int(e) - int(s)
+                        y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)
+                        W2 = Wp_comp.contiguous().view(Wp_comp.shape[0], ij)
+                        out_seg = torch.matmul(y2, W2.transpose(0, 1)).movedim(-1, -2)
+                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                        if weights is not None:
+                            out_seg = out_seg * weights[..., int(p_idx), None, None]
+                        out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + out_seg
+        else:
+            raise NotImplementedError("HarmonicFullyConnectedTensorProductO3 currently supports internal_weights + optional scalar gates only")
+        return out

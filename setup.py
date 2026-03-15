@@ -15,6 +15,7 @@ setup(
     author="Your Name",
     author_email="your.email@example.com",
     description="A Python library for molecular modeling with E3NN-based neural networks",
+    license="MIT",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/molecular_force_field",
@@ -22,6 +23,7 @@ setup(
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
         "Topic :: Scientific/Engineering :: Chemistry",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",
@@ -82,6 +84,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            "mff=molecular_force_field.cli.main:main",
             "mff-train=molecular_force_field.cli.train:main",
             "mff-evaluate=molecular_force_field.cli.evaluate:main",
             "mff-preprocess=molecular_force_field.cli.preprocess:main",
@@ -91,6 +94,7 @@ setup(
             "mff-evaluate-pes-coverage=molecular_force_field.cli.evaluate_pes_coverage:main",
             "mff-active-learn=molecular_force_field.cli.active_learning:main",
             "mff-init-data=molecular_force_field.cli.init_data:main",
+            "mff-merge-multifidelity=molecular_force_field.cli.merge_multifidelity_h5:main",
         ],
     },
 )

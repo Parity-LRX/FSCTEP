@@ -143,9 +143,17 @@ void PairMFFTorch::settings(int narg, char **arg) {
   cutsq_global_ = cut_global_ * cut_global_;
 
   use_external_field_ = false;
-  external_tensor_rank_ = 0;
+  use_electric_field_ = false;
+  use_magnetic_field_ = false;
+  use_rank2_external_field_ = false;
   external_field_symmetric_rank2_ = false;
-  external_field_var_names_.clear();
+  use_fidelity_input_ = false;
+  fidelity_is_variable_ = false;
+  fidelity_var_name_.clear();
+  fidelity_constant_ = 0;
+  electric_field_var_names_.clear();
+  magnetic_field_var_names_.clear();
+  rank2_external_field_var_names_.clear();
   cached_external_field_values_.clear();
   external_tensor_cache_ = torch::Tensor();
 
@@ -160,14 +168,26 @@ void PairMFFTorch::settings(int narg, char **arg) {
         error->all(FLERR, "pair_style mff/torch field expects three equal-style variables: v_Ex v_Ey v_Ez");
       }
       use_external_field_ = true;
-      external_tensor_rank_ = 1;
-      external_field_symmetric_rank2_ = false;
-      external_field_var_names_ = {
+      use_electric_field_ = true;
+      electric_field_var_names_ = {
           normalize_variable_name(arg[i + 1]),
           normalize_variable_name(arg[i + 2]),
           normalize_variable_name(arg[i + 3]),
       };
-      cached_external_field_values_.assign(3, 0.0f);
+      i += 3;
+      continue;
+    }
+    if (opt == "mfield") {
+      if (i + 3 >= narg) {
+        error->all(FLERR, "pair_style mff/torch mfield expects three equal-style variables: v_Bx v_By v_Bz");
+      }
+      use_external_field_ = true;
+      use_magnetic_field_ = true;
+      magnetic_field_var_names_ = {
+          normalize_variable_name(arg[i + 1]),
+          normalize_variable_name(arg[i + 2]),
+          normalize_variable_name(arg[i + 3]),
+      };
       i += 3;
       continue;
     }
@@ -178,11 +198,10 @@ void PairMFFTorch::settings(int narg, char **arg) {
                    "(row-major: xx xy xz yx yy yz zx zy zz)");
       }
       use_external_field_ = true;
-      external_tensor_rank_ = 2;
+      use_rank2_external_field_ = true;
       external_field_symmetric_rank2_ = false;
-      external_field_var_names_.clear();
-      for (int k = 1; k <= 9; ++k) external_field_var_names_.push_back(normalize_variable_name(arg[i + k]));
-      cached_external_field_values_.assign(9, 0.0f);
+      rank2_external_field_var_names_.clear();
+      for (int k = 1; k <= 9; ++k) rank2_external_field_var_names_.push_back(normalize_variable_name(arg[i + k]));
       i += 9;
       continue;
     }
@@ -193,15 +212,41 @@ void PairMFFTorch::settings(int narg, char **arg) {
                    "(symmetric order: xx yy zz xy xz yz)");
       }
       use_external_field_ = true;
-      external_tensor_rank_ = 2;
+      use_rank2_external_field_ = true;
       external_field_symmetric_rank2_ = true;
-      external_field_var_names_.clear();
-      for (int k = 1; k <= 6; ++k) external_field_var_names_.push_back(normalize_variable_name(arg[i + k]));
-      cached_external_field_values_.assign(6, 0.0f);
+      rank2_external_field_var_names_.clear();
+      for (int k = 1; k <= 6; ++k) rank2_external_field_var_names_.push_back(normalize_variable_name(arg[i + k]));
       i += 6;
       continue;
     }
+    if (opt == "fidelity") {
+      if (i + 1 >= narg) {
+        error->all(FLERR, "pair_style mff/torch fidelity expects an integer or equal-style variable");
+      }
+      use_fidelity_input_ = true;
+      std::string value(arg[i + 1]);
+      if (value.rfind("v_", 0) == 0) {
+        fidelity_is_variable_ = true;
+        fidelity_var_name_ = normalize_variable_name(value);
+      } else {
+        fidelity_is_variable_ = false;
+        fidelity_constant_ = static_cast<int64_t>(std::stoll(value));
+      }
+      i += 1;
+      continue;
+    }
     error->all(FLERR, ("Unknown pair_style mff/torch option: " + opt).c_str());
+  }
+
+  if (use_rank2_external_field_ && (use_electric_field_ || use_magnetic_field_)) {
+    error->all(FLERR, "pair_style mff/torch does not yet support combining field6/field9 with field/mfield");
+  }
+  if (use_electric_field_ && use_magnetic_field_) {
+    cached_external_field_values_.assign(6, 0.0f);
+  } else if (use_rank2_external_field_) {
+    cached_external_field_values_.assign(external_field_symmetric_rank2_ ? 6 : 9, 0.0f);
+  } else if (use_electric_field_ || use_magnetic_field_) {
+    cached_external_field_values_.assign(3, 0.0f);
   }
 }
 
@@ -291,39 +336,99 @@ void PairMFFTorch::validate_external_field_configuration() {
   if (use_external_field_) {
     if (!engine_->accepts_external_tensor()) {
       error->all(FLERR,
-                 "pair_style mff/torch field was specified, but core.pt does not accept external_tensor");
+                 "pair_style mff/torch field/mfield was specified, but core.pt does not accept external_tensor");
     }
-    const int expected_nvars = (external_tensor_rank_ == 1) ? 3 : (external_field_symmetric_rank2_ ? 6 : 9);
-    if (static_cast<int>(external_field_var_names_.size()) != expected_nvars) {
-      error->all(FLERR, "mff/torch external field variable count does not match the selected field mode");
-    }
-    for (const auto &name : external_field_var_names_) {
-      if (name.empty()) error->all(FLERR, "pair_style mff/torch external field variable name is empty");
-      const int ivar = input->variable->find(name.c_str());
-      if (ivar < 0) {
-        error->all(FLERR, ("Unknown LAMMPS variable for mff/torch field: " + name).c_str());
+    const bool expects_field_1o = engine_->external_tensor_has_field_1o() || engine_->external_tensor_irrep() == "1o";
+    const bool expects_field_1e = engine_->external_tensor_has_field_1e() || engine_->external_tensor_irrep() == "1e";
+    if (use_rank2_external_field_) {
+      if (expects_field_1o || expects_field_1e) {
+        error->all(FLERR, "core.pt expects rank-1 external fields; use field and/or mfield instead of field6/field9");
       }
-      if (!input->variable->equalstyle(ivar)) {
-        error->all(FLERR,
-                   ("mff/torch field variables must be equal-style scalars: " + name).c_str());
+      const int expected_nvars = external_field_symmetric_rank2_ ? 6 : 9;
+      if (static_cast<int>(rank2_external_field_var_names_.size()) != expected_nvars) {
+        error->all(FLERR, "mff/torch external field variable count does not match the selected field mode");
+      }
+    } else {
+      if (expects_field_1o && !expects_field_1e && !use_electric_field_) {
+        error->all(FLERR, "core.pt expects electric-field-style external_tensor; use pair_style mff/torch ... field v_Ex v_Ey v_Ez");
+      }
+      if (expects_field_1e && !expects_field_1o && !use_magnetic_field_) {
+        error->all(FLERR, "core.pt expects magnetic-field-style external_tensor; use pair_style mff/torch ... mfield v_Bx v_By v_Bz");
+      }
+      if (use_electric_field_ && !expects_field_1o && expects_field_1e) {
+        error->all(FLERR, "core.pt expects magnetic-field-style external_tensor only; remove field and use mfield");
+      }
+      if (use_magnetic_field_ && !expects_field_1e && expects_field_1o) {
+        error->all(FLERR, "core.pt expects electric-field-style external_tensor only; remove mfield and use field");
       }
     }
+
+    auto validate_names = [&](const std::vector<std::string>& names) {
+      for (const auto& name : names) {
+        if (name.empty()) error->all(FLERR, "pair_style mff/torch external field variable name is empty");
+        const int ivar = input->variable->find(name.c_str());
+        if (ivar < 0) {
+          error->all(FLERR, ("Unknown LAMMPS variable for mff/torch field: " + name).c_str());
+        }
+        if (!input->variable->equalstyle(ivar)) {
+          error->all(FLERR, ("mff/torch field variables must be equal-style scalars: " + name).c_str());
+        }
+      }
+    };
+    validate_names(electric_field_var_names_);
+    validate_names(magnetic_field_var_names_);
+    validate_names(rank2_external_field_var_names_);
   } else if (engine_->accepts_external_tensor()) {
     error->all(FLERR,
-               "core.pt requires external_tensor, but pair_style mff/torch was not given field/field6/field9");
+               "core.pt requires external_tensor, but pair_style mff/torch was not given field/mfield/field6/field9");
+  }
+
+  if (engine_->requires_runtime_fidelity()) {
+    if (!use_fidelity_input_) {
+      error->all(FLERR, "core.pt requires runtime fidelity_ids; add pair_style mff/torch ... fidelity <int|v_name>");
+    }
+  } else if (use_fidelity_input_ && !engine_->takes_fidelity_arg()) {
+    error->all(FLERR, "pair_style mff/torch fidelity was specified, but core.pt does not accept fidelity_ids");
+  }
+  if (use_fidelity_input_ && fidelity_is_variable_) {
+    if (fidelity_var_name_.empty()) error->all(FLERR, "pair_style mff/torch fidelity variable name is empty");
+    const int ivar = input->variable->find(fidelity_var_name_.c_str());
+    if (ivar < 0) {
+      error->all(FLERR, ("Unknown LAMMPS variable for mff/torch fidelity: " + fidelity_var_name_).c_str());
+    }
+    if (!input->variable->equalstyle(ivar)) {
+      error->all(FLERR, ("mff/torch fidelity variable must be an equal-style scalar: " + fidelity_var_name_).c_str());
+    }
+  }
+  if (use_fidelity_input_ && !fidelity_is_variable_ && engine_->num_fidelity_levels() > 0) {
+    if (fidelity_constant_ < 0 || fidelity_constant_ >= engine_->num_fidelity_levels()) {
+      error->all(
+          FLERR,
+          ("pair_style mff/torch fidelity is out of range [0, " + std::to_string(engine_->num_fidelity_levels() - 1) +
+           "]: " + std::to_string(fidelity_constant_))
+              .c_str());
+    }
   }
 }
 
 torch::Tensor PairMFFTorch::current_external_tensor(const torch::Device& device) {
   if (!use_external_field_) return torch::Tensor();
 
-  std::vector<float> values(external_field_var_names_.size(), 0.0f);
-  for (size_t k = 0; k < external_field_var_names_.size(); ++k) {
-    const int ivar = input->variable->find(external_field_var_names_[k].c_str());
-    if (ivar < 0) {
-      error->all(FLERR, ("Unknown LAMMPS variable for mff/torch field: " + external_field_var_names_[k]).c_str());
+  std::vector<float> values;
+  auto append_values = [&](const std::vector<std::string>& names) {
+    for (const auto& name : names) {
+      const int ivar = input->variable->find(name.c_str());
+      if (ivar < 0) {
+        error->all(FLERR, ("Unknown LAMMPS variable for mff/torch field: " + name).c_str());
+      }
+      values.push_back(static_cast<float>(input->variable->compute_equal(ivar)));
     }
-    values[k] = static_cast<float>(input->variable->compute_equal(ivar));
+  };
+  if (use_rank2_external_field_) {
+    append_values(rank2_external_field_var_names_);
+  } else {
+    if (use_electric_field_) append_values(electric_field_var_names_);
+    if (use_magnetic_field_) append_values(magnetic_field_var_names_);
   }
 
   const bool cache_hit =
@@ -334,9 +439,9 @@ torch::Tensor PairMFFTorch::current_external_tensor(const torch::Device& device)
 
   cached_external_field_values_ = values;
   torch::Tensor cpu;
-  if (external_tensor_rank_ == 1) {
+  if (!use_rank2_external_field_) {
     cpu = torch::tensor(values, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
-  } else if (external_tensor_rank_ == 2 && external_field_symmetric_rank2_) {
+  } else if (external_field_symmetric_rank2_) {
     cpu = torch::tensor(
               {
                   values[0], values[3], values[4],
@@ -345,14 +450,36 @@ torch::Tensor PairMFFTorch::current_external_tensor(const torch::Device& device)
               },
               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
               .reshape({3, 3});
-  } else if (external_tensor_rank_ == 2) {
+  } else {
     cpu = torch::tensor(values, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
               .reshape({3, 3});
-  } else {
-    error->all(FLERR, "Unsupported external tensor rank for mff/torch");
   }
   external_tensor_cache_ = (device.is_cpu()) ? cpu : cpu.to(device);
   return external_tensor_cache_;
+}
+
+torch::Tensor PairMFFTorch::current_fidelity_tensor(const torch::Device& device) {
+  if (!use_fidelity_input_) return torch::Tensor();
+
+  int64_t fidelity_value = fidelity_constant_;
+  if (fidelity_is_variable_) {
+    const int ivar = input->variable->find(fidelity_var_name_.c_str());
+    if (ivar < 0) {
+      error->all(FLERR, ("Unknown LAMMPS variable for mff/torch fidelity: " + fidelity_var_name_).c_str());
+    }
+    fidelity_value = static_cast<int64_t>(std::llround(input->variable->compute_equal(ivar)));
+  }
+  if (engine_ && engine_->num_fidelity_levels() > 0) {
+    if (fidelity_value < 0 || fidelity_value >= engine_->num_fidelity_levels()) {
+      error->all(
+          FLERR,
+          ("mff/torch fidelity value is out of range [0, " + std::to_string(engine_->num_fidelity_levels() - 1) +
+           "]: " + std::to_string(fidelity_value))
+              .c_str());
+    }
+  }
+  auto cpu = torch::tensor({fidelity_value}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  return device.is_cpu() ? cpu : cpu.to(device);
 }
 
 void PairMFFTorch::reset_physical_outputs() {
@@ -523,11 +650,13 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   auto edge_dst_t = torch::from_blob(edge_dst_cpu.data(), {E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)).clone();
   auto edge_shifts_t = torch::from_blob(edge_shifts_cpu.data(), {E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
   auto external_tensor_t = current_external_tensor(torch::kCPU);
+  auto fidelity_ids_t = current_fidelity_tensor(torch::kCPU);
 
   const bool want_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
     out = engine_->compute(nlocal, ntotal, pos_t, A_t, edge_src_t, edge_dst_t, edge_shifts_t, cell_t, external_tensor_t,
+                           fidelity_ids_t,
                            static_cast<bool>(eflag), want_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());

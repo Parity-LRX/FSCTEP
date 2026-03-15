@@ -1,6 +1,6 @@
 # Usage Guide
 
-FusedSCEquiTensorPot supports **eight equivariant tensor product implementation modes**, and in `pure-cartesian-ictd` mode can **embed external fields** (e.g., electric field) and **train physical tensors** (charge, dipole, polarizability, quadrupole). Including:
+FusedSCEquiTensorPot supports multiple equivariant tensor product implementation modes, and in `pure-cartesian-ictd`, `pure-cartesian-ictd-o3`, `pure-cartesian-sparse`, and `pure-cartesian-sparse-save` can **embed external fields** (electric field, magnetic field, and other rank-aware tensors) and **train physical tensors** (charge, dipole, polarizability, quadrupole, BEC, magnetic moment). Including:
 - `spherical`: e3nn-based spherical harmonics method (default)
 - `spherical-save`: channelwise edge conv (e3nn backend, fewer params)
 - `spherical-save-cue`: channelwise edge conv (cuEquivariance backend, optional dependency, GPU accelerated)
@@ -9,6 +9,7 @@ FusedSCEquiTensorPot supports **eight equivariant tensor product implementation 
 - `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, not recommended)
 - `pure-cartesian-sparse`: Sparse pure Cartesian (strictly equivariant, parameter-optimized)
 - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, fastest, fewest parameters)
+- `pure-cartesian-ictd-o3`: Full parity-aware O(3) ICTD trunk that keeps `1e/1o` distinct through the whole network
 
 All modes maintain O(3) equivariance (including rotation and reflection). For detailed performance comparison, see the [Tensor Product Mode Comparison](#tensor-product-mode-comparison) section.
 
@@ -273,10 +274,12 @@ mff-evaluate \
     --zbl-outer-cutoff 1.2
 ```
 
-**External Fields & Physical Tensor Training** (`pure-cartesian-ictd`, `pure-cartesian-sparse`, `pure-cartesian-sparse-save`):
+**External Fields & Physical Tensor Training** (`pure-cartesian-ictd`, `pure-cartesian-ictd-o3`, `pure-cartesian-sparse`, `pure-cartesian-sparse-save`):
 
 - **External field embedding**: Inject global tensors (e.g., electric field, rank=1) into conv1 for field-dependent potentials
-- **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
+- **Full-parity path**: any task with explicit parity semantics must use `pure-cartesian-ictd-o3`
+- **Parity-sensitive tasks**: this includes magnetic-field (`1e`) inputs, magnetic moment (`1e`) outputs, and any pseudo/axial tensor task where `1e` and `1o` must remain distinct through the trunk
+- **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole, and per-atom Born effective charge (BEC)
 
 ```bash
 # External field (electric) + dipole/polarizability training
@@ -289,7 +292,7 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse \
 # Per-atom physical tensors (requires per-node label HDF5)
 mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse-save \
   --extra-per-node-file data/per_atom_labels.h5 \
-  --physical-tensors-per-node charge_per_atom,dipole_per_atom
+  --physical-tensors-per-node charge_per_atom,dipole_per_atom,born_effective_charge_per_atom
 ```
 
 **External field & physical tensor parameters:**
@@ -297,17 +300,86 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse-save \
 | Parameter | Description |
 |-----------|--------------|
 | `--external-tensor-rank` | External tensor rank (e.g., 1=electric field), requires `--external-field-file` |
+| `--external-tensor-irrep` | External-field irrep semantics; common values are `1o` (electric field) and `1e` (magnetic field). Any explicitly parity-sensitive irrep task should use `pure-cartesian-ictd-o3` |
 | `--external-field-file` | External field label file (.npy/.npz/.h5, shape B×3) |
 | `--charge-file` | Per-structure charge labels (scalar per sample) |
 | `--dipole-file` | Per-structure dipole labels (B×3) |
+| `--magnetic-moment-file` | Per-structure magnetic moment labels (B×3, `1e`; should be trained under `pure-cartesian-ictd-o3`) |
 | `--polarizability-file` | Per-structure polarizability labels (B×3×3) |
 | `--quadrupole-file` | Per-structure quadrupole labels (B×3×3) |
-| `--extra-per-node-file` | Per-atom label HDF5 (sample_0, sample_1, ... with charge_per_atom, etc.) |
-| `--physical-tensors` | Per-structure outputs: charge,dipole,polarizability,quadrupole |
-| `--physical-tensors-per-node` | Per-atom outputs: charge_per_atom,dipole_per_atom, etc. |
+| `--extra-per-node-file` | Per-atom label HDF5 (sample_0, sample_1, ... with charge_per_atom, born_effective_charge_per_atom, etc.) |
+| `--physical-tensors` | Per-structure outputs: charge,dipole,magnetic_moment,polarizability,quadrupole |
+| `--physical-tensors-per-node` | Per-atom outputs: charge_per_atom,dipole_per_atom,magnetic_moment_per_atom,polarizability_per_atom,quadrupole_per_atom,born_effective_charge_per_atom |
+| `--o3-irrep-preset` | Active-irrep preset for `pure-cartesian-ictd-o3`: `minimal` / `auto` / `balanced` / `full` |
+| `--o3-active-irreps` | Explicit active-irrep override for `pure-cartesian-ictd-o3`, e.g. `0e,1e,2e` |
 | `--physical-tensor-reduce` | Per-structure reduce: sum (default), mean, none |
 | `--physical-tensor-weights` | Loss weights: `charge:1.0,dipole:2.0,...` |
+| `--bec-derivative-weight` | Loss weight for BEC supervision derived from `dF/dE` (requires rank-1 external field + BEC labels) |
+| `--bec-consistency-weight` | Loss weight tying the explicit BEC head to the `dF/dE`-derived BEC |
 | `--inference-output-physical-tensors` | Save to checkpoint: inference outputs physical tensors (default: no; MD/LAMMPS only needs energy and forces) |
+
+```bash
+# Full-parity O(3) ICTD path: magnetic field (1e) + magnetic moment
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd-o3 \
+  --external-tensor-rank 1 --external-tensor-irrep 1e \
+  --o3-irrep-preset auto \
+  --o3-active-irreps '0e,1e,2e' \
+  --external-field-file data/bfield.npy \
+  --physical-tensors magnetic_moment \
+  --magnetic-moment-file data/magnetic_moment.npy
+
+# Full-parity O(3) ICTD path: simultaneous electric field (1o) + magnetic field (1e)
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd-o3 \
+  --external-tensor-rank 1 --external-tensor-irrep 1o \
+  --external-field-file data/efield.npy \
+  --magnetic-field-file data/bfield.npy \
+  --o3-irrep-preset auto \
+  --o3-active-irreps '0e,1e,1o,2e'
+```
+
+- `pure-cartesian-ictd-o3` is the strict full-parity path. Any explicitly parity-sensitive task should run in this mode.
+- Other external fields can be embedded by pairing `--external-tensor-rank` with `--external-tensor-irrep`. Typical rank-1 cases are `1o` for electric field and `1e` for magnetic field. If the chosen irrep carries explicit parity semantics, use `pure-cartesian-ictd-o3`. Simultaneous rank-1 electric + magnetic conditioning is supported via `--external-field-file` together with `--magnetic-field-file`.
+
+Note: `born_effective_charge_per_atom` is now wired through training, evaluation, Python inference, and the `mff/torch` export schema. To make LAMMPS read the new columns, rebuild `USER-MFFTORCH` with the updated C++ sources.
+
+**Multi-fidelity training** (supported in `spherical-save-cue`, `pure-cartesian-ictd`, `pure-cartesian-ictd-o3`, `pure-cartesian-sparse`, `pure-cartesian-sparse-save`):
+
+- `--num-fidelity-levels`: total number of fidelity levels
+- `--fidelity-id-file`: one integer `fidelity_id` per structure
+- `--multi-fidelity-mode conditioning`: shared trunk + shared head, with conv1 conditioning only
+- `--multi-fidelity-mode delta-baseline`: shared trunk + baseline head + per-fidelity delta heads
+- `--fidelity-loss-weights`: fidelity-specific loss weights such as `0:1.0,1:3.0`
+- `--delta-regularization-weight`: regularization strength for delta heads, used with `delta-baseline`
+
+```bash
+# Conditioning-only multi-fidelity
+mff --train \
+  --data-dir data \
+  --tensor-product-mode pure-cartesian-ictd \
+  --num-fidelity-levels 2 \
+  --fidelity-id-file data/train_fidelity_id.npy \
+  --fidelity-loss-weights '0:1.0,1:3.0'
+
+# Delta-learning multi-fidelity
+mff --train \
+  --data-dir data \
+  --tensor-product-mode pure-cartesian-ictd-o3 \
+  --num-fidelity-levels 2 \
+  --multi-fidelity-mode delta-baseline \
+  --fidelity-id-file data/train_fidelity_id.npy \
+  --fidelity-loss-weights '0:1.0,1:3.0' \
+  --delta-regularization-weight 1e-4
+```
+
+You can merge multiple processed HDF5 files into one multi-fidelity dataset:
+
+```bash
+mff --merge-multifidelity \
+  --inputs data/processed_pbe.h5 data/processed_hse.h5 \
+  --fidelity-ids 0 1 \
+  --output-h5 data/processed_train_mf.h5 \
+  --output-fidelity-npy data/train_fidelity_id.npy
+```
 
 **Method 2: Auto Preprocess and Train (One Step)**
 ```bash
@@ -2088,23 +2160,48 @@ Additional note:
 - `isolated-far-field-v1` and `isolated-far-field-v2` checkpoints export with `long_range_runtime_backend=none`; no `--export-reciprocal-source` needed. The current `v2` export includes sparse explicit far shells, an internal screened-Coulomb × learned-radial-gate kernel, and a configurable coarse tail, all embedded directly in the core forward path.
 - The current `mfftorch` path is validated for 4 common combinations:
   1. No external field, no physical tensors: energy + forces only
-  2. External field, no physical tensors: energy + forces with runtime `field` / `field6` / `field9`
+  2. External field, no physical tensors: energy + forces with runtime `field` / `mfield` / `field6` / `field9`
   3. No external field, with physical tensors: energy + forces + tensor outputs via `compute mff/torch/phys`
   4. External field, with physical tensors: both runtime field input and tensor outputs enabled
 - Runtime external field support:
-  - `field v_Ex v_Ey v_Ez`: rank-1 external tensor, appropriate for `l=1`-like vector cases
+  - `field v_Ex v_Ey v_Ez`: rank-1 `1o` external tensor, appropriate for electric-field-like polar vectors
+  - `mfield v_Bx v_By v_Bz`: rank-1 `1e` external tensor, appropriate for magnetic-field-like axial vectors
+  - If an exported `core.pt` declares both rank-1 electric and magnetic fields, specify both `field ... mfield ...` in the same `pair_style mff/torch` line
   - `field6` / `field9`: rank-2 external tensor input
+  - If exported metadata says `external_tensor_irrep=1o`, use `field`; if it says `1e`, use `mfield`
+  - `field6` / `field9` remain mutually exclusive with `field` / `mfield`
+- Runtime multi-fidelity support:
+  - If exported `core.pt` keeps runtime fidelity input, pass `fidelity 1` in `pair_style mff/torch`
+  - Equal-style variable form `fidelity v_fid` is also supported
+  - If `core.pt` was exported with `--export-fidelity-id`, the fidelity branch is frozen and runtime `fidelity` should not be passed
 - The current fixed-schema physical quantities exposed in LAMMPS are:
   - global: `charge`, `dipole`, `polarizability`, `quadrupole`
-  - per-atom: `charge_per_atom`, `dipole_per_atom`, `polarizability_per_atom`, `quadrupole_per_atom`
+  - per-atom: `charge_per_atom`, `dipole_per_atom`, `polarizability_per_atom`, `quadrupole_per_atom`, `born_effective_charge_per_atom`
 - Missing physical heads are allowed: the corresponding mask becomes 0 and the output block is filled with 0
 - Typical fixed-schema `l` compatibility:
   - `charge` / `charge_per_atom`: `l=0`
   - `dipole` / `dipole_per_atom`: `l=1`
   - `polarizability`: usually a rank-2 Cartesian tensor, typically `l=0+2`
   - `quadrupole`: usually `l=2`
+  - `born_effective_charge_per_atom`: usually a full rank-2 Cartesian tensor, typically `l=0+1+2`
 - Arbitrary custom physical head names are not auto-exposed to `compute mff/torch/phys` yet
+
+Example:
+
+```lammps
+pair_style mff/torch 5.0 cuda fidelity 1
+pair_coeff * * /path/to/core.pt H O
+```
+
+or
+
+```lammps
+variable fid equal 1
+pair_style mff/torch 5.0 cuda fidelity v_fid
+pair_coeff * * /path/to/core.pt H O
+```
 - The current LibTorch/LAMMPS export path assumes `channels_out == 1` for exposed physical heads
+- `born_effective_charge_per_atom` is read through `compute ... atom born_effective_charge`; the full tensor has 9 Cartesian components, and individual components such as `xx` can be selected directly
 
 **Recommended GPU test commands**:
 

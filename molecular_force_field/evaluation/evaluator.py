@@ -7,7 +7,19 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from molecular_force_field.utils.scatter import scatter
 
-from molecular_force_field.utils.tensor_utils import build_physical_tensor_label_blocks, map_tensor_values
+from molecular_force_field.utils.tensor_utils import (
+    ALL_PHYSICAL_TENSOR_NAMES,
+    build_physical_tensor_label_blocks,
+    map_tensor_values,
+)
+from molecular_force_field.utils.external_tensor_specs import pack_external_tensor_from_extras
+from molecular_force_field.utils.fidelity import (
+    finalize_per_fidelity_metric_sums,
+    get_graph_fidelity_weights,
+    init_per_fidelity_metric_sums,
+    smooth_l1_loss_stats,
+    update_per_fidelity_metric_sums,
+)
 
 
 class Evaluator:
@@ -46,6 +58,7 @@ class Evaluator:
         self.output_physical_tensors = output_physical_tensors
         self._phys_label_embedders = {}
         self.physical_tensor_weights = {}
+        self.fidelity_loss_weights = {}
 
     def _compute_physical_tensor_loss(self, extras, phys_pred, batch_idx, model):
         if phys_pred is None or not isinstance(phys_pred, dict):
@@ -58,12 +71,13 @@ class Evaluator:
             base = name.replace("_per_atom", "")
             return self.physical_tensor_weights.get(name, self.physical_tensor_weights.get(base, 1.0))
 
-        def _get_embed(y_tensor: torch.Tensor, rank: int, *, include_trace_chain: bool):
+        def _get_embed(y_tensor: torch.Tensor, rank: int, *, include_trace_chain: bool, rank2_mode: str = "symmetric"):
             return build_physical_tensor_label_blocks(
                 y_tensor,
                 rank=rank,
                 lmax=lmax_model,
                 include_trace_chain=include_trace_chain,
+                rank2_mode=rank2_mode,
                 representation=getattr(model, "physical_tensor_representation", "ictd"),
                 device=self.device,
                 cache=self._phys_label_embedders,
@@ -94,6 +108,14 @@ class Evaluator:
                 if p1 is not None and 1 in y_blocks:
                     phys_loss = phys_loss + w * F.smooth_l1_loss(p1.view(-1), y_blocks[1].view(-1), beta=0.5)
 
+        for name in ("magnetic_moment", "magnetic_moment_per_atom"):
+            if name in extras and name in phys_pred:
+                w = _phys_weight(name)
+                y_blocks = _get_embed(extras[name], 1, include_trace_chain=False)
+                p1 = phys_pred[name].get(1) if isinstance(phys_pred[name], dict) else None
+                if p1 is not None and 1 in y_blocks:
+                    phys_loss = phys_loss + w * F.smooth_l1_loss(p1.view(-1), y_blocks[1].view(-1), beta=0.5)
+
         for name in ("polarizability", "polarizability_per_atom"):
             if name in extras and name in phys_pred:
                 w = _phys_weight(name)
@@ -110,6 +132,15 @@ class Evaluator:
                 p2 = phys_pred[name].get(2) if isinstance(phys_pred[name], dict) else None
                 if p2 is not None and 2 in y_blocks:
                     phys_loss = phys_loss + w * F.smooth_l1_loss(p2.view(-1), y_blocks[2].view(-1), beta=0.5)
+
+        name = "born_effective_charge_per_atom"
+        if name in extras and name in phys_pred:
+            w = _phys_weight(name)
+            y_blocks = _get_embed(extras[name], 2, include_trace_chain=True, rank2_mode="full")
+            for l in (0, 1, 2):
+                pl = phys_pred[name].get(l) if isinstance(phys_pred[name], dict) else None
+                if pl is not None and l in y_blocks:
+                    phys_loss = phys_loss + w * F.smooth_l1_loss(pl.view(-1), y_blocks[l].view(-1), beta=0.5)
 
         return phys_loss
     
@@ -134,6 +165,11 @@ class Evaluator:
         val_F_targets = []
         val_total_loss_list = []
         val_phys_loss_list = []
+        val_energy_loss_sum = 0.0
+        val_energy_loss_norm = 0.0
+        val_force_loss_sum = 0.0
+        val_force_loss_norm = 0.0
+        per_fidelity_sums = None
         
         # Use SmoothL1Loss consistent with run_eval.py
         criterion = torch.nn.SmoothL1Loss(beta=0.5)
@@ -171,13 +207,29 @@ class Evaluator:
             
             # Forward
             forward_kwargs = {}
-            if "external_field" in extras:
-                forward_kwargs["external_tensor"] = extras["external_field"]
-            want_phys = any(
-                k in extras for k in (
-                    "charge", "dipole", "polarizability", "quadrupole",
-                    "charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom",
+            external_specs = getattr(self.model, "external_tensor_specs", None)
+            num_fidelity_levels = int(getattr(self.model, "num_fidelity_levels", 0) or 0)
+            fidelity_ids = None
+            if external_specs:
+                packed_external = pack_external_tensor_from_extras(
+                    extras,
+                    external_specs,
+                    device=self.device,
+                    dtype=pos.dtype,
                 )
+                if packed_external is not None:
+                    forward_kwargs["external_tensor"] = packed_external
+            elif "external_field" in extras:
+                forward_kwargs["external_tensor"] = extras["external_field"]
+            if num_fidelity_levels > 0:
+                if "fidelity_id" not in extras:
+                    raise ValueError("Model was configured with num_fidelity_levels but batch extras do not contain fidelity_id")
+                fidelity_ids = extras["fidelity_id"].to(self.device, dtype=torch.long).view(-1)
+                forward_kwargs["fidelity_ids"] = fidelity_ids
+                if per_fidelity_sums is None:
+                    per_fidelity_sums = init_per_fidelity_metric_sums(num_fidelity_levels, device=self.device)
+            want_phys = any(
+                k in extras for k in ALL_PHYSICAL_TENSOR_NAMES
             )
             supports_phys = hasattr(self.model, "physical_tensor_heads") and self.model.physical_tensor_heads is not None
             if (self.output_physical_tensors or want_phys) and supports_phys:
@@ -207,6 +259,13 @@ class Evaluator:
             f_pred_final = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)  # [N_atoms, 3]
             
             f_ref_final = force_ref * self.force_shift_value
+            graph_fidelity_weights = get_graph_fidelity_weights(
+                fidelity_ids,
+                self.fidelity_loss_weights,
+                device=self.device,
+                dtype=pos.dtype,
+            )
+            atom_fidelity_weights = None if graph_fidelity_weights is None else graph_fidelity_weights[batch_idx]
             
             # Collect data (detach and move to CPU)
             with torch.no_grad():
@@ -224,13 +283,47 @@ class Evaluator:
                 val_F_targets.append(f_ref_final.detach().cpu())
 
                 # Loss (only for Log)
-                batch_e_loss = criterion(E_mean_val, target_energies)
-                batch_f_loss = criterion(f_pred_final.view(-1), f_ref_final.view(-1))
+                num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
+                E_avg_pred = E_mean_val / num_atoms_per_mol
+                E_avg_target = target_energies / num_atoms_per_mol
+                _, batch_e_loss_sum, batch_e_loss_norm = smooth_l1_loss_stats(
+                    E_avg_pred,
+                    E_avg_target,
+                    beta=0.5,
+                    weights=graph_fidelity_weights,
+                )
+                _, batch_f_loss_sum, batch_f_loss_norm = smooth_l1_loss_stats(
+                    f_pred_final,
+                    f_ref_final,
+                    beta=0.5,
+                    weights=atom_fidelity_weights,
+                )
+                val_energy_loss_sum += float(batch_e_loss_sum.item())
+                val_energy_loss_norm += float(batch_e_loss_norm.item())
+                val_force_loss_sum += float(batch_f_loss_sum.item())
+                val_force_loss_norm += float(batch_f_loss_norm.item())
                 batch_phys_loss = torch.tensor(0.0, device=self.device)
                 if want_phys and supports_phys and phys_pred is not None:
                     batch_phys_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, self.model)
                     val_phys_loss_list.append(batch_phys_loss.item())
-                val_total_loss_list.append((batch_e_loss + batch_f_loss + batch_phys_loss).item())
+                val_total_loss_list.append(
+                    (
+                        batch_e_loss_sum / batch_e_loss_norm.clamp_min(1e-12)
+                        + batch_f_loss_sum / batch_f_loss_norm.clamp_min(1e-12)
+                        + batch_phys_loss
+                    ).item()
+                )
+                update_per_fidelity_metric_sums(
+                    per_fidelity_sums,
+                    graph_fidelity_ids=fidelity_ids,
+                    batch_idx=batch_idx,
+                    energy_preds=E_mean_val.detach(),
+                    energy_targets=target_energies.detach(),
+                    energy_avg_preds=E_avg_pred.detach(),
+                    energy_avg_targets=E_avg_target.detach(),
+                    force_preds=f_pred_final.detach(),
+                    force_targets=f_ref_final.detach(),
+                )
 
             # Fix: take [0] when printing log to avoid error when batch_size > 1
             logging.info(f"Batch Sample -> Pred: {self.dataset.restore_energy(E_mean_val[0].item()):.4f} , True: {self.dataset.restore_energy(target_energies[0].item()):.4f}")
@@ -256,23 +349,39 @@ class Evaluator:
         val_energy_mae_avg = F.l1_loss(all_E_avg_preds, all_E_avg_targets).item()
         val_energy_mae_avg = self.dataset.restore_energy(val_energy_mae_avg)
         
-        val_energy_loss = F.mse_loss(all_E_avg_preds, all_E_avg_targets).item()
+        val_energy_loss = val_energy_loss_sum / max(1.0, val_energy_loss_norm)
 
         # Force (Flatten to calculate metrics)
         val_force_rmse = torch.sqrt(F.mse_loss(all_F_preds.view(-1), all_F_targets.view(-1))).item()
         val_force_mae = F.l1_loss(all_F_preds.view(-1), all_F_targets.view(-1)).item()
+        val_force_loss = val_force_loss_sum / max(1.0, val_force_loss_norm)
         val_phys_loss = float(sum(val_phys_loss_list) / max(1, len(val_phys_loss_list))) if val_phys_loss_list else 0.0
+        per_fidelity_metrics = finalize_per_fidelity_metric_sums(
+            per_fidelity_sums,
+            restore_energy=self.dataset.restore_energy,
+            restore_force=self.dataset.restore_force,
+        )
 
         phys_log_line = f"""
                         "Phys Loss Val (weighted)": {val_phys_loss}""" if val_phys_loss_list else ""
         logging.info(f"""
-                        "Energy Loss Val (MSE)": {val_energy_loss},
+                        "Energy Loss Val (weighted SmoothL1)": {val_energy_loss},
                         "Energy RMSE Val": {val_energy_rmse},
                         "Energy RMSE avg Val": {val_energy_rmse_avg},
                         "Energy MAE avg Val": {val_energy_mae_avg},
                         "Force MAE Val": {val_force_mae},
-                        "Force RMSE Val":  {val_force_rmse},{phys_log_line}
+                        "Force RMSE Val":  {val_force_rmse},
+                        "Force Loss Val (weighted)": {val_force_loss},{phys_log_line}
                         """)
+        for fid, fid_metrics in sorted(per_fidelity_metrics.items()):
+            logging.info(
+                "Eval fidelity %d | N=%d | E_RMSE=%.6f | Eatom_RMSE=%.6f | F_RMSE=%.6f",
+                fid,
+                int(fid_metrics.get("num_graphs", 0)),
+                fid_metrics.get("energy_rmse", 0.0),
+                fid_metrics.get("energy_rmse_avg", 0.0),
+                fid_metrics.get("force_rmse", 0.0),
+            )
         
         # Save results
         loss_out = [{
@@ -314,7 +423,9 @@ class Evaluator:
             'energy_loss': val_energy_loss,
             'force_rmse': val_force_rmse,
             'force_mae': val_force_mae,
+            'force_loss': val_force_loss,
             'phys_loss': val_phys_loss,
+            'per_fidelity': per_fidelity_metrics,
         }
     
     def compute_hessian(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):

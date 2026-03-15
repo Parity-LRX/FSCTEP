@@ -15,9 +15,9 @@ struct MFFOutputs {
   torch::Tensor forces;        // (ntotal,3) on engine device
   torch::Tensor atom_virial;   // (ntotal,6) on engine device — Voigt: xx,yy,zz,xy,xz,yz
   torch::Tensor global_phys;   // (n_graphs, 22) on engine device
-  torch::Tensor atom_phys;     // (ntotal, 22) on engine device
-  torch::Tensor global_phys_mask;  // (4,) on engine device
-  torch::Tensor atom_phys_mask;    // (4,) on engine device
+  torch::Tensor atom_phys;     // (ntotal, 31) on engine device
+  torch::Tensor global_phys_mask;  // (5,) on engine device
+  torch::Tensor atom_phys_mask;    // (5,) on engine device
   torch::Tensor reciprocal_source; // (ntotal, C_lr) on engine device
 };
 
@@ -33,7 +33,15 @@ class MFFTorchEngine {
   const torch::Device& device() const { return device_; }
   bool is_cuda() const { return device_.is_cuda(); }
   bool accepts_external_tensor() const { return core_requires_external_tensor_; }
+  const std::string& external_tensor_irrep() const { return external_tensor_irrep_; }
+  int64_t external_tensor_total_numel() const { return external_tensor_total_numel_; }
+  bool external_tensor_has_field_1o() const { return external_tensor_has_field_1o_; }
+  bool external_tensor_has_field_1e() const { return external_tensor_has_field_1e_; }
   bool exports_reciprocal_source() const { return core_exports_reciprocal_source_; }
+  bool takes_fidelity_arg() const { return core_takes_fidelity_arg_; }
+  bool requires_runtime_fidelity() const { return core_requires_runtime_fidelity_; }
+  int64_t num_fidelity_levels() const { return num_fidelity_levels_; }
+  int64_t export_fidelity_id() const { return export_fidelity_id_; }
   int64_t reciprocal_source_channels() const { return reciprocal_source_channels_; }
   const std::string& reciprocal_source_boundary() const { return reciprocal_source_boundary_; }
   int64_t reciprocal_source_slab_padding_factor() const { return reciprocal_source_slab_padding_factor_; }
@@ -60,6 +68,7 @@ class MFFTorchEngine {
                      const torch::Tensor& edge_shifts,
                      const torch::Tensor& cell,
                      const torch::Tensor& external_tensor = torch::Tensor(),
+                     const torch::Tensor& fidelity_ids = torch::Tensor(),
                      bool need_energy = true,
                      bool need_atom_virial = false);
 
@@ -68,6 +77,14 @@ class MFFTorchEngine {
   bool loaded_ = false;
   bool core_takes_external_tensor_arg_ = false;
   bool core_requires_external_tensor_ = false;
+  bool core_takes_fidelity_arg_ = false;
+  bool core_requires_runtime_fidelity_ = false;
+  std::string external_tensor_irrep_;
+  int64_t external_tensor_total_numel_ = 0;
+  int64_t num_fidelity_levels_ = 0;
+  int64_t export_fidelity_id_ = -1;
+  bool external_tensor_has_field_1o_ = false;
+  bool external_tensor_has_field_1e_ = false;
   bool core_exports_reciprocal_source_ = false;
   int64_t reciprocal_source_channels_ = 0;
   std::string reciprocal_source_boundary_ = "periodic";

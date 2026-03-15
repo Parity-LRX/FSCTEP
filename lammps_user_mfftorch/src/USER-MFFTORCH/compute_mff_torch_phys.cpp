@@ -16,8 +16,9 @@ using namespace LAMMPS_NS;
 
 namespace {
 
-constexpr int kPhysValueCols = 22;
-constexpr int kPhysMaskCols = 4;
+constexpr int kGlobalPhysValueCols = 22;
+constexpr int kAtomPhysValueCols = 31;
+constexpr int kPhysMaskCols = 5;
 
 std::string normalize_quantity_name(std::string name) {
   if (name.size() > 9 && name.rfind("_per_atom") == name.size() - 9) {
@@ -87,6 +88,38 @@ bool lookup_value_selection(const std::string &quantity_in, const std::string *c
     scalar_output = true;
     return true;
   }
+  if (quantity == "born_effective_charge") {
+    offset = 22;
+    if (component == nullptr) {
+      length = 9;
+      scalar_output = false;
+      return true;
+    }
+    if (*component == "xx") {
+      offset += 0;
+    } else if (*component == "xy") {
+      offset += 1;
+    } else if (*component == "xz") {
+      offset += 2;
+    } else if (*component == "yx") {
+      offset += 3;
+    } else if (*component == "yy") {
+      offset += 4;
+    } else if (*component == "yz") {
+      offset += 5;
+    } else if (*component == "zx") {
+      offset += 6;
+    } else if (*component == "zy") {
+      offset += 7;
+    } else if (*component == "zz") {
+      offset += 8;
+    } else {
+      return false;
+    }
+    length = 1;
+    scalar_output = true;
+    return true;
+  }
   return false;
 }
 
@@ -106,6 +139,10 @@ bool lookup_mask_selection(const std::string &quantity_in, int &offset) {
   }
   if (quantity == "quadrupole") {
     offset = 3;
+    return true;
+  }
+  if (quantity == "born_effective_charge") {
+    offset = 4;
     return true;
   }
   return false;
@@ -180,7 +217,13 @@ void ComputeMFFTorchPhys::parse_mode(const std::string &mode) {
 
 void ComputeMFFTorchPhys::parse_selection(int narg, char **arg) {
   selection_offset_ = 0;
-  selection_length_ = (mode_ == Mode::GLOBAL_MASK || mode_ == Mode::ATOM_MASK) ? kPhysMaskCols : kPhysValueCols;
+  if (mode_ == Mode::GLOBAL_MASK || mode_ == Mode::ATOM_MASK) {
+    selection_length_ = kPhysMaskCols;
+  } else if (mode_ == Mode::GLOBAL_VALUES) {
+    selection_length_ = kGlobalPhysValueCols;
+  } else {
+    selection_length_ = kAtomPhysValueCols;
+  }
   use_scalar_output_ = false;
   use_peratom_vector_output_ = false;
 
@@ -189,15 +232,20 @@ void ComputeMFFTorchPhys::parse_selection(int narg, char **arg) {
   const std::string quantity(arg[4]);
   const bool has_component = (narg >= 6);
   const std::string component = has_component ? std::string(arg[5]) : std::string();
+  const std::string quantity_norm = normalize_quantity_name(quantity);
 
   if (mode_ == Mode::GLOBAL_VALUES || mode_ == Mode::ATOM_VALUES) {
+    if (mode_ == Mode::GLOBAL_VALUES && quantity_norm == "born_effective_charge") {
+      error->all(FLERR,
+                 "compute mff/torch/phys global mode does not expose born_effective_charge; use atom or atom/mask");
+    }
     int offset = 0;
     int length = 0;
     bool scalar_output = false;
     const std::string *component_ptr = has_component ? &component : nullptr;
     if (!lookup_value_selection(quantity, component_ptr, offset, length, scalar_output)) {
       error->all(FLERR,
-                 "compute mff/torch/phys value selection must use charge, dipole[x|y|z], polarizability[xx..zz], or quadrupole[xx..zz]");
+                 "compute mff/torch/phys value selection must use charge, dipole[x|y|z], polarizability[xx..zz], quadrupole[xx..zz], or born_effective_charge[xx..zz]");
     }
     selection_offset_ = offset;
     selection_length_ = length;
@@ -213,7 +261,7 @@ void ComputeMFFTorchPhys::parse_selection(int narg, char **arg) {
     int offset = 0;
     if (!lookup_mask_selection(quantity, offset)) {
       error->all(FLERR,
-                 "compute mff/torch/phys mask selection must use charge, dipole, polarizability, or quadrupole");
+                 "compute mff/torch/phys mask selection must use charge, dipole, polarizability, quadrupole, or born_effective_charge");
     }
     selection_offset_ = offset;
     selection_length_ = 1;
@@ -312,7 +360,7 @@ double ComputeMFFTorchPhys::compute_scalar() {
 
   switch (mode_) {
     case Mode::GLOBAL_VALUES:
-      copy_global_tensor_to_scalar(pair_mfftorch_->global_phys(), kPhysValueCols);
+      copy_global_tensor_to_scalar(pair_mfftorch_->global_phys(), kGlobalPhysValueCols);
       break;
     case Mode::GLOBAL_MASK:
       copy_global_tensor_to_scalar(pair_mfftorch_->global_phys_mask(), kPhysMaskCols);
@@ -334,9 +382,9 @@ void ComputeMFFTorchPhys::compute_vector() {
   switch (mode_) {
     case Mode::GLOBAL_VALUES:
       if (use_scalar_output_) {
-        copy_global_tensor_to_scalar(pair_mfftorch_->global_phys(), kPhysValueCols);
+        copy_global_tensor_to_scalar(pair_mfftorch_->global_phys(), kGlobalPhysValueCols);
       } else {
-        copy_global_tensor_to_vector(pair_mfftorch_->global_phys(), kPhysValueCols);
+        copy_global_tensor_to_vector(pair_mfftorch_->global_phys(), kGlobalPhysValueCols);
       }
       break;
     case Mode::GLOBAL_MASK:
@@ -367,8 +415,8 @@ void ComputeMFFTorchPhys::compute_peratom() {
     error->all(FLERR, "compute mff/torch/phys per-atom access requires atom mode");
   }
   if (use_peratom_vector_output_) {
-    copy_atom_tensor_to_vector(pair_mfftorch_->atom_phys(), kPhysValueCols);
+    copy_atom_tensor_to_vector(pair_mfftorch_->atom_phys(), kAtomPhysValueCols);
   } else {
-    copy_atom_tensor_to_array(pair_mfftorch_->atom_phys(), kPhysValueCols);
+    copy_atom_tensor_to_array(pair_mfftorch_->atom_phys(), kAtomPhysValueCols);
   }
 }

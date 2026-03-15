@@ -4,84 +4,24 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for predicting molecular energies and forces. Built with PyTorch, it supports **eight equivariant tensor product modes**, including e3nn-based spherical harmonics, channelwise spherical backends, and multiple self-implemented Cartesian tensor product methods. **Highlights**: embed **external fields** (e.g., electric field) into the equivariant message passing, and train **physical tensors** (charge, dipole, polarizability, quadrupole) as supervised outputs—supported in `pure-cartesian-ictd`, `pure-cartesian-sparse`, and `pure-cartesian-sparse-save`.
+**FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for atomistic modeling with multiple tensor-product backends, explicit external-field conditioning, physical-tensor supervision, multi-fidelity training, and direct LAMMPS deployment.
 
-## ✨ Features
+## Overview
 
-- **Eight Equivariant Tensor Product Modes**: 
-  - `spherical`: e3nn-based spherical harmonics (strictly equivariant, default, standard implementation)
-  - `spherical-save`: channelwise edge convolution (e3nn backend; fewer params)
-  - `spherical-save-cue`: channelwise edge convolution (cuEquivariance backend; optional dependency)
-  - `partial-cartesian`: Cartesian tensor products with CG coefficients (strictly equivariant, -17.4% params)
-  - `partial-cartesian-loose`: Optimized Cartesian tensor products (approximate equivariance, faster)
-  - `pure-cartesian`: Pure Cartesian \(3^L\) representation (strictly equivariant, very slow, not recommended)
-  - `pure-cartesian-sparse`: Sparse pure Cartesian with δ/ε contractions (strictly equivariant, -29.6% params)
-  - `pure-cartesian-ictd`: ICTD irreps internal representation (strictly equivariant, -72.1% params, fastest, best for memory)
-  
-- **E(3)-Equivariant**: All modes maintain rotational equivariance and parity conservation
+- **Backends**: spherical, channelwise spherical (`spherical-save-cue`), partial Cartesian, sparse Cartesian, ICTD, and strict-parity `pure-cartesian-ictd-o3`.
+- **Field-aware learning**: electric field (`1o`), magnetic field (`1e`), and rank-aware tensor inputs can be embedded into equivariant message passing.
+- **Physical tensor targets**: charge, dipole, polarizability, quadrupole, BEC, and magnetic moment.
+- **Multi-fidelity**: graph-level fidelity conditioning, delta-learning (`delta-baseline`), per-fidelity weighting, and per-fidelity metrics.
+- **Deployment**: export to `core.pt`, run through `USER-MFFTORCH` or ML-IAP, and support runtime field / fidelity control in LAMMPS.
 
-- **Configurable Invariant Readout Width**:
-  - `--invariant-channels` controls the scalar invariant channel width used by the product-3 style readout blocks in `spherical`, `spherical-save`, `partial-cartesian`, `partial-cartesian-loose`, `pure-cartesian`, `pure-cartesian-sparse`, `pure-cartesian-ictd`, and `pure-cartesian-ictd-save`
-  - Default is `32`, which matches the previous hard-coded behavior
-  - `spherical-save-cue` does not use this parameter; even if a checkpoint carries `invariant_channels`, that field is ignored by the cuEquivariance channelwise backend
-  - The value is stored in checkpoint metadata and restored automatically by training resume, `mff-evaluate`, active learning loaders, thermal loaders, `mff-export-core`, and `export_mliap`
+## What This Repository Focuses On
 
-- **External Fields & Physical Tensors** (`pure-cartesian-ictd`, `pure-cartesian-sparse`, `pure-cartesian-sparse-save`):
-  - **External field embedding**: Inject global tensors (e.g., electric field, rank-1) into conv1 for field-dependent potentials
-  - **Physical tensor training**: Supervised outputs for charge, dipole, polarizability, quadrupole (per-structure or per-atom)
-  - Configurable loss weights, checkpoint-based inference mode; LAMMPS/TorchScript export outputs energy+forces only
-
-- **Optional ZBL Short-Range Repulsion**:
-  - Adds a universal `Ziegler-Biersack-Littmark (ZBL)` short-range repulsive correction on top of the learned per-atom energy
-  - Intended for high-energy close-contact configurations such as collision cascades, irradiation, ion implantation, and general short-range stabilization
-  - The configuration is stored in checkpoint metadata and is automatically restored by `mff-train`, `mff-evaluate`, `mff-export-core`, `export_mliap`, ASE calculators, active learning loaders, and thermal loaders
-  - Current controls: `--zbl-enabled`, `--zbl-inner-cutoff`, `--zbl-outer-cutoff`, `--zbl-exponent`, `--zbl-energy-scale`
-
-- **Prototype Long-Range Modules** (`pure-cartesian-ictd`, `spherical-save-cue`):
-  - `latent-coulomb`: latent-charge real-space prototype
-  - `latent-coulomb + tree_fmm`: open-boundary nonperiodic Barnes-Hut style backend for training/eval and `core.pt -> USER-MFFTORCH` runtime
-  - `reciprocal-spectral-v1`: legacy `direct_kspace` prototype plus LES-style `mesh_fft` backend (`O(M log M)` main term)
-  - `feature-spectral-fft`: low-rank `(N,F)->(N,C_lr)->FFT->(N,F)` residual block before `proj_total`
-  - `mesh_fft` supports `periodic` and `slab` (`x/y periodic + z vacuum padding`) in training, ASE active learning, and `core.pt -> USER-MFFTORCH`
-  - `tree_fmm` currently targets `boundary=nonperiodic`, scalar `latent_charge`, and `multipole_order=0`; USER-MFFTORCH now supports both single-rank and MPI multi-rank open-boundary runtime
-  - on CUDA builds, `tree_fmm` now prefers a CUDA-first linear-tree runtime for local tree construction, local leaf interactions, remote summary evaluation, and imported near-field evaluation; CPU helpers remain as reference/debug fallback
-  - distributed MPI exchange still supports conservative auto-fallback: `MFF_TREE_FMM_GPU_AWARE_MPI=1` requests device-pointer collectives, `MFF_TREE_FMM_ASSUME_GPU_AWARE_MPI=1` force-enables them, and `MFF_TREE_FMM_REUSE_POSITION_TOL=<tol>` reuses cached linear-tree topology across nearby MD steps
-  - `core.pt` keeps the legacy `reciprocal_source` output slot for backward compatibility, but now also writes backend-agnostic long-range source metadata for runtime evaluation
-  - Current recommended first-stage config: `mesh_fft + poisson + potential + cic`
-  
-- **Complete Workflow**:
-  - Data preprocessing from Extended XYZ format with PBC support
-  - Training with dynamic loss weight adjustment, SWA, EMA, stress training
-  - Evaluation: static metrics, MD, NEB, phonon spectrum
-  - LAMMPS integration: LibTorch (USER-MFFTORCH), ML-IAP, fix external
-  
-- **🔄 Active Learning** — *automatically grow your training set where the model is uncertain*:
-  - **One command** runs the full loop: **Train (ensemble) → Explore (MD/NEB) → Select (force deviation) → Label (DFT) → Merge → repeat**.
-  - **10+ label backends**: PySCF (no binary), VASP / CP2K / QE / Gaussian / ORCA via ASE; user script; **one script template for both local and SLURM**.
-  - **Single-node**: `--label-n-workers 8` for parallel DFT; **HPC**: one sbatch job per structure, throttle & resume.
-  - **Multi-stage**: JSON config (e.g. 300K → 600K); optional PES coverage (SOAP).
-  - **Docs**: [USAGE](USAGE.md#主动学习-mff-active-learn) (中文) · [USAGE_EN](USAGE_EN.md#active-learning-mff-active-learn) (English) · [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) (FAQ & backends).
-  
-- **CLI Commands**:
-  - `mff-preprocess` - Data preprocessing
-  - `mff-convert-dataset` - Convert common MLFF datasets to extxyz
-  - `mff-train` - Training
-  - `mff-evaluate` - Evaluation (static/MD/NEB/phonon)
-  - `mff-active-learn` - Active learning loop (explore, select, label, merge)
-  - `mff-export-core` - Export LibTorch core.pt (USER-MFFTORCH)
-  - `mff-lammps` - Generate LAMMPS fix external script
-  - `python -m molecular_force_field.cli.export_mliap` - Export ML-IAP format
-- `python -m molecular_force_field.cli.thermal_transport` - IFC2/IFC3, intrinsic BTE, and Callaway thermal workflow
-  - `torchrun -m molecular_force_field.cli.inference_ddp` - Large-scale multi-GPU inference (pure-cartesian-ictd only)
+- Multiple Cartesian and spherical equivariant trunks under one training/evaluation stack.
+- External-field-aware tensor learning, including explicit parity-sensitive O(3) modeling.
+- End-to-end workflow from preprocessing and training to `core.pt` export and LAMMPS runtime.
+- Research-oriented extensions such as long-range prototypes, active learning, NEB, phonons, and thermal transport.
 
 Dataset notes and conversion examples are in [DATASETS.md](DATASETS.md).
-  
-- **Easy to Use**:
-  - Simple command-line interface
-  - Automatic data preprocessing
-  - Checkpoint management with mode detection
-  
-- **GPU Support**: Full CUDA acceleration for training and inference
 
 ## Installation
 
@@ -89,89 +29,27 @@ Dataset notes and conversion examples are in [DATASETS.md](DATASETS.md).
 pip install -e .
 ```
 
-Or install dependencies from requirements.txt:
-
-```bash
-pip install -r requirements.txt
-```
-
-### Recommended (Linux CUDA): pinned cu128 toolchain
-
-Some dependencies (PyTorch CUDA wheels, PyG `torch_scatter` wheels) require pip flags like
-`--index-url` / `-f`, which **cannot be enforced from `setup.py`**. For a reproducible setup
-with cuEquivariance + PyG wheels, use the provided script:
+For a reproducible Linux CUDA setup with pinned PyTorch/cuEquivariance/PyG wheels:
 
 ```bash
 bash scripts/install_pt271_cu128.sh
 pip install -e .
 ```
 
-### Optional: cuEquivariance backend (for `tensor_product_mode=spherical-save-cue`)
+Optional extras:
 
-This project supports an additional channelwise spherical backend powered by NVIDIA **cuEquivariance**.
-
-Install via extras (recommended):
-
-```bash
-pip install -e ".[cue]"
-```
-
-Or via requirements files:
-
-```bash
-pip install -r requirements.txt
-pip install -r requirements-cue.txt
-```
-
-Notes:
-- `cuequivariance-ops-torch-cu12` (CUDA kernels) is **Linux CUDA only**. On macOS you can still install `cuequivariance-torch` for CPU fallback.
-- If you select `--tensor-product-mode spherical-save-cue` without the dependency installed, the CLI will raise a clear ImportError with install instructions.
-
-### Optional: PyG (torch-scatter, torch-cluster)
-
-Faster neighbor list and scatter operations. Install via extras:
-
-```bash
-pip install -e ".[pyg]"
-```
-
-### Optional: Active Learning (mff-active-learn with SOAP diversity)
-
-For the active learning loop with SOAP-based diversity screening (`--diversity-metric soap`), install:
-
-```bash
-pip install -e ".[al]"
-```
-
-This pulls in `dscribe` and `scikit-learn`. Without it, `--diversity-metric soap` falls back to `devi_hist`.
-
-### Optional: Thermal Transport (IFC2/IFC3, BTE, Callaway)
-
-For the thermal conductivity workflow (`python -m molecular_force_field.cli.thermal_transport`), install:
-
-```bash
-pip install -e ".[thermal]"
-```
-
-This pulls in `phono3py` and `scipy`. See [THERMAL_TRANSPORT.md](THERMAL_TRANSPORT.md) for the full workflow.
+- `pip install -e ".[cue]"` for `spherical-save-cue`
+- `pip install -e ".[pyg]"` for faster PyG scatter / neighbor ops
+- `pip install -e ".[al]"` for SOAP-based active learning diversity
+- `pip install -e ".[thermal]"` for thermal transport (`phono3py`, `scipy`)
 
 ## Quick Start
 
-### 1. Data Preprocessing
-
-Preprocess your Extended XYZ file:
+### 1. Preprocess Data
 
 ```bash
 mff-preprocess --input-file data.xyz --output-dir data
 ```
-
-This will:
-- Extract data blocks from XYZ file
-- Split into training and validation sets
-- Fit baseline atomic energies
-- Save preprocessed data to HDF5 and CSV formats
-- Save `read_{train,val}.h5` in variable-length per-sample groups by default
-- Precompute neighbor lists and write `processed_{train,val}.h5` by default
 
 To skip neighbor list preprocessing (for quick sanity-check):
 
@@ -192,51 +70,60 @@ mff-preprocess \
   --atomic-number-key atomic_number
 ```
 
-### 2. Training
+### 2. Train
 
-Train a model (default: spherical mode):
+Minimal training:
 
 ```bash
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda
+mff --train --data-dir data --epochs 1000 --batch-size 8 --device cuda
 ```
 
-Train with Cartesian mode (strictly equivariant):
+Recommended backbone examples:
 
 ```bash
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian
+# Memory-efficient ICTD
+mff --train --data-dir data --device cuda --tensor-product-mode pure-cartesian-ictd
+
+# Full-parity O(3) ICTD
+mff --train --data-dir data --device cuda --tensor-product-mode pure-cartesian-ictd-o3
+
+# Sparse Cartesian
+mff --train --data-dir data --device cuda --tensor-product-mode pure-cartesian-sparse
 ```
 
-Train with different tensor product modes:
+Field-aware training examples:
 
 ```bash
-# Partial-Cartesian (strictly equivariant, -17.4% params)
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian
-
-# Partial-Cartesian-Loose (fastest, approximate equivariance)
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode partial-cartesian-loose
-
-# Pure-Cartesian-Sparse (strictly equivariant, -29.6% params)
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-sparse
-
-# Pure-Cartesian-ICTD (strictly equivariant, -72.1% params, best for memory)
-mff-train --data-dir data --epochs 1000 --batch-size 8 --device cuda --tensor-product-mode pure-cartesian-ictd
-```
-
-Train with external field and physical tensors (`pure-cartesian-ictd`, `pure-cartesian-sparse`, or `pure-cartesian-sparse-save`):
-
-```bash
-# External electric field + dipole/polarizability training
-mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse \
+# Electric field + dipole/polarizability
+mff --train --data-dir data --tensor-product-mode pure-cartesian-sparse \
   --external-tensor-rank 1 --external-field-file data/efield.npy \
   --physical-tensors dipole,polarizability \
   --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
   --physical-tensor-weights "dipole:2.0,polarizability:1.0"
+
+# Magnetic field (1e) + magnetic moment
+mff --train --data-dir data --tensor-product-mode pure-cartesian-ictd-o3 \
+  --external-tensor-rank 1 --external-tensor-irrep 1e \
+  --o3-irrep-preset auto \
+  --o3-active-irreps '0e,1e,2e' \
+  --external-field-file data/bfield.npy \
+  --physical-tensors magnetic_moment \
+  --magnetic-moment-file data/magnetic_moment.npy
+
+# Simultaneous electric field (1o) + magnetic field (1e)
+mff --train --data-dir data --tensor-product-mode pure-cartesian-ictd-o3 \
+  --external-tensor-rank 1 --external-tensor-irrep 1o \
+  --external-field-file data/efield.npy \
+  --magnetic-field-file data/bfield.npy \
+  --o3-irrep-preset auto \
+  --o3-active-irreps '0e,1e,1o,2e'
+
 ```
 
-Train with ZBL short-range repulsion:
+Optional ZBL short-range repulsion:
 
 ```bash
-mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
+mff --train --data-dir data --tensor-product-mode pure-cartesian-ictd \
   --zbl-enabled \
   --zbl-inner-cutoff 0.6 \
   --zbl-outer-cutoff 1.2 \
@@ -244,10 +131,48 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
   --zbl-energy-scale 1.0
 ```
 
-Notes:
-- ZBL is implemented as a short-range energy correction outside the tensor-product backbone, so it is compatible with all tensor-product modes in the Python training/evaluation stack.
-- For `core.pt` export, the usual TorchScript mode restrictions still apply: currently `pure-cartesian-ictd`, `pure-cartesian-ictd-save`, and `spherical-save-cue`.
-- Once written into the checkpoint, the ZBL settings are restored automatically during evaluation and export; you do not need to pass them again to `mff-export-core` or `export_mliap`.
+## Multi-Fidelity
+
+Supported modes:
+- `spherical-save-cue`
+- `pure-cartesian-ictd`
+- `pure-cartesian-ictd-o3`
+- `pure-cartesian-sparse`
+- `pure-cartesian-sparse-save`
+
+Conditioning-only multi-fidelity:
+
+```bash
+mff --train \
+  --data-dir data \
+  --tensor-product-mode pure-cartesian-ictd \
+  --num-fidelity-levels 2 \
+  --fidelity-id-file data/train_fidelity_id.npy \
+  --fidelity-loss-weights '0:1.0,1:3.0'
+```
+
+Delta-learning multi-fidelity:
+
+```bash
+mff --train \
+  --data-dir data \
+  --tensor-product-mode pure-cartesian-ictd-o3 \
+  --num-fidelity-levels 2 \
+  --multi-fidelity-mode delta-baseline \
+  --fidelity-id-file data/train_fidelity_id.npy \
+  --fidelity-loss-weights '0:1.0,1:3.0' \
+  --delta-regularization-weight 1e-4
+```
+
+Merge multiple processed HDF5 files into one multi-fidelity dataset:
+
+```bash
+mff --merge-multifidelity \
+  --inputs data/processed_pbe.h5 data/processed_hse.h5 \
+  --fidelity-ids 0 1 \
+  --output-h5 data/processed_train_mf.h5 \
+  --output-fidelity-npy data/train_fidelity_id.npy
+```
 
 Train with LES-style long-range (`mesh_fft`, recommended first-stage settings):
 
@@ -409,7 +334,7 @@ pair_coeff * * /path/to/core.pt H O
 
 If `core.pt` came from a checkpoint with ZBL enabled, no extra LAMMPS keyword is needed: the ZBL short-range repulsion is already embedded in the exported TorchScript model.
 
-For `pure-cartesian-ictd` checkpoints exported with external-field architecture, USER-MFFTORCH also supports a runtime rank-1 external field:
+For checkpoints exported with external-field architecture, USER-MFFTORCH supports runtime rank-1 external tensors and follows the exported irrep semantics:
 
 ```lammps
 variable Ex equal 0.0
@@ -419,7 +344,49 @@ pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez
 pair_coeff * * /path/to/core.pt H O
 ```
 
-The `field` variables are re-evaluated on each force call, so time-dependent equal-style variables are supported. Current limitation: runtime external tensors are implemented for rank-1 and rank-2.
+For magnetic-field-style `1e` checkpoints, use `mfield` instead of `field`:
+
+```lammps
+variable Bx equal 0.0
+variable By equal 0.0
+variable Bz equal 0.01
+pair_style mff/torch 5.0 cuda mfield v_Bx v_By v_Bz
+pair_coeff * * /path/to/core.pt H O
+```
+
+The rank-1 variables are re-evaluated on each force call, so time-dependent equal-style variables are supported. `field` is the runtime keyword for `1o`-style vectors such as electric field; `mfield` is the runtime keyword for `1e`-style axial vectors such as magnetic field. Current limitation: runtime external tensors are implemented for rank-1 and rank-2.
+
+When a `core.pt` is exported with simultaneous rank-1 electric and magnetic fields, provide both keywords in the same `pair_style` line:
+
+```lammps
+variable Ex equal 0.0
+variable Ey equal 0.0
+variable Ez equal 0.01
+variable Bx equal 0.0
+variable By equal 0.0
+variable Bz equal 0.02
+pair_style mff/torch 5.0 cuda field v_Ex v_Ey v_Ez mfield v_Bx v_By v_Bz
+pair_coeff * * /path/to/core.pt H O
+```
+
+For multi-fidelity `core.pt`, runtime fidelity is passed through `pair_style mff/torch fidelity ...`:
+
+```lammps
+pair_style mff/torch 5.0 cuda fidelity 1
+pair_coeff * * /path/to/core.pt H O
+```
+
+or with an equal-style variable:
+
+```lammps
+variable fid equal 1
+pair_style mff/torch 5.0 cuda fidelity v_fid
+pair_coeff * * /path/to/core.pt H O
+```
+
+If `core.pt` was exported with `--export-fidelity-id`, the fidelity branch is frozen during export and you should not pass `fidelity` at runtime.
+
+`field6` / `field9` remain mutually exclusive with `field` / `mfield`.
 
 For rank-2 runtime external tensors, USER-MFFTORCH supports both:
 - `field9`: full `3x3` tensor in row-major order `xx xy xz yx yy yz zx zy zz`

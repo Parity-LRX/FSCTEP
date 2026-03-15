@@ -1,6 +1,6 @@
 # 使用指南
 
-FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，并可在 `pure-cartesian-ictd`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save` 模式下**嵌入外场**（如电场）和**训练物理张量**（电荷、偶极矩、极化率、四极矩）。包括：
+FusedSCEquiTensorPot 支持多种等变张量积实现模式，并可在 `pure-cartesian-ictd`、`pure-cartesian-ictd-o3`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save` 模式下**嵌入外场**（如电场、磁场等）和**训练物理张量**（电荷、偶极矩、极化率、四极矩、BEC、磁矩）。包括：
 - `spherical`: 基于 e3nn 的球谐函数方法（默认）
 - `spherical-save`: channelwise edge conv（e3nn 后端，参数量更少）
 - `spherical-save-cue`: channelwise edge conv（cuEquivariance 后端，需可选依赖，GPU 加速）
@@ -9,6 +9,7 @@ FusedSCEquiTensorPot 支持**八种等变张量积实现模式**，并可在 `pu
 - `pure-cartesian`: 纯笛卡尔 \(3^L\) 表示（严格等变，速度较慢，完全自实现）
 - `pure-cartesian-sparse`: 稀疏纯笛卡尔（严格等变，参数量优化，完全自实现）
 - `pure-cartesian-ictd`: ICTD irreps 内部表示（严格等变，速度最快，参数量最少，完全自实现）
+- `pure-cartesian-ictd-o3`: 全 parity 的 O(3) ICTD 主干（严格区分 `1e/1o` 并在整个 trunk 中传播）
 
 所有模式都保持 O(3) 等变性（包括旋转和反射）。详细性能对比见[张量积模式对比](#张量积模式对比)部分。
 
@@ -275,10 +276,13 @@ mff-evaluate \
     --zbl-outer-cutoff 1.2
 ```
 
-**外场与物理张量训练**（支持 `pure-cartesian-ictd`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save`）：
+**外场与物理张量训练**（支持 `pure-cartesian-ictd`、`pure-cartesian-ictd-o3`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save`）：
 
 - **外场嵌入**：将全局张量（如电场，rank=1）注入 conv1，用于场依赖势能
-- **物理张量训练**：监督输出电荷、偶极矩、极化率、四极矩（结构级或原子级）
+- **full parity 路径**：凡是任务里显式出现 parity 语义，都必须使用 `pure-cartesian-ictd-o3`
+- **显性 parity 任务**：包括磁场 `1e`、磁矩 `1e`、以及任何要求 `1e/1o` 在整个主干中保持区分的 pseudo/axial 张量任务
+- **其他外场嵌入**：通过 `--external-tensor-rank` 指定张量阶数，并通过 `--external-tensor-irrep` 指定语义；例如电场用 `1o`，磁场用 `1e`。如果这个 irrep 带显性 parity 语义，就应切到 `pure-cartesian-ictd-o3`
+- **物理张量训练**：监督输出电荷、偶极矩、极化率、四极矩、磁矩，以及原子级 Born effective charge（BEC）
 
 ```bash
 # 外场（电场）+ 偶极矩/极化率训练
@@ -288,10 +292,27 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse \
   --dipole-file data/dipole.npy --polarizability-file data/pol.npy \
   --physical-tensor-weights "dipole:2.0,polarizability:1.0"
 
+# full parity O(3) 路径：磁场（1e）+ 磁矩
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd-o3 \
+  --external-tensor-rank 1 --external-tensor-irrep 1e \
+  --o3-irrep-preset auto \
+  --o3-active-irreps '0e,1e,2e' \
+  --external-field-file data/bfield.npy \
+  --physical-tensors magnetic_moment \
+  --magnetic-moment-file data/magnetic_moment.npy
+
+# full parity O(3) 路径：同时嵌入电场（1o）和磁场（1e）
+mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd-o3 \
+  --external-tensor-rank 1 --external-tensor-irrep 1o \
+  --external-field-file data/efield.npy \
+  --magnetic-field-file data/bfield.npy \
+  --o3-irrep-preset auto \
+  --o3-active-irreps '0e,1e,1o,2e'
+
 # 原子级物理张量（需 per-node 标签 HDF5）
 mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse-save \
   --extra-per-node-file data/per_atom_labels.h5 \
-  --physical-tensors-per-node charge_per_atom,dipole_per_atom
+  --physical-tensors-per-node charge_per_atom,dipole_per_atom,born_effective_charge_per_atom
 ```
 
 **外场与物理张量相关参数：**
@@ -299,17 +320,65 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-sparse-save \
 | 参数 | 说明 |
 |------|------|
 | `--external-tensor-rank` | 外场张量秩（如 1=电场），需配合 `--external-field-file` |
+| `--external-tensor-irrep` | 外场不可约表示语义；常用值：`1o`（电场）、`1e`（磁场）。凡是显性带 parity 的 irrep 任务，都应配合 `pure-cartesian-ictd-o3` |
 | `--external-field-file` | 外场标签文件（.npy/.npz/.h5，形状 B×3） |
+| `--magnetic-field-file` | 磁场标签文件（.npy/.npz/.h5，形状 B×3）。与 `--external-field-file` 同时给出时，可实现 rank-1 电场 + 磁场联合嵌入 |
 | `--charge-file` | 结构级电荷标签（标量/样本） |
 | `--dipole-file` | 结构级偶极矩标签（B×3） |
+| `--magnetic-moment-file` | 结构级磁矩标签（B×3，对应 `1e`；应在 `pure-cartesian-ictd-o3` 下训练） |
 | `--polarizability-file` | 结构级极化率标签（B×3×3） |
 | `--quadrupole-file` | 结构级四极矩标签（B×3×3） |
-| `--extra-per-node-file` | 原子级标签 HDF5（sample_0, sample_1, ... 含 charge_per_atom 等） |
-| `--physical-tensors` | 结构级输出：charge,dipole,polarizability,quadrupole |
-| `--physical-tensors-per-node` | 原子级输出：charge_per_atom,dipole_per_atom 等 |
+| `--extra-per-node-file` | 原子级标签 HDF5（sample_0, sample_1, ... 含 charge_per_atom、born_effective_charge_per_atom 等） |
+| `--physical-tensors` | 结构级输出：charge,dipole,magnetic_moment,polarizability,quadrupole |
+| `--physical-tensors-per-node` | 原子级输出：charge_per_atom,dipole_per_atom,magnetic_moment_per_atom,polarizability_per_atom,quadrupole_per_atom,born_effective_charge_per_atom |
+| `--o3-irrep-preset` | `pure-cartesian-ictd-o3` 的 active irreps 档位：`minimal` / `auto` / `balanced` / `full` |
+| `--o3-active-irreps` | 显式覆盖 `pure-cartesian-ictd-o3` 的 active irreps，例如 `0e,1e,2e` |
 | `--physical-tensor-reduce` | 结构级归约：sum（默认）、mean、none |
 | `--physical-tensor-weights` | 损失权重：`charge:1.0,dipole:2.0,...` |
+| `--bec-derivative-weight` | `dF/dE` 导出的 BEC 监督损失权重（需要 rank-1 外场 + BEC 标签） |
+| `--bec-consistency-weight` | 显式 BEC head 与 `dF/dE` 导出 BEC 的一致性损失权重 |
 | `--inference-output-physical-tensors` | 保存到 checkpoint：推理时输出物理张量（默认不输出，MD/LAMMPS 仅需能量和力） |
+
+说明：`born_effective_charge_per_atom` 已接入训练、评估、Python 推理以及 `mff/torch` 导出 schema。要让 LAMMPS 端真正读到这组新列，需要重编更新后的 `USER-MFFTORCH`。
+
+**Multi-fidelity 训练**（支持 `spherical-save-cue`、`pure-cartesian-ictd`、`pure-cartesian-ictd-o3`、`pure-cartesian-sparse`、`pure-cartesian-sparse-save`）：
+
+- `--num-fidelity-levels`：总 fidelity 档位数
+- `--fidelity-id-file`：每个结构一个整数 `fidelity_id`
+- `--multi-fidelity-mode conditioning`：共享 trunk + 共享 head，仅在 conv1 条件嵌入
+- `--multi-fidelity-mode delta-baseline`：共享 trunk + baseline head + 各 fidelity 的 delta head
+- `--fidelity-loss-weights`：按 fidelity 加权损失，例如 `0:1.0,1:3.0`
+- `--delta-regularization-weight`：delta 头正则化强度，仅在 `delta-baseline` 下生效
+
+```bash
+# 条件化 multi-fidelity
+mff --train \
+  --data-dir data \
+  --tensor-product-mode pure-cartesian-ictd \
+  --num-fidelity-levels 2 \
+  --fidelity-id-file data/train_fidelity_id.npy \
+  --fidelity-loss-weights '0:1.0,1:3.0'
+
+# delta-learning multi-fidelity
+mff --train \
+  --data-dir data \
+  --tensor-product-mode pure-cartesian-ictd-o3 \
+  --num-fidelity-levels 2 \
+  --multi-fidelity-mode delta-baseline \
+  --fidelity-id-file data/train_fidelity_id.npy \
+  --fidelity-loss-weights '0:1.0,1:3.0' \
+  --delta-regularization-weight 1e-4
+```
+
+多保真数据可直接合并成一个训练集：
+
+```bash
+mff --merge-multifidelity \
+  --inputs data/processed_pbe.h5 data/processed_hse.h5 \
+  --fidelity-ids 0 1 \
+  --output-h5 data/processed_train_mf.h5 \
+  --output-fidelity-npy data/train_fidelity_id.npy
+```
 
 **方式二：自动预处理并训练（一步完成）**
 ```bash
@@ -2250,23 +2319,47 @@ run 200
 
 - 当前 `mfftorch` 已验证并支持 4 种常见组合：
   1. 无外场、无物理张量：只输出能量和力
-  2. 有外场、无物理张量：输出能量和力，并接收运行时 `field`/`field6`/`field9`
+  2. 有外场、无物理张量：输出能量和力，并接收运行时 `field`/`mfield`/`field6`/`field9`
   3. 无外场、有物理张量：输出能量、力，以及 `compute mff/torch/phys` 暴露的 tensor
   4. 有外场、有物理张量：同时支持外场输入和 tensor 输出
 - 运行时外场支持：
-  - `field v_Ex v_Ey v_Ez`：rank-1 外场，适合 `l=1` 向量情形
+  - `field v_Ex v_Ey v_Ez`：rank-1 `1o` 外场，适合电场这类 polar vector
+  - `mfield v_Bx v_By v_Bz`：rank-1 `1e` 外场，适合磁场这类 axial vector
+  - 若导出的 `core.pt` 同时声明电场和磁场两个 rank-1 外场，则在同一个 `pair_style mff/torch` 里同时写 `field ... mfield ...`
   - `field6` / `field9`：rank-2 外场输入
+  - 若 checkpoint metadata 里写的是 `external_tensor_irrep=1o`，LAMMPS 端必须用 `field`；若写的是 `1e`，必须用 `mfield`
+  - `field6` / `field9` 仍然不能和 `field` / `mfield` 混用
+- 运行时 multi-fidelity 支持：
+  - 若导出的 `core.pt` 保留了 runtime fidelity 输入，可在同一个 `pair_style mff/torch` 里写 `fidelity 1`
+  - 也支持 `fidelity v_fid`，其中 `v_fid` 是 equal-style 标量变量
+  - 若导出时使用了 `--export-fidelity-id` 固化某个 fidelity 分支，则运行时不要再写 `fidelity`
 - 当前 LAMMPS 端固定暴露的物理量为：
   - 结构级：`charge`、`dipole`、`polarizability`、`quadrupole`
-  - 原子级：`charge_per_atom`、`dipole_per_atom`、`polarizability_per_atom`、`quadrupole_per_atom`
+  - 原子级：`charge_per_atom`、`dipole_per_atom`、`polarizability_per_atom`、`quadrupole_per_atom`、`born_effective_charge_per_atom`
 - 缺失的物理量是允许的：若某个 head 没训练，对应 `mask=0`，输出自动填 0
 - 当前固定 schema 与 `l` 的典型对应关系：
   - `charge` / `charge_per_atom`：`l=0`
   - `dipole` / `dipole_per_atom`：`l=1`
   - `polarizability`：通常是 rank-2 笛卡尔张量，对应 `l=0+2`
   - `quadrupole`：通常对应 `l=2`
+  - `born_effective_charge_per_atom`：通常是 full rank-2 笛卡尔张量，对应 `l=0+1+2`
 - 自定义 physical head 名称当前不会自动暴露到 `compute mff/torch/phys`
 - 当前导出到 LAMMPS 的 physical heads 默认假定 `channels_out == 1`
+
+示例：
+
+```lammps
+pair_style mff/torch 5.0 cuda fidelity 1
+pair_coeff * * /path/to/core.pt H O
+```
+
+或
+
+```lammps
+variable fid equal 1
+pair_style mff/torch 5.0 cuda fidelity v_fid
+pair_coeff * * /path/to/core.pt H O
+```
 
 **推荐测试命令**（GPU 脚本）：
 
@@ -2525,7 +2618,7 @@ thermo 20
 run 200
 ```
 
-2. **有外场、无物理张量**：以 rank-1 电场为例
+2. **有外场、无物理张量**：以 rank-1 电场（`1o`）为例
 
 ```lammps
 units metal
@@ -2547,6 +2640,17 @@ fix 1 all nve
 thermo_style custom step pe
 thermo 20
 run 200
+```
+
+如果导出的 `core.pt` 来自 `external_tensor_irrep=1e` 的磁场模型，则运行时改为：
+
+```lammps
+variable Bx equal 0.0
+variable By equal 0.0
+variable Bz equal 0.01
+
+pair_style mff/torch 5.0 cuda mfield v_Bx v_By v_Bz
+pair_coeff * * /path/to/core.pt H O
 ```
 
 3. **无外场、有物理张量**：输出 energy/force/tensor
@@ -2619,6 +2723,8 @@ compute dxatom all mff/torch/phys atom dipole x
 compute datom all mff/torch/phys atom dipole
 compute pxxatom all mff/torch/phys atom polarizability xx
 compute patom all mff/torch/phys atom polarizability
+compute becxx all mff/torch/phys atom born_effective_charge xx
+compute bec all mff/torch/phys atom born_effective_charge
 ```
 
 其中 `global/mask` 的固定顺序为：
@@ -2629,6 +2735,8 @@ compute patom all mff/torch/phys atom polarizability
 - `c_mffgm[4]` -> `quadrupole`
 
 若某个量没有训练或没有导出，则对应 mask 为 `0`，输出块自动填 `0`。
+
+`born_effective_charge_per_atom` 属于原子级固定 schema，不在 `global/mask` 中；它通过 `compute ... atom born_effective_charge` 读取，完整输出是 `3x3` 共 9 个分量，也可以按 `xx/xy/.../zz` 逐分量读取。
 
 **spherical-save-cue 导出说明**：默认导出为纯 PyTorch 实现（`force_naive`），`core.pt` 不依赖 cuEquivariance 自定义 ops，可在任意 LibTorch 环境运行。
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import tempfile
 
 import torch
+import pytest
 
 from molecular_force_field.test.self_test_lammps_potential import (
     _make_dummy_checkpoint_pure_cartesian_ictd,
@@ -28,6 +29,7 @@ def _run_forward(
     dtype: torch.dtype,
     *,
     external_tensor_rank: int | None = None,
+    fidelity_ids: torch.Tensor | None = None,
 ):
     """运行一次 forward，返回输出。"""
     N, E = 32, 256
@@ -45,7 +47,21 @@ def _run_forward(
         external_tensor = torch.zeros((3,) * int(external_tensor_rank), device=device, dtype=dtype)
 
     with torch.no_grad():
-        out = core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor)
+        if fidelity_ids is None:
+            out = core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor)
+        else:
+            out = core(
+                pos,
+                A,
+                batch,
+                edge_src,
+                edge_dst,
+                edge_shifts,
+                cell,
+                edge_vec,
+                external_tensor,
+                fidelity_ids.to(device=device, dtype=torch.long),
+            )
     return out
 
 
@@ -224,19 +240,192 @@ def test_export_core_physical_tensors(external_tensor_rank: int = 1):
         core.eval()
         out = _run_forward(core, device, dtype, external_tensor_rank=external_tensor_rank)
         assert isinstance(out, tuple), "Expected fixed-schema tuple output for physical tensor heads"
-        assert len(out) == 5, "Expected (atom_energy, global_phys, atom_phys, global_mask, atom_mask)"
+        assert len(out) == 6, "Expected (atom_energy, global_phys, atom_phys, global_mask, atom_mask, reciprocal_source)"
 
-        atom_energy, global_phys, atom_phys, global_mask, atom_mask = out
+        atom_energy, global_phys, atom_phys, global_mask, atom_mask, reciprocal_source = out
         assert atom_energy.shape == (32, 1)
         assert global_phys.shape == (1, 22)
-        assert atom_phys.shape == (32, 22)
-        assert global_mask.shape == (4,)
-        assert atom_mask.shape == (4,)
-        assert global_mask.tolist() == [0.0, 1.0, 1.0, 0.0]
-        assert atom_mask.tolist() == [0.0, 1.0, 1.0, 0.0]
+        assert atom_phys.shape == (32, 31)
+        assert global_mask.shape == (5,)
+        assert atom_mask.shape == (5,)
+        assert global_mask.tolist() == [0.0, 1.0, 1.0, 0.0, 0.0]
+        assert atom_mask.tolist() == [0.0, 1.0, 1.0, 0.0, 0.0]
+        assert reciprocal_source.shape == (32, 0)
         print(
             f"PASS: export_core physical tensor tuple schema works for rank-{external_tensor_rank}"
         )
+
+
+def test_export_core_delta_multifidelity_runtime_fidelity_matches_eager():
+    import json
+    from molecular_force_field.cli.export_libtorch_core import export_core
+    from molecular_force_field.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = f"{tmp}/dummy_ictd_mf_delta.pth"
+        out_pt = f"{tmp}/core_mf_delta.pt"
+        _make_dummy_checkpoint_pure_cartesian_ictd(
+            ckpt_path,
+            device=torch.device("cpu"),
+            external_tensor_rank=None,
+            num_fidelity_levels=2,
+            multi_fidelity_mode="delta-baseline",
+        )
+        export_core(
+            checkpoint=ckpt_path,
+            elements=["H", "O"],
+            device=str(device),
+            max_radius=5.0,
+            num_interaction=2,
+            out_pt=out_pt,
+            tensor_product_mode="pure-cartesian-ictd",
+            embed_e0=False,
+        )
+
+        with open(out_pt + ".json", "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        assert meta["num_fidelity_levels"] == 2
+        assert meta["multi_fidelity_mode"] == "delta-baseline"
+        assert meta["export_fidelity_id"] is None
+        assert meta["runtime_fidelity_input"] is True
+
+        mliap = LAMMPS_MLIAP_MFF.from_checkpoint(
+            checkpoint_path=ckpt_path,
+            element_types=["H", "O"],
+            max_radius=5.0,
+            atomic_energy_keys=[1, 8],
+            atomic_energy_values=[-13.6, -75.0],
+            device=str(device),
+            torchscript=False,
+        )
+        eager = mliap.wrapper.model
+        core = torch.jit.load(out_pt, map_location=device)
+        core.eval()
+
+        N, E = 32, 256
+        pos = torch.zeros(N, 3, device=device, dtype=dtype)
+        A = torch.ones(N, device=device, dtype=torch.long)
+        batch = torch.zeros(N, device=device, dtype=torch.long)
+        edge_src = torch.randint(0, N, (E,), device=device, dtype=torch.long)
+        edge_dst = torch.randint(0, N, (E,), device=device, dtype=torch.long)
+        edge_shifts = torch.zeros(E, 3, device=device, dtype=dtype)
+        cell = torch.eye(3, device=device, dtype=dtype).unsqueeze(0) * 100.0
+        edge_vec = (pos[edge_dst] - pos[edge_src] + torch.randn(E, 3, device=device, dtype=dtype)).detach()
+
+        with torch.no_grad():
+            eager_out = eager(
+                pos,
+                A,
+                batch,
+                edge_src,
+                edge_dst,
+                edge_shifts,
+                cell,
+                precomputed_edge_vec=edge_vec,
+                fidelity_ids=torch.tensor([1], device=device, dtype=torch.long),
+            )
+            core_out = core(
+                pos,
+                A,
+                batch,
+                edge_src,
+                edge_dst,
+                edge_shifts,
+                cell,
+                edge_vec,
+                torch.empty(0, device=device, dtype=dtype),
+                torch.tensor([1], device=device, dtype=torch.long),
+            )
+        assert torch.allclose(_atom_energy_from_output(core_out), eager_out, atol=1e-5, rtol=1e-5)
+
+
+def test_export_core_delta_multifidelity_fixed_branch_matches_eager():
+    import json
+    from molecular_force_field.cli.export_libtorch_core import export_core
+    from molecular_force_field.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = f"{tmp}/dummy_ictd_mf_delta.pth"
+        out_pt = f"{tmp}/core_mf_delta.pt"
+        _make_dummy_checkpoint_pure_cartesian_ictd(
+            ckpt_path,
+            device=torch.device("cpu"),
+            external_tensor_rank=None,
+            num_fidelity_levels=2,
+            multi_fidelity_mode="delta-baseline",
+        )
+
+        export_core(
+            checkpoint=ckpt_path,
+            elements=["H", "O"],
+            device=str(device),
+            max_radius=5.0,
+            num_interaction=2,
+            out_pt=out_pt,
+            tensor_product_mode="pure-cartesian-ictd",
+            embed_e0=False,
+            export_fidelity_id=1,
+        )
+
+        with open(out_pt + ".json", "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        assert meta["num_fidelity_levels"] == 2
+        assert meta["multi_fidelity_mode"] == "delta-baseline"
+        assert meta["export_fidelity_id"] == 1
+
+        mliap = LAMMPS_MLIAP_MFF.from_checkpoint(
+            checkpoint_path=ckpt_path,
+            element_types=["H", "O"],
+            max_radius=5.0,
+            atomic_energy_keys=[1, 8],
+            atomic_energy_values=[-13.6, -75.0],
+            device=str(device),
+            torchscript=False,
+        )
+        eager = mliap.wrapper.model
+        core = torch.jit.load(out_pt, map_location=device)
+        core.eval()
+
+        N, E = 32, 256
+        pos = torch.zeros(N, 3, device=device, dtype=dtype)
+        A = torch.ones(N, device=device, dtype=torch.long)
+        batch = torch.zeros(N, device=device, dtype=torch.long)
+        edge_src = torch.randint(0, N, (E,), device=device, dtype=torch.long)
+        edge_dst = torch.randint(0, N, (E,), device=device, dtype=torch.long)
+        edge_shifts = torch.zeros(E, 3, device=device, dtype=dtype)
+        cell = torch.eye(3, device=device, dtype=dtype).unsqueeze(0) * 100.0
+        edge_vec = (pos[edge_dst] - pos[edge_src] + torch.randn(E, 3, device=device, dtype=dtype)).detach()
+
+        with torch.no_grad():
+            eager_out = eager(
+                pos,
+                A,
+                batch,
+                edge_src,
+                edge_dst,
+                edge_shifts,
+                cell,
+                precomputed_edge_vec=edge_vec,
+                fidelity_ids=torch.tensor([1], device=device, dtype=torch.long),
+            )
+            core_out = core(
+                pos,
+                A,
+                batch,
+                edge_src,
+                edge_dst,
+                edge_shifts,
+                cell,
+                edge_vec,
+                torch.empty(0, device=device, dtype=dtype),
+            )
+        assert torch.allclose(_atom_energy_from_output(core_out), eager_out, atol=1e-5, rtol=1e-5)
 
 
 def main():

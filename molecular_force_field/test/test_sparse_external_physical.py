@@ -13,6 +13,8 @@ from molecular_force_field.models import (
     PureCartesianSparseTransformerLayerSave,
 )
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.utils.external_tensor_specs import pack_external_tensor_dict
+from molecular_force_field.utils.tensor_utils import derive_born_effective_charge_from_forces
 
 
 def _cartesian_kwargs(device: torch.device) -> dict:
@@ -119,6 +121,7 @@ def test_sparse_forward_supports_external_tensor_and_physical_outputs() -> None:
         "dipole_per_atom": {"ls": [1], "channels_out": 1, "reduce": "none"},
         "polarizability": {"ls": [0, 2], "channels_out": 1, "reduce": "sum"},
         "polarizability_per_atom": {"ls": [0, 2], "channels_out": 1, "reduce": "none"},
+        "born_effective_charge_per_atom": {"ls": [0, 1, 2], "channels_out": 1, "reduce": "none"},
     }
     for cls in (PureCartesianSparseTransformerLayer, PureCartesianSparseTransformerLayerSave):
         model = cls(
@@ -144,6 +147,9 @@ def test_sparse_forward_supports_external_tensor_and_physical_outputs() -> None:
         assert physical_out["polarizability"][0].shape == (2, 1, 1)
         assert physical_out["polarizability"][2].shape == (2, 1, 3, 3)
         assert physical_out["polarizability_per_atom"][2].shape == (4, 1, 3, 3)
+        assert physical_out["born_effective_charge_per_atom"][0].shape == (4, 1, 1)
+        assert physical_out["born_effective_charge_per_atom"][1].shape == (4, 1, 3)
+        assert physical_out["born_effective_charge_per_atom"][2].shape == (4, 1, 3, 3)
         global_phys, atom_phys, global_mask, atom_mask = _recover_cartesian_physical_tensors(
             physical_out,
             num_graphs=2,
@@ -152,9 +158,38 @@ def test_sparse_forward_supports_external_tensor_and_physical_outputs() -> None:
             dtype=atom_energy.dtype,
         )
         assert global_phys.shape == (2, 22)
-        assert atom_phys.shape == (4, 22)
-        assert global_mask.tolist() == [0.0, 1.0, 1.0, 0.0]
-        assert atom_mask.tolist() == [0.0, 1.0, 1.0, 0.0]
+        assert atom_phys.shape == (4, 31)
+        assert global_mask.tolist() == [0.0, 1.0, 1.0, 0.0, 0.0]
+        assert atom_mask.tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
+
+
+def test_derive_bec_from_forces_matches_analytic_jacobian() -> None:
+    device = torch.device("cpu")
+    dtype = torch.float64
+    batch = torch.tensor([0, 0, 1], dtype=torch.long, device=device)
+    external_field = torch.tensor(
+        [[0.1, -0.2, 0.3], [0.4, 0.5, -0.6]],
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
+    coeff = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0], [0.5, -1.0, 2.0], [4.0, 0.0, -2.0]],
+            [[-1.0, 0.2, 1.5], [2.5, 3.0, -0.5], [0.0, 1.0, 1.0]],
+            [[0.7, -0.3, 0.9], [1.1, 0.0, -2.2], [3.3, -1.1, 0.4]],
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    forces = torch.einsum("nab,nb->na", coeff, external_field[batch])
+    bec = derive_born_effective_charge_from_forces(
+        forces,
+        external_field,
+        batch,
+        create_graph=False,
+    )
+    assert torch.allclose(bec, coeff)
 
 
 def test_sparse_return_physical_without_heads_raises() -> None:
@@ -179,12 +214,52 @@ def test_sparse_return_physical_without_heads_raises() -> None:
         raise AssertionError("Expected ValueError when requesting physical tensors without heads")
 
 
+def test_sparse_forward_supports_simultaneous_rank1_fields() -> None:
+    specs = [
+        {"name": "external_field", "rank": 1, "irrep": "1o"},
+        {"name": "magnetic_field", "rank": 1, "irrep": "1e"},
+    ]
+    for cls in (PureCartesianSparseTransformerLayer, PureCartesianSparseTransformerLayerSave):
+        model = cls(
+            **_cartesian_kwargs(torch.device("cpu")),
+            external_tensor_specs=specs,
+            physical_tensor_outputs={
+                "dipole": {"ls": [1], "channels_out": 1, "reduce": "sum"},
+            },
+        ).to(dtype=torch.float64)
+        pos, A, batch, edge_src, edge_dst, edge_shifts, cell = _toy_batch(torch.device("cpu"), torch.float64)
+        packed = pack_external_tensor_dict(
+            {
+                "external_field": torch.tensor([0.1, 0.0, -0.2], dtype=torch.float64),
+                "magnetic_field": torch.tensor([-0.3, 0.2, 0.4], dtype=torch.float64),
+            },
+            specs,
+            dtype=torch.float64,
+        )
+        atom_energy, physical_out = model(
+            pos,
+            A,
+            batch,
+            edge_src,
+            edge_dst,
+            edge_shifts,
+            cell,
+            external_tensor=packed,
+            return_physical_tensors=True,
+        )
+        assert packed is not None
+        assert packed.shape == (6,)
+        assert atom_energy.shape == (4, 1)
+        assert physical_out["dipole"][1].shape == (2, 1, 3)
+
+
 def test_sparse_export_core_physical_tensor_tuple_schema() -> None:
     physical_tensor_outputs = {
         "dipole": {"ls": [1], "channels_out": 1, "reduce": "sum"},
         "dipole_per_atom": {"ls": [1], "channels_out": 1, "reduce": "none"},
         "polarizability": {"ls": [0, 2], "channels_out": 1, "reduce": "sum"},
         "polarizability_per_atom": {"ls": [0, 2], "channels_out": 1, "reduce": "none"},
+        "born_effective_charge_per_atom": {"ls": [0, 1, 2], "channels_out": 1, "reduce": "none"},
     }
     for mode in ("pure-cartesian-sparse", "pure-cartesian-sparse-save"):
         with tempfile.TemporaryDirectory(prefix="mff-sparse-export-") as td:
@@ -220,7 +295,7 @@ def test_sparse_export_core_physical_tensor_tuple_schema() -> None:
             atom_energy, global_phys, atom_phys, global_mask, atom_mask, reciprocal_source = out
             assert atom_energy.shape == (4, 1)
             assert global_phys.shape == (1, 22)
-            assert atom_phys.shape == (4, 22)
-            assert global_mask.tolist() == [0.0, 1.0, 1.0, 0.0]
-            assert atom_mask.tolist() == [0.0, 1.0, 1.0, 0.0]
+            assert atom_phys.shape == (4, 31)
+            assert global_mask.tolist() == [0.0, 1.0, 1.0, 0.0, 0.0]
+            assert atom_mask.tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
             assert reciprocal_source.shape == (4, 0)

@@ -347,12 +347,14 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 
   auto A = type2Z_cuda_.index_select(0, buf_type_idx_);
   auto external_tensor = current_external_tensor(dev);
+  auto fidelity_ids = current_fidelity_tensor(dev);
 
   const bool need_energy = static_cast<bool>(eflag_global || eflag_atom);
   const bool need_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
     out = engine_->compute(nlocal, ntotal, buf_pos_, A, buf_edge_src_, buf_edge_dst_, buf_edge_shifts_, cell_t, external_tensor,
+                           fidelity_ids,
                            need_energy, need_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());

@@ -23,6 +23,7 @@ from molecular_force_field.models import (
     PureCartesianSparseTransformerLayer,
     PureCartesianSparseTransformerLayerSave,
     PureCartesianICTDTransformerLayer,
+    PureCartesianICTDO3TransformerLayer,
     MainNet,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
@@ -42,6 +43,11 @@ from molecular_force_field.utils.checkpoint_metadata import (
     resolve_model_architecture,
 )
 from molecular_force_field.utils.config import ModelConfig
+from molecular_force_field.utils.external_tensor_specs import (
+    build_standard_external_tensor_specs,
+    normalize_external_tensor_specs,
+)
+from molecular_force_field.utils.fidelity import parse_fidelity_loss_weights
 from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
 
@@ -468,7 +474,8 @@ def main():
     # 外部张量 / 物理张量（仅 pure-cartesian-ictd 支持）
     parser.add_argument('--external-tensor-rank', type=int, default=None,
                         help='External tensor rank for conv1 injection (e.g. 1=electric field). '
-                             'Only for pure-cartesian-ictd. Used with --external-field-file or --external-field-value.')
+                             'Supported by pure-cartesian-ictd, pure-cartesian-sparse, and pure-cartesian-sparse-save. '
+                             'Used with --external-field-file or --external-field-value.')
     parser.add_argument('--charge-file', type=str, default=None,
                         help='Per-structure charge label file (.npy/.npz/.h5, scalar per sample)')
     parser.add_argument('--dipole-file', type=str, default=None,
@@ -492,21 +499,63 @@ def main():
                             '  rank L (3^L values): full rank-L Cartesian tensor, row-major\n'
                             'Auto-sets --external-tensor-rank if not given.'
                         ))
+    parser.add_argument('--magnetic-field-file', type=str, default=None,
+                        help='Per-structure magnetic field file (.npy/.npz/.h5, shape Bx3). '
+                             'Can be used together with --external-field-file/--external-field-value '
+                             'to inject electric and magnetic fields simultaneously.')
+    parser.add_argument('--magnetic-field-value', type=float, nargs=3, default=None,
+                        metavar=('BX', 'BY', 'BZ'),
+                        help='Uniform magnetic field applied to ALL samples (shape Bx3 after H5 injection). '
+                             'Mutually exclusive with --magnetic-field-file.')
+    parser.add_argument('--fidelity-id-file', type=str, default=None,
+                        help='Per-structure multi-fidelity level ids (.npy/.npz/.h5, integer scalar per sample).')
+    parser.add_argument('--num-fidelity-levels', type=int, default=None,
+                        help='Number of discrete fidelity levels for graph-level fidelity conditioning. '
+                             'Required for training new multi-fidelity models unless restored from checkpoint.')
+    parser.add_argument('--multi-fidelity-mode', type=str, default=None, choices=['conditioning', 'delta-baseline'],
+                        help='Multi-fidelity architecture mode. "conditioning" keeps a shared readout, '
+                             '"delta-baseline" uses fidelity 0 as baseline and learns residual energy heads for higher fidelities.')
+    parser.add_argument('--fidelity-loss-weights', type=str, default=None,
+                        help='Optional per-fidelity loss weights for training, e.g. "0:1.0,1:3.0". '
+                             'Applied to energy/force/stress SmoothL1 losses; unspecified fidelity ids default to 1.0.')
+    parser.add_argument('--delta-regularization-weight', type=float, default=0.0,
+                        help='Optional L2 regularization weight applied to multi-fidelity delta heads '
+                             'when --multi-fidelity-mode=delta-baseline.')
+    parser.add_argument('--external-tensor-irrep', type=str, default=None,
+                        help="Optional parity-aware irrep tag for external tensor injection, e.g. '1o' or '1e'.")
+    parser.add_argument('--external-tensor-parity', type=str, default=None, choices=['e', 'o'],
+                        help='Optional parity shorthand for external tensor injection. Ignored when --external-tensor-irrep is set.')
+    parser.add_argument('--o3-irrep-preset', type=str, default=None,
+                        choices=['auto', 'minimal', 'balanced', 'full'],
+                        help='Active-irrep preset for pure-cartesian-ictd-o3. '
+                             '"auto" keeps canonical SO(3) irreps plus parity-sensitive inputs/outputs, '
+                             '"minimal" keeps only required irreps, '
+                             '"balanced" adds one extra coupling shell around auto, '
+                             '"full" keeps every (l,e/o) block.')
+    parser.add_argument('--o3-active-irreps', type=str, default=None,
+                        help="Explicit active irrep override for pure-cartesian-ictd-o3, e.g. '0e,1e,2e'. "
+                             'When set, this overrides --o3-irrep-preset but still auto-includes required inputs/outputs.')
     parser.add_argument('--extra-per-node-file', type=str, default=None,
                         help='Per-node label HDF5 (sample_0, sample_1, ... with charge_per_atom, dipole_per_atom, etc.)')
     parser.add_argument('--physical-tensors', type=str, default=None,
-                        help='Comma-separated physical tensor outputs: charge,dipole,polarizability,quadrupole. '
-                             'Requires corresponding label files. Only for pure-cartesian-ictd.')
+                        help='Comma-separated physical tensor outputs: charge,dipole,magnetic_moment,polarizability,quadrupole. '
+                             'Requires corresponding label files. Supported by pure-cartesian-ictd, '
+                             'pure-cartesian-sparse, and pure-cartesian-sparse-save.')
     parser.add_argument('--physical-tensors-per-node', type=str, default=None,
-                        help='Comma-separated per-node outputs: charge_per_atom,dipole_per_atom,polarizability_per_atom,quadrupole_per_atom. '
-                             'Requires --extra-per-node-file. Only for pure-cartesian-ictd.')
+                        help='Comma-separated per-node outputs: charge_per_atom,dipole_per_atom,magnetic_moment_per_atom,polarizability_per_atom,quadrupole_per_atom,born_effective_charge_per_atom. '
+                             'Requires --extra-per-node-file. Supported by pure-cartesian-ictd, '
+                             'pure-cartesian-sparse, and pure-cartesian-sparse-save.')
     parser.add_argument('--physical-tensor-reduce', type=str, default='sum',
                         choices=['sum', 'mean', 'none'],
                         help='Reduce mode for graph-level physical tensors (default: sum). '
                              'Per-node tensors always use reduce=none.')
     parser.add_argument('--physical-tensor-weights', type=str, default=None,
-                        help='Loss weights for physical tensors: "charge:1.0,dipole:2.0,polarizability:1.0,quadrupole:1.0". '
+                        help='Loss weights for physical tensors: "charge:1.0,dipole:2.0,magnetic_moment:1.0,polarizability:1.0,quadrupole:1.0,born_effective_charge:1.0". '
                              'Per-node (charge_per_atom) uses charge weight. Unspecified default 1.0.')
+    parser.add_argument('--bec-derivative-weight', type=float, default=1.0,
+                        help='Additional loss weight for dF/dE-derived Born effective charge supervision when born_effective_charge_per_atom labels and rank-1 external_field are present.')
+    parser.add_argument('--bec-consistency-weight', type=float, default=0.25,
+                        help='Additional loss weight tying the explicit born_effective_charge_per_atom head to the dF/dE-derived Born effective charge.')
     parser.add_argument('--distributed', action='store_true',
                         help='Enable distributed training (DDP)')
     parser.add_argument('--local-rank', type=int, default=-1,
@@ -536,7 +585,7 @@ def main():
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-save'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
@@ -547,6 +596,7 @@ def main():
                              '"pure-cartesian-sparse" uses a sparse pure-cartesian delta/epsilon tensor product (O(3) strict) by restricting rank-rank paths, '
                              '"pure-cartesian-sparse-save" uses the same sparse pure-cartesian implementation under a dedicated save-mode name, '
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
+                             '"pure-cartesian-ictd-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware O(3) ICTD). '
                              '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, same readout, DDP supported). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--max-rank-other', type=int, default=None,
@@ -806,6 +856,8 @@ def main():
             "tensor_product_mode": args.tensor_product_mode,
             "num_interaction": args.num_interaction,
             "invariant_channels": args.invariant_channels,
+            "o3_irrep_preset": args.o3_irrep_preset,
+            "o3_active_irreps": args.o3_active_irreps,
             "max_rank_other": args.max_rank_other,
             "k_policy": args.k_policy,
             "ictd_tp_path_policy": args.ictd_tp_path_policy,
@@ -912,6 +964,13 @@ def main():
     args.zbl_energy_scale = resolved_arch["zbl_energy_scale"]
     if args.external_tensor_rank is None:
         args.external_tensor_rank = resolved_arch["external_tensor_rank"]
+    if args.external_tensor_irrep is None:
+        args.external_tensor_irrep = resolved_arch.get("external_tensor_irrep")
+    restored_external_tensor_specs = resolved_arch.get("external_tensor_specs")
+    if args.o3_irrep_preset is None:
+        args.o3_irrep_preset = resolved_arch.get("o3_irrep_preset")
+    if args.o3_active_irreps is None:
+        args.o3_active_irreps = resolved_arch.get("o3_active_irreps")
     restored_physical_tensor_outputs = resolved_arch["physical_tensor_outputs"]
 
     # --- Dataset option validation (pairs must be both set or both unset) ---
@@ -923,6 +982,8 @@ def main():
     # --- External tensor / physical tensor validation ---
     if args.external_field_file and args.external_field_value:
         raise ValueError("--external-field-file and --external-field-value are mutually exclusive")
+    if args.magnetic_field_file and args.magnetic_field_value:
+        raise ValueError("--magnetic-field-file and --magnetic-field-value are mutually exclusive")
     if args.external_field_value:
         from molecular_force_field.active_learning.data_merge import external_field_tensor_shape
         shape = external_field_tensor_shape(len(args.external_field_value))
@@ -935,27 +996,92 @@ def main():
                 f"--external-tensor-rank={args.external_tensor_rank} conflicts with "
                 f"--external-field-value ({len(args.external_field_value)} values → rank {inferred_rank})"
             )
+    if args.magnetic_field_file or args.magnetic_field_value:
+        if args.external_tensor_rank is not None and int(args.external_tensor_rank) != 1 and (args.external_field_file or args.external_field_value):
+            raise ValueError("Simultaneous electric + magnetic field embedding currently requires rank-1 electric field input")
+        if args.external_tensor_irrep is not None and str(args.external_tensor_irrep).strip() not in {"1o"} and (args.external_field_file or args.external_field_value):
+            raise ValueError("When combining electric and magnetic fields, the legacy --external-tensor-irrep should describe the electric field and must be '1o'")
     if args.external_field_file and not args.external_tensor_rank:
         raise ValueError("--external-field-file requires --external-tensor-rank (e.g. 1 for electric field)")
-    if args.external_tensor_rank and not args.external_field_file and not args.external_field_value:
+    resolved_num_fidelity_levels = int(resolved_arch.get("num_fidelity_levels") or 0)
+    num_fidelity_levels = int(args.num_fidelity_levels) if args.num_fidelity_levels is not None else resolved_num_fidelity_levels
+    resolved_multi_fidelity_mode = str(resolved_arch.get("multi_fidelity_mode") or "conditioning")
+    multi_fidelity_mode = str(args.multi_fidelity_mode or resolved_multi_fidelity_mode).strip().lower()
+    fidelity_supported_modes = {
+        "spherical-save-cue",
+        "pure-cartesian-ictd",
+        "pure-cartesian-ictd-o3",
+        "pure-cartesian-sparse",
+        "pure-cartesian-sparse-save",
+    }
+    if num_fidelity_levels < 0:
+        raise ValueError("--num-fidelity-levels must be >= 0")
+    if num_fidelity_levels > 0 and args.tensor_product_mode not in fidelity_supported_modes:
+        raise ValueError(
+            "--num-fidelity-levels is currently supported only for --tensor-product-mode "
+            "spherical-save-cue, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+        )
+    if multi_fidelity_mode not in {"conditioning", "delta-baseline"}:
+        raise ValueError("--multi-fidelity-mode must be one of conditioning|delta-baseline")
+    if args.external_tensor_rank and not args.external_field_file and not args.external_field_value and not args.magnetic_field_file and not args.magnetic_field_value:
         logging.warning(
             "--external-tensor-rank is set but --external-field-file/--external-field-value is not. "
             "The model will include external field architecture. If 'external_field' "
             "is not embedded in the H5 dataset, the field will be zero at runtime."
         )
-    phys_supported_modes = {"pure-cartesian-ictd", "pure-cartesian-sparse", "pure-cartesian-sparse-save"}
-    if args.external_tensor_rank and args.tensor_product_mode not in phys_supported_modes:
+    phys_supported_modes = {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-sparse", "pure-cartesian-sparse-save"}
+    has_external_tensor_request = bool(
+        args.external_tensor_rank
+        or args.external_tensor_irrep
+        or args.external_tensor_parity
+        or args.external_field_file
+        or args.external_field_value
+        or args.magnetic_field_file
+        or args.magnetic_field_value
+        or restored_external_tensor_specs
+    )
+    if has_external_tensor_request and args.tensor_product_mode not in phys_supported_modes:
         raise ValueError(
-            "--external-tensor-rank only supported for --tensor-product-mode "
-            "pure-cartesian-ictd, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+            "External tensor embedding is only supported for --tensor-product-mode "
+            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
         )
     if (args.physical_tensors or args.physical_tensors_per_node) and args.tensor_product_mode not in phys_supported_modes:
         raise ValueError(
             "--physical-tensors and --physical-tensors-per-node only supported for --tensor-product-mode "
-            "pure-cartesian-ictd, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
         )
     if args.physical_tensors_per_node and not args.extra_per_node_file:
         raise ValueError("--physical-tensors-per-node requires --extra-per-node-file")
+
+    external_tensor_specs = normalize_external_tensor_specs(restored_external_tensor_specs) if restored_external_tensor_specs else None
+    if has_external_tensor_request:
+        specs_by_name = {
+            str(spec["name"]): dict(spec)
+            for spec in (external_tensor_specs or [])
+        }
+        if args.external_tensor_rank is not None:
+            electric_specs = build_standard_external_tensor_specs(
+                external_tensor_rank=args.external_tensor_rank,
+                external_tensor_irrep=args.external_tensor_irrep,
+                external_tensor_parity=args.external_tensor_parity,
+                include_magnetic_field=False,
+            ) or []
+            for spec in electric_specs:
+                specs_by_name[str(spec["name"])] = dict(spec)
+        elif args.external_field_file or args.external_field_value:
+            raise ValueError("Electric-field data was provided but --external-tensor-rank is not set")
+        if args.magnetic_field_file or args.magnetic_field_value:
+            for spec in (
+                normalize_external_tensor_specs(
+                    None,
+                    external_tensor_rank=1,
+                    external_tensor_irrep="1e",
+                    default_name="magnetic_field",
+                )
+                or []
+            ):
+                specs_by_name[str(spec["name"])] = dict(spec)
+        external_tensor_specs = list(specs_by_name.values()) or None
 
     # Parse physical_tensor_weights: "charge:1.0,dipole:2.0,..." -> {"charge": 1.0, "dipole": 2.0, ...}
     physical_tensor_weights = {}
@@ -971,6 +1097,15 @@ def main():
                     raise ValueError(f"Invalid --physical-tensor-weights part {part!r}; expected name:weight")
             else:
                 raise ValueError(f"Invalid --physical-tensor-weights part {part!r}; expected name:weight")
+    fidelity_loss_weights = parse_fidelity_loss_weights(args.fidelity_loss_weights)
+    if fidelity_loss_weights and num_fidelity_levels <= 0:
+        raise ValueError("--fidelity-loss-weights requires --num-fidelity-levels > 0")
+    if fidelity_loss_weights:
+        max_fid = max(fidelity_loss_weights)
+        if max_fid >= num_fidelity_levels:
+            raise ValueError(
+                f"--fidelity-loss-weights references fidelity id {max_fid}, but --num-fidelity-levels={num_fidelity_levels}"
+            )
 
     # --- Rank / world size (updated later if --distributed) ---
     rank = 0
@@ -1211,8 +1346,8 @@ def main():
             logging.error("Data preparation failed. Exiting.")
             return
 
-    # --- Inject uniform external field into H5 (if --external-field-value) ---
-    if args.external_field_value:
+    # --- Inject uniform external field / magnetic field into H5 ---
+    if args.external_field_value or args.magnetic_field_value:
         from molecular_force_field.active_learning.data_merge import _inject_external_field_into_h5
         if use_custom_data_paths:
             h5_paths = [args.train_data, args.valid_data]
@@ -1223,7 +1358,10 @@ def main():
             ]
         for hp in h5_paths:
             if os.path.exists(hp):
-                _inject_external_field_into_h5(hp, args.external_field_value)
+                if args.external_field_value:
+                    _inject_external_field_into_h5(hp, args.external_field_value, dataset_name="external_field")
+                if args.magnetic_field_value:
+                    _inject_external_field_into_h5(hp, args.magnetic_field_value, dataset_name="magnetic_field")
 
     # --- Build extra_label_paths and extra_per_node for H5Dataset ---
     extra_label_paths = {}
@@ -1237,6 +1375,10 @@ def main():
         extra_label_paths["quadrupole"] = args.quadrupole_file
     if args.external_field_file:
         extra_label_paths["external_field"] = args.external_field_file
+    if args.magnetic_field_file:
+        extra_label_paths["magnetic_field"] = args.magnetic_field_file
+    if args.fidelity_id_file:
+        extra_label_paths["fidelity_id"] = args.fidelity_id_file
     extra_label_paths = extra_label_paths if extra_label_paths else None
 
     # --- Build datasets (from custom paths or data_dir + prefix) ---
@@ -1471,35 +1613,53 @@ def main():
             )
 
         # Build physical_tensor_outputs from CLI, or restore them from checkpoint when resuming.
-        _phys_specs = {"charge": [0], "dipole": [1], "polarizability": [0, 2], "quadrupole": [2]}
+        _phys_specs = {"charge": [0], "dipole": [1], "magnetic_moment": [1], "polarizability": [0, 2], "quadrupole": [2], "born_effective_charge": [0, 1, 2]}
+        _phys_irreps = {
+            "charge": ["0e"],
+            "dipole": ["1o"],
+            "magnetic_moment": ["1e"],
+            "polarizability": ["0e", "2e"],
+            "quadrupole": ["2e"],
+            "born_effective_charge": ["0e", "1e", "2e"],
+        }
         physical_tensor_outputs = {}
         if args.physical_tensors:
             for name in (s.strip() for s in args.physical_tensors.split(",") if s.strip()):
+                if name == "born_effective_charge":
+                    raise ValueError(
+                        "born_effective_charge is currently supported only as per-node "
+                        "born_effective_charge_per_atom via --physical-tensors-per-node"
+                    )
                 if name in _phys_specs:
                     physical_tensor_outputs[name] = {
                         "ls": _phys_specs[name],
+                        "irreps": _phys_irreps.get(name),
                         "channels_out": 1,
                         "reduce": args.physical_tensor_reduce,
                     }
                 else:
-                    raise ValueError(f"Unknown --physical-tensors name {name!r}; supported: charge, dipole, polarizability, quadrupole")
+                    raise ValueError(f"Unknown --physical-tensors name {name!r}; supported: charge, dipole, magnetic_moment, polarizability, quadrupole")
         if args.physical_tensors_per_node:
             for name in (s.strip() for s in args.physical_tensors_per_node.split(",") if s.strip()):
                 base = name.replace("_per_atom", "")
                 if base in _phys_specs:
                     physical_tensor_outputs[name] = {
                         "ls": _phys_specs[base],
+                        "irreps": _phys_irreps.get(base),
                         "channels_out": 1,
                         "reduce": "none",
                     }
                 else:
-                    raise ValueError(f"Unknown --physical-tensors-per-node {name!r}; supported: charge_per_atom, dipole_per_atom, polarizability_per_atom, quadrupole_per_atom")
+                    raise ValueError(
+                        f"Unknown --physical-tensors-per-node {name!r}; supported: charge_per_atom, dipole_per_atom, "
+                        "magnetic_moment_per_atom, polarizability_per_atom, quadrupole_per_atom, born_effective_charge_per_atom"
+                    )
         physical_tensor_outputs = physical_tensor_outputs if physical_tensor_outputs else restored_physical_tensor_outputs
 
         if physical_tensor_outputs and rank == 0:
             logging.info("  physical_tensor_outputs: %s", list(physical_tensor_outputs.keys()))
-        if args.external_tensor_rank is not None and rank == 0:
-            logging.info("  external_tensor_rank=%d (e.g. electric field)", args.external_tensor_rank)
+        if external_tensor_specs is not None and rank == 0:
+            logging.info("  external_tensor_specs=%s", external_tensor_specs)
 
         e3trans = PureCartesianICTDTransformerLayerFull(
             max_embed_radius=config.max_radius,
@@ -1525,6 +1685,111 @@ def main():
             **common_invariant_kwargs,
             physical_tensor_outputs=physical_tensor_outputs,
             external_tensor_rank=args.external_tensor_rank,
+            external_tensor_irrep=args.external_tensor_irrep,
+            external_tensor_parity=args.external_tensor_parity,
+            external_tensor_specs=external_tensor_specs,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
+            long_range_mode=args.long_range_mode,
+            long_range_hidden_dim=args.long_range_hidden_dim,
+            long_range_boundary=args.long_range_boundary,
+            long_range_neutralize=args.long_range_neutralize,
+            long_range_filter_hidden_dim=args.long_range_filter_hidden_dim,
+            long_range_kmax=args.long_range_kmax,
+            long_range_mesh_size=args.long_range_mesh_size,
+            long_range_slab_padding_factor=args.long_range_slab_padding_factor,
+            long_range_include_k0=args.long_range_include_k0,
+            long_range_source_channels=args.long_range_source_channels,
+            long_range_backend=args.long_range_backend,
+            long_range_reciprocal_backend=args.long_range_reciprocal_backend,
+            long_range_energy_partition=args.long_range_energy_partition,
+            long_range_green_mode=args.long_range_green_mode,
+            long_range_assignment=args.long_range_assignment,
+            long_range_theta=args.long_range_theta,
+            long_range_leaf_size=args.long_range_leaf_size,
+            long_range_multipole_order=args.long_range_multipole_order,
+            long_range_far_source_dim=args.long_range_far_source_dim,
+            long_range_far_num_shells=args.long_range_far_num_shells,
+            long_range_far_shell_growth=args.long_range_far_shell_growth,
+            long_range_far_tail=args.long_range_far_tail,
+            long_range_far_tail_bins=args.long_range_far_tail_bins,
+            long_range_far_stats=args.long_range_far_stats,
+            long_range_far_max_radius_multiplier=args.long_range_far_max_radius_multiplier,
+            long_range_far_source_norm=args.long_range_far_source_norm,
+            long_range_far_gate_init=args.long_range_far_gate_init,
+            feature_spectral_mode=args.feature_spectral_mode,
+            feature_spectral_bottleneck_dim=args.feature_spectral_bottleneck_dim,
+            feature_spectral_mesh_size=args.feature_spectral_mesh_size,
+            feature_spectral_filter_hidden_dim=args.feature_spectral_filter_hidden_dim,
+            feature_spectral_boundary=args.feature_spectral_boundary,
+            feature_spectral_slab_padding_factor=args.feature_spectral_slab_padding_factor,
+            feature_spectral_neutralize=args.feature_spectral_neutralize,
+            feature_spectral_include_k0=args.feature_spectral_include_k0,
+            feature_spectral_gate_init=args.feature_spectral_gate_init,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd-o3':
+        logging.info("Using PURE Cartesian ICTD O(3) mode (strict parity-aware ICTD), num_interaction=%d", args.num_interaction)
+        logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
+        _phys_specs = {"charge": [0], "dipole": [1], "magnetic_moment": [1], "polarizability": [0, 2], "quadrupole": [2], "born_effective_charge": [0, 1, 2]}
+        _phys_irreps = {
+            "charge": ["0e"],
+            "dipole": ["1o"],
+            "magnetic_moment": ["1e"],
+            "polarizability": ["0e", "2e"],
+            "quadrupole": ["2e"],
+            "born_effective_charge": ["0e", "1e", "2e"],
+        }
+        physical_tensor_outputs = {}
+        if args.physical_tensors:
+            for name in (s.strip() for s in args.physical_tensors.split(",") if s.strip()):
+                if name == "born_effective_charge":
+                    raise ValueError("born_effective_charge is currently supported only as per-node born_effective_charge_per_atom via --physical-tensors-per-node")
+                if name in _phys_specs:
+                    physical_tensor_outputs[name] = {"ls": _phys_specs[name], "irreps": _phys_irreps.get(name), "channels_out": 1, "reduce": args.physical_tensor_reduce}
+                else:
+                    raise ValueError(f"Unknown --physical-tensors name {name!r}; supported: charge, dipole, magnetic_moment, polarizability, quadrupole")
+        if args.physical_tensors_per_node:
+            for name in (s.strip() for s in args.physical_tensors_per_node.split(",") if s.strip()):
+                base = name.replace("_per_atom", "")
+                if base in _phys_specs:
+                    physical_tensor_outputs[name] = {"ls": _phys_specs[base], "irreps": _phys_irreps.get(base), "channels_out": 1, "reduce": "none"}
+                else:
+                    raise ValueError(
+                        f"Unknown --physical-tensors-per-node {name!r}; supported: charge_per_atom, dipole_per_atom, "
+                        "magnetic_moment_per_atom, polarizability_per_atom, quadrupole_per_atom, born_effective_charge_per_atom"
+                    )
+        physical_tensor_outputs = physical_tensor_outputs if physical_tensor_outputs else restored_physical_tensor_outputs
+        e3trans = PureCartesianICTDO3TransformerLayer(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            ictd_tp_path_policy=args.ictd_tp_path_policy,
+            ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
+            internal_compute_dtype=config.dtype,
+            device=device,
+            **common_invariant_kwargs,
+            physical_tensor_outputs=physical_tensor_outputs,
+            external_tensor_rank=args.external_tensor_rank,
+            external_tensor_irrep=args.external_tensor_irrep,
+            external_tensor_parity=args.external_tensor_parity,
+            external_tensor_specs=external_tensor_specs,
+            o3_irrep_preset=args.o3_irrep_preset,
+            o3_active_irreps=args.o3_active_irreps,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
             long_range_mode=args.long_range_mode,
             long_range_hidden_dim=args.long_range_hidden_dim,
             long_range_boundary=args.long_range_boundary,
@@ -1621,6 +1886,9 @@ def main():
             k_policy=args.k_policy,
             physical_tensor_outputs=physical_tensor_outputs,
             external_tensor_rank=args.external_tensor_rank,
+            external_tensor_specs=external_tensor_specs,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
             device=device,
             **common_invariant_kwargs,
             **common_long_range_kwargs,
@@ -1795,6 +2063,8 @@ def main():
             feature_spectral_neutralize=args.feature_spectral_neutralize,
             feature_spectral_include_k0=args.feature_spectral_include_k0,
             feature_spectral_gate_init=args.feature_spectral_gate_init,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
         ).to(device)
     else:  # spherical (default)
         logging.info("Using Spherical harmonics tensor product mode (e3nn), num_interaction=%d", args.num_interaction)
@@ -1889,6 +2159,10 @@ def main():
         compile_val_precache=args.compile_val_precache,
         inference_output_physical_tensors=args.inference_output_physical_tensors,
         physical_tensor_weights=physical_tensor_weights,
+        fidelity_loss_weights=fidelity_loss_weights,
+        delta_regularization_weight=args.delta_regularization_weight,
+        bec_derivative_weight=args.bec_derivative_weight,
+        bec_consistency_weight=args.bec_consistency_weight,
     )
     
     # Start training

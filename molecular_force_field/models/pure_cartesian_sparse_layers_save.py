@@ -24,6 +24,16 @@ from molecular_force_field.models.pure_cartesian_sparse_layers import (
     _apply_channel_adapter_cartesian,
     normalize_sparse_external_tensor_blocks,
 )
+from molecular_force_field.utils.external_tensor_specs import (
+    external_tensor_total_numel,
+    normalize_external_tensor_specs,
+    unpack_external_tensor,
+)
+from molecular_force_field.utils.fidelity import (
+    apply_delta_energy_heads,
+    apply_fidelity_embedding,
+    zero_init_module_output,
+)
 from e3nn.math import soft_one_hot_linspace
 from molecular_force_field.utils.scatter import scatter
 
@@ -51,6 +61,9 @@ class PureCartesianSparseE3ConvSave(nn.Module):
         max_rank_other: int = 1,
         k_policy: str = "k0",
         external_tensor_rank: int | None = None,
+        external_tensor_specs: list[dict] | None = None,
+        num_fidelity_levels: int = 0,
+        multi_fidelity_mode: str = "conditioning",
         external_tensor_scale_init: float = 0.0,
     ):
         super().__init__()
@@ -60,13 +73,25 @@ class PureCartesianSparseE3ConvSave(nn.Module):
         self.output_size = output_size
         self.Lmax = Lmax
         self.function_type = function_type
-        self.external_tensor_rank = int(external_tensor_rank) if external_tensor_rank is not None else None
+        self.external_tensor_specs = normalize_external_tensor_specs(
+            external_tensor_specs,
+            external_tensor_rank=external_tensor_rank,
+            external_tensor_irrep=None,
+            external_tensor_parity=None,
+        )
+        self.external_tensor_total_numel = external_tensor_total_numel(self.external_tensor_specs)
+        single_external_spec = self.external_tensor_specs[0] if self.external_tensor_specs and len(self.external_tensor_specs) == 1 else None
+        self.external_tensor_rank = int(single_external_spec["rank"]) if single_external_spec is not None else None
 
         self.atom_embedding = nn.Embedding(max_atomvalue, embedding_dim)
         self.atom_mlp = nn.Sequential(
             nn.Linear(embedding_dim, 64),
             nn.SiLU(),
             nn.Linear(64, output_size),
+        )
+        self.num_fidelity_levels = int(num_fidelity_levels)
+        self.fidelity_embedding = (
+            nn.Embedding(self.num_fidelity_levels, output_size) if self.num_fidelity_levels > 0 else None
         )
 
         from molecular_force_field.models.pure_cartesian import (
@@ -95,14 +120,33 @@ class PureCartesianSparseE3ConvSave(nn.Module):
             nn.Linear(64, self.tp.weight_numel),
         )
         self.output_dim = total_dim_o3(channels_out, Lmax)
-        if self.external_tensor_rank is not None:
+        if self.external_tensor_specs is not None and len(self.external_tensor_specs) > 1:
+            self.external_tensor_scale_by_spec_l = nn.Parameter(
+                torch.full((len(self.external_tensor_specs), self.Lmax + 1), float(external_tensor_scale_init))
+            )
+            self.external_tensor_scale_by_l = None
+        elif self.external_tensor_rank is not None:
             self.external_tensor_scale_by_l = nn.Parameter(
                 torch.full((self.Lmax + 1,), float(external_tensor_scale_init))
             )
+            self.external_tensor_scale_by_spec_l = None
         else:
             self.external_tensor_scale_by_l = None
+            self.external_tensor_scale_by_spec_l = None
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, *, external_tensor: torch.Tensor | None = None):
+    def forward(
+        self,
+        pos,
+        A,
+        batch,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        *,
+        external_tensor: torch.Tensor | None = None,
+        fidelity_ids: torch.Tensor | None = None,
+    ):
         dtype = next(self.parameters()).dtype
         pos = pos.to(dtype=dtype)
         cell = cell.to(dtype=dtype)
@@ -116,23 +160,40 @@ class PureCartesianSparseE3ConvSave(nn.Module):
         edge_length = edge_vec.norm(dim=1)
 
         Ai = self.atom_mlp(self.atom_embedding(A.long()))
+        Ai = apply_fidelity_embedding(Ai, batch, fidelity_ids, self.fidelity_embedding)
         edge_vec = edge_vec.to(dtype=Ai.dtype)
         edge_length = edge_length.to(dtype=Ai.dtype)
 
         ext_blocks = None
         if external_tensor is not None:
-            if self.external_tensor_rank is None:
+            if self.external_tensor_specs is not None and len(self.external_tensor_specs) > 1:
+                unpacked = unpack_external_tensor(external_tensor, self.external_tensor_specs)
+                ext_blocks = {}
+                for spec_idx, spec in enumerate(self.external_tensor_specs):
+                    blocks_i = normalize_sparse_external_tensor_blocks(
+                        unpacked[str(spec["name"])],
+                        external_tensor_rank=int(spec["rank"]),
+                        num_nodes=Ai.shape[0],
+                        batch=batch,
+                        device=Ai.device,
+                        dtype=Ai.dtype,
+                    )
+                    for L, blk in blocks_i.items():
+                        scale = self.external_tensor_scale_by_spec_l[spec_idx, int(L)]
+                        ext_blocks[L] = blk * scale if L not in ext_blocks else ext_blocks[L] + blk * scale
+            elif self.external_tensor_rank is None:
                 raise ValueError(
                     "external_tensor was provided but pure-cartesian-sparse-save was not configured with external_tensor_rank"
                 )
-            ext_blocks = normalize_sparse_external_tensor_blocks(
-                external_tensor,
-                external_tensor_rank=self.external_tensor_rank,
-                num_nodes=Ai.shape[0],
-                batch=batch,
-                device=Ai.device,
-                dtype=Ai.dtype,
-            )
+            else:
+                ext_blocks = normalize_sparse_external_tensor_blocks(
+                    external_tensor,
+                    external_tensor_rank=self.external_tensor_rank,
+                    num_nodes=Ai.shape[0],
+                    batch=batch,
+                    device=Ai.device,
+                    dtype=Ai.dtype,
+                )
 
         x1_blocks = {(0, 0): Ai[edge_src], (1, 0): torch.zeros_like(Ai[edge_src])}
         for L in range(1, self.Lmax + 1):
@@ -247,6 +308,8 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         feature_spectral_gate_init: float = 0.0,
         physical_tensor_outputs: dict[str, dict] | None = None,
         external_tensor_rank: int | None = None,
+        external_tensor_specs: list[dict] | None = None,
+        num_fidelity_levels: int = 0,
         external_tensor_scale_init: float = 0.0,
     ):
         super().__init__()
@@ -267,7 +330,19 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         self.max_rank_other = int(max_rank_other)
         self.k_policy = str(k_policy)
         self.lmax = int(lmax)
-        self.external_tensor_rank = int(external_tensor_rank) if external_tensor_rank is not None else None
+        self.external_tensor_specs = normalize_external_tensor_specs(
+            external_tensor_specs,
+            external_tensor_rank=external_tensor_rank,
+            external_tensor_irrep=None,
+            external_tensor_parity=None,
+        )
+        self.external_tensor_total_numel = external_tensor_total_numel(self.external_tensor_specs)
+        single_external_spec = self.external_tensor_specs[0] if self.external_tensor_specs and len(self.external_tensor_specs) == 1 else None
+        self.external_tensor_rank = int(single_external_spec["rank"]) if single_external_spec is not None else None
+        self.num_fidelity_levels = int(num_fidelity_levels)
+        self.multi_fidelity_mode = str(multi_fidelity_mode or "conditioning").strip().lower()
+        if self.multi_fidelity_mode not in {"conditioning", "delta-baseline"}:
+            raise ValueError(f"Unsupported multi_fidelity_mode {self.multi_fidelity_mode!r}")
         self.physical_tensor_representation = "cartesian"
 
         self.e3_conv_layers = nn.ModuleList()
@@ -284,6 +359,8 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
                 max_rank_other=self.max_rank_other,
                 k_policy=self.k_policy,
                 external_tensor_rank=self.external_tensor_rank,
+                external_tensor_specs=self.external_tensor_specs,
+                num_fidelity_levels=self.num_fidelity_levels,
                 external_tensor_scale_init=external_tensor_scale_init,
             )
         )
@@ -315,6 +392,23 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
             17,
         )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
+        self.delta_proj_total: nn.ModuleDict | None = None
+        self.delta_weighted_sum: nn.ModuleDict | None = None
+        if self.multi_fidelity_mode == "delta-baseline" and self.num_fidelity_levels > 1:
+            self.delta_proj_total = nn.ModuleDict()
+            self.delta_weighted_sum = nn.ModuleDict()
+            for fid in range(1, self.num_fidelity_levels):
+                head = MainNet(
+                    self.num_interaction * self.product_5_o3.dim_out + scalar_channels,
+                    embed_size,
+                    17,
+                )
+                zero_init_module_output(head)
+                self.delta_proj_total[str(fid)] = head
+                sum_head = RobustScalarWeightedSum(17)
+                with torch.no_grad():
+                    sum_head.weights.zero_()
+                self.delta_weighted_sum[str(fid)] = sum_head
         configure_long_range_modules(
             self,
             feature_dim=self.num_interaction * self.product_5_o3.dim_out + scalar_channels,
@@ -411,6 +505,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         *,
         precomputed_edge_vec=None,
         external_tensor: torch.Tensor | None = None,
+        fidelity_ids: torch.Tensor | None = None,
         return_physical_tensors: bool = False,
         return_reciprocal_source: bool = False,
         **_unused,
@@ -435,6 +530,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
             edge_shifts,
             cell,
             external_tensor=external_tensor,
+            fidelity_ids=fidelity_ids,
         )
         features.append(f_prev)
         for conv in self.e3_conv_layers[1:]:
@@ -499,6 +595,15 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         product_proj = self.proj_total(f_prod5)
         e_out = self.weighted_sum(product_proj)
         atom_energies = e_out.sum(dim=-1, keepdim=True)
+        if self.multi_fidelity_mode == "delta-baseline":
+            atom_energies = apply_delta_energy_heads(
+                atom_energies,
+                f_prod5,
+                batch,
+                fidelity_ids,
+                self.delta_proj_total,
+                self.delta_weighted_sum,
+            )
         if long_range_energy is not None and not defer_long_range_to_runtime:
             atom_energies = atom_energies + long_range_energy
         if reciprocal_source is None and return_reciprocal_source:

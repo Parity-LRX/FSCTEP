@@ -37,6 +37,9 @@ from molecular_force_field.models.pure_cartesian_layers import (
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PureCartesianICTDTransformerLayer,
 )
+from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
+    PureCartesianICTDO3TransformerLayer,
+)
 from molecular_force_field.models.pure_cartesian_sparse_layers import (
     PureCartesianSparseTransformerLayer,
 )
@@ -70,6 +73,7 @@ __all__ = [
     "EquivariantTensorProduct",
     "PureCartesianTransformerLayer",
     "PureCartesianICTDTransformerLayer",
+    "PureCartesianICTDO3TransformerLayer",
     "PureCartesianSparseTransformerLayer",
     "PureCartesianSparseTransformerLayerSave",
     "FastSymmetricSTF",

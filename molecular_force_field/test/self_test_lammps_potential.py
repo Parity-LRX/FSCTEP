@@ -339,6 +339,8 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
     path: str,
     device: torch.device,
     external_tensor_rank: int | None = None,
+    external_tensor_irrep: str | None = None,
+    external_tensor_specs: list[dict] | None = None,
     physical_tensor_outputs: dict[str, dict] | None = None,
     long_range_mode: str = "none",
     long_range_hidden_dim: int = 64,
@@ -376,6 +378,8 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
     feature_spectral_neutralize: bool = True,
     feature_spectral_include_k0: bool = False,
     feature_spectral_gate_init: float = 0.0,
+    num_fidelity_levels: int = 0,
+    multi_fidelity_mode: str = "conditioning",
 ) -> ModelConfig:
     """创建 pure-cartesian-ictd (pure_cartesian_ictd_layers_full) 的 dummy checkpoint。"""
     from molecular_force_field.models.pure_cartesian_ictd_layers_full import PureCartesianICTDTransformerLayer
@@ -409,6 +413,8 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         lmax=config.lmax,
         physical_tensor_outputs=physical_tensor_outputs,
         external_tensor_rank=external_tensor_rank,
+        external_tensor_irrep=external_tensor_irrep,
+        external_tensor_specs=external_tensor_specs,
         internal_compute_dtype=config.dtype,
         device=device,
         long_range_mode=long_range_mode,
@@ -447,6 +453,8 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
         feature_spectral_gate_init=feature_spectral_gate_init,
+        num_fidelity_levels=num_fidelity_levels,
+        multi_fidelity_mode=multi_fidelity_mode,
     ).to(device)
 
     ckpt = {
@@ -456,8 +464,15 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
     }
     if external_tensor_rank is not None:
         ckpt["external_tensor_rank"] = int(external_tensor_rank)
+    if external_tensor_irrep is not None:
+        ckpt["external_tensor_irrep"] = str(external_tensor_irrep)
+    if external_tensor_specs is not None:
+        ckpt["external_tensor_specs"] = external_tensor_specs
     if physical_tensor_outputs is not None:
         ckpt["physical_tensor_outputs"] = physical_tensor_outputs
+    ckpt.setdefault("model_hyperparameters", {})
+    ckpt["model_hyperparameters"]["num_fidelity_levels"] = int(num_fidelity_levels)
+    ckpt["model_hyperparameters"]["multi_fidelity_mode"] = str(multi_fidelity_mode)
     _write_long_range_hparams(
         ckpt,
         long_range_mode=long_range_mode,
@@ -500,6 +515,69 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         feature_spectral_include_k0=feature_spectral_include_k0,
         feature_spectral_gate_init=feature_spectral_gate_init,
     )
+    torch.save(ckpt, path)
+    return config
+
+
+def _make_dummy_checkpoint_pure_cartesian_ictd_o3(
+    path: str,
+    device: torch.device,
+    external_tensor_rank: int | None = None,
+    external_tensor_irrep: str | None = None,
+    external_tensor_specs: list[dict] | None = None,
+    physical_tensor_outputs: dict[str, dict] | None = None,
+    o3_irrep_preset: str = "auto",
+    o3_active_irreps: str | None = None,
+) -> ModelConfig:
+    """创建 pure-cartesian-ictd-o3 的 dummy checkpoint。"""
+    from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDO3TransformerLayer
+
+    config = ModelConfig(dtype=torch.float64)
+    config.atomic_energy_keys = torch.tensor([1, 8], dtype=torch.long)
+    config.atomic_energy_values = torch.tensor([-13.6, -75.0], dtype=config.dtype)
+
+    model = PureCartesianICTDO3TransformerLayer(
+        max_embed_radius=config.max_radius,
+        main_max_radius=config.max_radius_main,
+        main_number_of_basis=config.number_of_basis_main,
+        hidden_dim_conv=config.channel_in,
+        hidden_dim_sh=config.get_hidden_dim_sh(),
+        hidden_dim=config.emb_number_main_2,
+        channel_in2=config.channel_in2,
+        embedding_dim=config.embedding_dim,
+        max_atomvalue=config.max_atomvalue,
+        output_size=config.output_size,
+        embed_size=config.embed_size,
+        main_hidden_sizes3=config.main_hidden_sizes3,
+        num_layers=config.num_layers,
+        num_interaction=2,
+        function_type_main=config.function_type,
+        lmax=config.lmax,
+        physical_tensor_outputs=physical_tensor_outputs,
+        external_tensor_rank=external_tensor_rank,
+        external_tensor_irrep=external_tensor_irrep,
+        external_tensor_specs=external_tensor_specs,
+        o3_irrep_preset=o3_irrep_preset,
+        o3_active_irreps=o3_active_irreps,
+        internal_compute_dtype=config.dtype,
+        device=device,
+    ).to(device)
+
+    ckpt = {
+        "e3trans_state_dict": model.state_dict(),
+        "dtype": "float64",
+        "tensor_product_mode": "pure-cartesian-ictd-o3",
+        "o3_irrep_preset": o3_irrep_preset,
+        "o3_active_irreps": o3_active_irreps,
+    }
+    if external_tensor_rank is not None:
+        ckpt["external_tensor_rank"] = int(external_tensor_rank)
+    if external_tensor_irrep is not None:
+        ckpt["external_tensor_irrep"] = str(external_tensor_irrep)
+    if external_tensor_specs is not None:
+        ckpt["external_tensor_specs"] = external_tensor_specs
+    if physical_tensor_outputs is not None:
+        ckpt["physical_tensor_outputs"] = physical_tensor_outputs
     torch.save(ckpt, path)
     return config
 
@@ -681,4 +759,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

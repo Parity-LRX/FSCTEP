@@ -20,6 +20,10 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "tensor_product_mode": "spherical",
     "num_interaction": 2,
     "invariant_channels": 32,
+    "num_fidelity_levels": 0,
+    "multi_fidelity_mode": "conditioning",
+    "o3_irrep_preset": "auto",
+    "o3_active_irreps": None,
     "max_radius": 5.0,
     "max_rank_other": 1,
     "k_policy": "k0",
@@ -67,6 +71,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "zbl_outer_cutoff": 1.2,
     "zbl_exponent": 0.23,
     "zbl_energy_scale": 1.0,
+    "external_tensor_specs": None,
 }
 
 
@@ -220,6 +225,40 @@ def resolve_model_architecture(
             "invariant_channels",
             DEFAULT_MODEL_ARCHITECTURE["invariant_channels"],
         )
+    )
+    resolved["num_fidelity_levels"] = int(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "num_fidelity_levels",
+            DEFAULT_MODEL_ARCHITECTURE["num_fidelity_levels"],
+        )
+    )
+    resolved["multi_fidelity_mode"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "multi_fidelity_mode",
+            DEFAULT_MODEL_ARCHITECTURE["multi_fidelity_mode"],
+        )
+    )
+    resolved["o3_irrep_preset"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "o3_irrep_preset",
+            DEFAULT_MODEL_ARCHITECTURE["o3_irrep_preset"],
+        )
+    )
+    resolved["o3_active_irreps"] = _resolve_value(
+        overrides,
+        checkpoint,
+        arch_meta,
+        "o3_active_irreps",
+        DEFAULT_MODEL_ARCHITECTURE["o3_active_irreps"],
     )
     resolved["max_rank_other"] = int(_resolve_value(overrides, checkpoint, arch_meta, "max_rank_other", DEFAULT_MODEL_ARCHITECTURE["max_rank_other"]))
     resolved["k_policy"] = str(_resolve_value(overrides, checkpoint, arch_meta, "k_policy", DEFAULT_MODEL_ARCHITECTURE["k_policy"]))
@@ -623,6 +662,16 @@ def resolve_model_architecture(
     if external_tensor_rank is None and state_dict:
         external_tensor_rank = infer_external_tensor_rank_from_state_dict(state_dict)
     resolved["external_tensor_rank"] = external_tensor_rank
+    resolved["external_tensor_irrep"] = (
+        checkpoint.get("external_tensor_irrep")
+        if checkpoint is not None and checkpoint.get("external_tensor_irrep") is not None
+        else arch_meta.get("external_tensor_irrep")
+    )
+    resolved["external_tensor_specs"] = (
+        checkpoint.get("external_tensor_specs")
+        if checkpoint is not None and checkpoint.get("external_tensor_specs") is not None
+        else arch_meta.get("external_tensor_specs", DEFAULT_MODEL_ARCHITECTURE["external_tensor_specs"])
+    )
 
     resolved["inference_output_physical_tensors"] = (
         checkpoint.get("inference_output_physical_tensors") if checkpoint is not None else None

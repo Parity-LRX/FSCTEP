@@ -22,6 +22,7 @@ def _load_struct_property_file(file_path: str, *, kind: str) -> torch.Tensor:
 
     kind:
       - "scalar": (B,)
+      - "int_scalar": (B,) integer ids
       - "vector3": (B, 3)
       - "mat33": (B, 3, 3) or (B, 9) row-major
     """
@@ -53,6 +54,12 @@ def _load_struct_property_file(file_path: str, *, kind: str) -> torch.Tensor:
             values = values[:, 0]
         values = values.reshape(-1).astype(np.float64)
         return torch.from_numpy(values).double()
+
+    if kind == "int_scalar":
+        if values.ndim == 2 and values.shape[1] >= 1:
+            values = values[:, 0]
+        values = values.reshape(-1).astype(np.int64)
+        return torch.from_numpy(values).long()
 
     if kind == "vector3":
         if values.ndim == 1 and values.shape[0] == 3:
@@ -174,6 +181,7 @@ class CustomDataset(Dataset):
         polarizability_file_path: str | None = None,    # mat33
         quadrupole_file_path: str | None = None,        # mat33 (typically traceless, but stored Cartesian)
         external_field_file_path: str | None = None,    # vector3 (e.g., uniform E field)
+        magnetic_field_file_path: str | None = None,    # vector3 (e.g., uniform B field)
     ):
         """
         Initialize custom dataset.
@@ -199,6 +207,7 @@ class CustomDataset(Dataset):
         polars_all = _load_struct_property_file(polarizability_file_path, kind="mat33") if polarizability_file_path else None
         quads_all = _load_struct_property_file(quadrupole_file_path, kind="mat33") if quadrupole_file_path else None
         ext_fields_all = _load_struct_property_file(external_field_file_path, kind="vector3") if external_field_file_path else None
+        mag_fields_all = _load_struct_property_file(magnetic_field_file_path, kind="vector3") if magnetic_field_file_path else None
         
         # Load stress data (optional)
         import os
@@ -248,6 +257,8 @@ class CustomDataset(Dataset):
                 extras["quadrupole"] = quads_all[i]
             if ext_fields_all is not None:
                 extras["external_field"] = ext_fields_all[i]
+            if mag_fields_all is not None:
+                extras["magnetic_field"] = mag_fields_all[i]
             tasks.append((i, blocks[i], targets[i], cells[i], pbc_i, self.max_radius, stress_i, extras))
         
         # Use process pool for parallel computation
@@ -337,12 +348,17 @@ class H5Dataset(Dataset):
                 p = str(path)
                 if key in ("charge",):
                     self._extra_labels[key] = _load_struct_property_file(p, kind="scalar")
-                elif key in ("dipole", "external_field"):
+                elif key in ("fidelity_id",):
+                    self._extra_labels[key] = _load_struct_property_file(p, kind="int_scalar")
+                elif key in ("dipole", "magnetic_moment", "external_field", "magnetic_field"):
                     self._extra_labels[key] = _load_struct_property_file(p, kind="vector3")
                 elif key in ("polarizability", "quadrupole"):
                     self._extra_labels[key] = _load_struct_property_file(p, kind="mat33")
                 else:
-                    raise ValueError(f"Unknown extra label name {key!r}; supported: charge, dipole, polarizability, quadrupole, external_field")
+                    raise ValueError(
+                        f"Unknown extra label name {key!r}; supported: charge, fidelity_id, dipole, magnetic_moment, "
+                        "polarizability, quadrupole, external_field, magnetic_field"
+                    )
             # Basic length validation (best-effort)
             for k, v in self._extra_labels.items():
                 if v.shape[0] != self.num_samples:
@@ -356,7 +372,14 @@ class H5Dataset(Dataset):
                     if key not in f:
                         continue
                     g = f[key]
-                    for k in ("charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom"):
+                    for k in (
+                        "charge_per_atom",
+                        "dipole_per_atom",
+                        "magnetic_moment_per_atom",
+                        "polarizability_per_atom",
+                        "quadrupole_per_atom",
+                        "born_effective_charge_per_atom",
+                    ):
                         if k in g:
                             self._extra_per_node.setdefault(k, [None] * self.num_samples)[i] = torch.from_numpy(g[k][:]).double()
     
@@ -392,13 +415,23 @@ class H5Dataset(Dataset):
             'stress': stress,
         }
         # Prefer in-H5 datasets when present, else fall back to extra_label_paths.
-        for k in ("charge", "dipole", "polarizability", "quadrupole", "external_field"):
+        for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in g:
-                out[k] = torch.from_numpy(g[k][:]).double()
+                if k == "fidelity_id":
+                    out[k] = torch.as_tensor(np.asarray(g[k][()]), dtype=torch.long)
+                else:
+                    out[k] = torch.from_numpy(g[k][:]).double()
             elif k in self._extra_labels:
                 out[k] = self._extra_labels[k][idx]
         # Per-node labels (reduce="none"): shape (num_atoms,) or (num_atoms, 3) or (num_atoms, 3, 3)
-        for k in ("charge_per_atom", "dipole_per_atom", "polarizability_per_atom", "quadrupole_per_atom"):
+        for k in (
+            "charge_per_atom",
+            "dipole_per_atom",
+            "magnetic_moment_per_atom",
+            "polarizability_per_atom",
+            "quadrupole_per_atom",
+            "born_effective_charge_per_atom",
+        ):
             if k in g:
                 out[k] = torch.from_numpy(g[k][:]).double()
             elif hasattr(self, "_extra_per_node") and k in self._extra_per_node:
@@ -423,6 +456,7 @@ class OnTheFlyDataset(Dataset):
         polarizability_file_path: str | None = None,    # mat33
         quadrupole_file_path: str | None = None,        # mat33
         external_field_file_path: str | None = None,    # vector3
+        magnetic_field_file_path: str | None = None,    # vector3
     ):
         """
         Initialize on-the-fly dataset.
@@ -449,6 +483,7 @@ class OnTheFlyDataset(Dataset):
         self.polars_all = _load_struct_property_file(polarizability_file_path, kind="mat33") if polarizability_file_path else None
         self.quads_all = _load_struct_property_file(quadrupole_file_path, kind="mat33") if quadrupole_file_path else None
         self.ext_fields_all = _load_struct_property_file(external_field_file_path, kind="vector3") if external_field_file_path else None
+        self.mag_fields_all = _load_struct_property_file(magnetic_field_file_path, kind="vector3") if magnetic_field_file_path else None
         
         # Load stress data (optional)
         import os
@@ -545,4 +580,6 @@ class OnTheFlyDataset(Dataset):
             out["quadrupole"] = self.quads_all[idx]
         if self.ext_fields_all is not None:
             out["external_field"] = self.ext_fields_all[idx]
+        if self.mag_fields_all is not None:
+            out["magnetic_field"] = self.mag_fields_all[idx]
         return out

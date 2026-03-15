@@ -129,6 +129,25 @@ def _sym_rank_linear_permutation_indices(L: int) -> tuple[list[torch.Tensor], to
     return perm_indices, torch.tensor(coefs, dtype=torch.float64)
 
 
+@lru_cache(maxsize=None)
+def _rank2_antisymmetric_basis() -> torch.Tensor:
+    """
+    Basis that maps the axial-vector components [yz, zx, xy] to a flattened 3x3
+    antisymmetric matrix in row-major order.
+    """
+    basis = torch.zeros(3, 9, dtype=torch.float64)
+    # yz
+    basis[0, 5] = 1.0
+    basis[0, 7] = -1.0
+    # zx
+    basis[1, 6] = 1.0
+    basis[1, 2] = -1.0
+    # xy
+    basis[2, 1] = 1.0
+    basis[2, 3] = -1.0
+    return basis
+
+
 class PhysicalTensorICTDEmbedding(nn.Module):
     """
     Embed a (symmetric) Cartesian physical tensor of rank L into ICTD-irreps blocks.
@@ -159,6 +178,7 @@ class PhysicalTensorICTDEmbedding(nn.Module):
         channels_out: int | None = None,
         input_repr: str = "cartesian",
         include_trace_chain: bool = True,
+        rank2_mode: str = "symmetric",
         internal_compute_dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
@@ -168,6 +188,7 @@ class PhysicalTensorICTDEmbedding(nn.Module):
         self.channels_out = int(channels_out) if channels_out is not None else int(channels_in)
         self.input_repr = str(input_repr).strip().lower()
         self.include_trace_chain = bool(include_trace_chain)
+        self.rank2_mode = str(rank2_mode).strip().lower()
         self.internal_compute_dtype = internal_compute_dtype
 
         if self.rank < 0:
@@ -180,6 +201,10 @@ class PhysicalTensorICTDEmbedding(nn.Module):
             raise ValueError(f"channels_out must be positive, got {self.channels_out}")
         if self.input_repr not in ("cartesian", "monomial"):
             raise ValueError(f"input_repr must be 'cartesian' or 'monomial', got {self.input_repr!r}")
+        if self.rank2_mode not in ("symmetric", "full"):
+            raise ValueError(f"rank2_mode must be 'symmetric' or 'full', got {self.rank2_mode!r}")
+        if self.rank != 2 and self.rank2_mode != "symmetric":
+            raise ValueError("rank2_mode='full' is only supported for rank=2")
 
         # Precompute Sym^L lookup for cartesian -> monomial coefficients
         lin_idx, coefs = _sym_rank_linear_indices_and_coefs(self.rank)
@@ -216,8 +241,12 @@ class PhysicalTensorICTDEmbedding(nn.Module):
             ls = list(range(self.rank, -1, -2))
         else:
             ls = [self.rank]
+        if self.rank == 2 and self.rank2_mode == "full" and 1 <= self.lmax_out:
+            ls = sorted(set(ls + [1]))
         for l in ls:
             if l > self.lmax_out:
+                continue
+            if (self.rank, l) not in proj.P:
                 continue
             P = proj.P[(self.rank, l)]  # (2l+1, D) CPU float64
             if P.shape[-1] != D:
@@ -286,7 +315,12 @@ class PhysicalTensorICTDEmbedding(nn.Module):
         device = tensor.device
 
         if self.input_repr == "cartesian":
-            t = self._to_monomial_coeffs(tensor)  # (..., Cin, Dsym)
+            tensor_for_trace = tensor
+            if self.rank == 2 and self.rank2_mode == "full":
+                if tensor.shape[-1:] == (9,):
+                    tensor_for_trace = tensor.reshape(*tensor.shape[:-1], 3, 3)
+                tensor_for_trace = 0.5 * (tensor_for_trace + tensor_for_trace.transpose(-1, -2))
+            t = self._to_monomial_coeffs(tensor_for_trace)  # (..., Cin, Dsym)
         else:
             t = self._ensure_channel_dim_monomial(tensor)
             D = sym_dim(self.rank)
@@ -302,6 +336,25 @@ class PhysicalTensorICTDEmbedding(nn.Module):
 
         out_blocks: dict[int, torch.Tensor] = {}
         batch_shape = t.shape[:-2]
+        antisym_block = None
+        if self.rank == 2 and self.rank2_mode == "full":
+            if self.input_repr != "cartesian":
+                raise ValueError("rank2_mode='full' currently requires input_repr='cartesian'")
+            T = tensor.to(dtype=compute_dtype) if tensor.dtype != compute_dtype else tensor
+            if T.shape[-2:] == (9,):
+                T = T.reshape(*T.shape[:-1], 3, 3)
+            elif T.shape[-2:] == (6,):
+                xx, yy, zz, xy, xz, yz = T.unbind(dim=-1)
+                row0 = torch.stack((xx, xy, xz), dim=-1)
+                row1 = torch.stack((xy, yy, yz), dim=-1)
+                row2 = torch.stack((xz, yz, zz), dim=-1)
+                T = torch.stack((row0, row1, row2), dim=-2)
+            T = self._ensure_channel_dim_cartesian(T)
+            anti = 0.5 * (T - T.transpose(-1, -2))
+            antisym_block = torch.stack(
+                (anti[..., 1, 2], anti[..., 2, 0], anti[..., 0, 1]),
+                dim=-1,
+            )
         for l in range(self.lmax_out + 1):
             if l in P_by_l:
                 P = P_by_l[l]  # (2l+1, Dsym) compute_dtype
@@ -309,6 +362,10 @@ class PhysicalTensorICTDEmbedding(nn.Module):
                 c = torch.einsum("...cd,md->...cm", t_comp, P)
                 c = c.to(dtype=dtype) if c.dtype != dtype else c
                 c = _apply_channel_adapter_per_l(c, self._adapters[str(l)])  # (..., Cout, 2l+1)
+                out_blocks[l] = c
+            elif l == 1 and antisym_block is not None:
+                c = antisym_block.to(dtype=dtype) if antisym_block.dtype != dtype else antisym_block
+                c = _apply_channel_adapter_per_l(c, self._adapters[str(l)])
                 out_blocks[l] = c
             else:
                 out_blocks[l] = torch.zeros(*batch_shape, self.channels_out, 2 * l + 1, device=device, dtype=dtype)
@@ -341,6 +398,7 @@ class PhysicalTensorICTDRecovery(nn.Module):
         channels_in: int = 1,
         lmax_in: int | None = None,
         include_trace_chain: bool = True,
+        rank2_mode: str = "symmetric",
         internal_compute_dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
@@ -348,6 +406,7 @@ class PhysicalTensorICTDRecovery(nn.Module):
         self.channels_in = int(channels_in)
         self.lmax_in = int(lmax_in) if lmax_in is not None else int(rank)
         self.include_trace_chain = bool(include_trace_chain)
+        self.rank2_mode = str(rank2_mode).strip().lower()
         self.internal_compute_dtype = internal_compute_dtype
 
         if self.rank < 0:
@@ -356,8 +415,13 @@ class PhysicalTensorICTDRecovery(nn.Module):
             raise ValueError(f"channels_in must be positive, got {self.channels_in}")
         if self.lmax_in < 0:
             raise ValueError(f"lmax_in must be >= 0, got {self.lmax_in}")
+        if self.rank2_mode not in ("symmetric", "full"):
+            raise ValueError(f"rank2_mode must be 'symmetric' or 'full', got {self.rank2_mode!r}")
+        if self.rank != 2 and self.rank2_mode != "symmetric":
+            raise ValueError("rank2_mode='full' is only supported for rank=2")
 
         self._recon_cache: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
+        self._antisym_cache: dict[tuple[str, str], torch.Tensor] = {}
 
     def _get_reconstructors(self, device: torch.device, dtype: torch.dtype) -> dict[int, torch.Tensor]:
         compute_dtype = self.internal_compute_dtype
@@ -392,6 +456,16 @@ class PhysicalTensorICTDRecovery(nn.Module):
             f"Expected channels_in={self.channels_in} at dim -2 for l={l} block, got shape={tuple(blk.shape)}"
         )
 
+    def _get_rank2_antisymmetric_basis(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._antisym_cache.get(key)
+        if cached is not None:
+            return cached
+        basis = _rank2_antisymmetric_basis().to(device=device, dtype=compute_dtype).contiguous()
+        self._antisym_cache[key] = basis
+        return basis
+
     def _to_monomial_coeffs(self, blocks: dict[int, torch.Tensor]) -> torch.Tensor:
         device = next(iter(blocks.values())).device
         dtype = next(iter(blocks.values())).dtype
@@ -425,6 +499,8 @@ class PhysicalTensorICTDRecovery(nn.Module):
             vals = (t[..., d] / coefs[d]).unsqueeze(-1).expand(*t.shape[:-1], idxs.numel())
             idxs = idxs.view(*([1] * (flat.dim() - 1)), idxs.numel()).expand(*t.shape[:-1], idxs.numel())
             flat.scatter_(-1, idxs, vals)
+        if self.rank == 2 and self.rank2_mode == "full":
+            return flat
         out = flat.reshape(*t.shape[:-1], *([3] * self.rank))
         if squeeze_channel and self.channels_in == 1:
             out = out.squeeze(-self.rank - 1)
@@ -464,6 +540,23 @@ class PhysicalTensorICTDRecovery(nn.Module):
         t = self._to_monomial_coeffs(blocks_dict)
         if return_monomial:
             return t.squeeze(-2) if squeeze_channel and self.channels_in == 1 else t
+        if self.rank == 2 and self.rank2_mode == "full":
+            device = t.device
+            dtype = t.dtype
+            flat = self._monomial_to_cartesian(t, squeeze_channel=False)
+            out = flat.reshape(*t.shape[:-2], self.channels_in, 3, 3)
+            blk1 = blocks_dict.get(1)
+            if blk1 is not None:
+                blk1 = self._ensure_channel_dim_blocks(blk1, 1)
+                blk1_comp = blk1.to(dtype=self.internal_compute_dtype) if blk1.dtype != self.internal_compute_dtype else blk1
+                basis = self._get_rank2_antisymmetric_basis(device=device, dtype=dtype)
+                anti_flat = torch.einsum("...cm,mn->...cn", blk1_comp, basis)
+                anti = anti_flat.reshape(*blk1.shape[:-2], self.channels_in, 3, 3)
+                anti = anti.to(dtype=dtype) if anti.dtype != dtype else anti
+                out = out + anti
+            if squeeze_channel and self.channels_in == 1:
+                out = out.squeeze(-3)
+            return out
         return self._monomial_to_cartesian(t, squeeze_channel=squeeze_channel)
 
 def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, channels: int, lmax: int) -> torch.Tensor:

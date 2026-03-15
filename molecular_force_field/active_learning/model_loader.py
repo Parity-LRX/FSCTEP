@@ -10,6 +10,7 @@ from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
     infer_physical_tensor_outputs_from_state_dict,
 )
+from molecular_force_field.utils.external_tensor_specs import normalize_external_tensor_specs
 from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
@@ -39,10 +40,22 @@ def build_e3trans_from_checkpoint(
     arch_meta = ckpt.get("model_hyperparameters", {})
 
     external_tensor_rank = ckpt.get("external_tensor_rank")
+    external_tensor_irrep = ckpt.get("external_tensor_irrep", arch_meta.get("external_tensor_irrep"))
+    external_tensor_specs = ckpt.get("external_tensor_specs", arch_meta.get("external_tensor_specs"))
+    num_fidelity_levels = int(arch_meta.get("num_fidelity_levels", 0) or 0)
+    multi_fidelity_mode = str(arch_meta.get("multi_fidelity_mode", "conditioning") or "conditioning")
+    o3_irrep_preset = str(arch_meta.get("o3_irrep_preset", "auto"))
+    o3_active_irreps = arch_meta.get("o3_active_irreps")
     if external_tensor_rank is None:
         state = ckpt.get("e3trans_state_dict", {})
         if "e3_conv_emb.external_tensor_scale_by_l" in state:
             external_tensor_rank = 1
+    external_tensor_specs = normalize_external_tensor_specs(
+        external_tensor_specs,
+        external_tensor_rank=external_tensor_rank,
+        external_tensor_irrep=external_tensor_irrep,
+        external_tensor_parity=None,
+    )
     physical_tensor_outputs = ckpt.get("physical_tensor_outputs")
     if physical_tensor_outputs is None:
         physical_tensor_outputs = arch_meta.get("physical_tensor_outputs")
@@ -221,6 +234,7 @@ def build_e3trans_from_checkpoint(
         PureCartesianSparseTransformerLayer,
         PureCartesianSparseTransformerLayerSave,
         PureCartesianICTDTransformerLayer,
+        PureCartesianICTDO3TransformerLayer,
     )
     from molecular_force_field.models.e3nn_layers_channelwise import (
         E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
@@ -275,6 +289,8 @@ def build_e3trans_from_checkpoint(
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
             feature_spectral_gate_init=feature_spectral_gate_init,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
         )
     elif mode == "partial-cartesian":
         e3trans = CartesianTransformerLayer(**k_cartesian)
@@ -294,6 +310,9 @@ def build_e3trans_from_checkpoint(
             k_policy="k0",
             physical_tensor_outputs=physical_tensor_outputs,
             external_tensor_rank=external_tensor_rank,
+            external_tensor_specs=external_tensor_specs,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
         )
     elif mode == "pure-cartesian-ictd":
         ictd_kwargs = dict(
@@ -303,6 +322,10 @@ def build_e3trans_from_checkpoint(
         )
         if external_tensor_rank is not None:
             ictd_kwargs["external_tensor_rank"] = external_tensor_rank
+        if external_tensor_irrep is not None:
+            ictd_kwargs["external_tensor_irrep"] = external_tensor_irrep
+        if external_tensor_specs is not None:
+            ictd_kwargs["external_tensor_specs"] = external_tensor_specs
         ictd_kwargs["long_range_mode"] = long_range_mode
         ictd_kwargs["long_range_hidden_dim"] = long_range_hidden_dim
         ictd_kwargs["long_range_boundary"] = long_range_boundary
@@ -342,6 +365,30 @@ def build_e3trans_from_checkpoint(
         e3trans = PureCartesianICTDTransformerLayerFull(
             **k_cartesian,
             physical_tensor_outputs=physical_tensor_outputs,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
+            **ictd_kwargs,
+        )
+    elif mode == "pure-cartesian-ictd-o3":
+        ictd_kwargs = dict(
+            ictd_tp_path_policy="full",
+            ictd_tp_max_rank_other=None,
+            internal_compute_dtype=dtype,
+            o3_irrep_preset=o3_irrep_preset,
+            o3_active_irreps=o3_active_irreps,
+        )
+        if external_tensor_rank is not None:
+            ictd_kwargs["external_tensor_rank"] = external_tensor_rank
+        if external_tensor_irrep is not None:
+            ictd_kwargs["external_tensor_irrep"] = external_tensor_irrep
+        if external_tensor_specs is not None:
+            ictd_kwargs["external_tensor_specs"] = external_tensor_specs
+        ictd_kwargs.update(common_long_range_kwargs)
+        e3trans = PureCartesianICTDO3TransformerLayer(
+            **k_cartesian,
+            physical_tensor_outputs=physical_tensor_outputs,
+            num_fidelity_levels=num_fidelity_levels,
+            multi_fidelity_mode=multi_fidelity_mode,
             **ictd_kwargs,
         )
     elif mode == "pure-cartesian-ictd-save":
@@ -356,7 +403,7 @@ def build_e3trans_from_checkpoint(
             f"Unsupported tensor_product_mode: {mode}. "
             "Supported: spherical, spherical-save, spherical-save-cue, "
             "partial-cartesian, partial-cartesian-loose, pure-cartesian, "
-            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-save"
+            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save"
         )
 
     e3trans = e3trans.to(device=device, dtype=dtype)

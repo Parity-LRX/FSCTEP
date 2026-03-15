@@ -14,8 +14,8 @@ namespace mfftorch {
 namespace {
 
 constexpr int64_t kGlobalPhysWidth = 22;
-constexpr int64_t kAtomPhysWidth = 22;
-constexpr int64_t kPhysMaskWidth = 4;
+constexpr int64_t kAtomPhysWidth = 31;
+constexpr int64_t kPhysMaskWidth = 5;
 
 bool parse_bool_from_metadata(const std::string& content, const std::string& key, bool& value) {
   const auto key_pos = content.find(key);
@@ -101,6 +101,13 @@ bool parse_external_tensor_rank_from_metadata(const std::string& meta_path, bool
   return false;
 }
 
+bool parse_external_tensor_irrep_from_metadata(const std::string& meta_path, std::string& irrep) {
+  std::ifstream in(meta_path);
+  if (!in) return false;
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  return parse_string_from_metadata(content, "\"external_tensor_irrep\"", irrep);
+}
+
 bool try_forward_with_external_tensor(torch::jit::script::Module& core,
                                       const torch::Device& device,
                                       const torch::Tensor& cell,
@@ -135,6 +142,17 @@ bool try_forward_with_external_tensor(torch::jit::script::Module& core,
   } catch (...) {
     return false;
   }
+}
+
+bool should_use_flat_external_tensor(
+    int64_t external_tensor_total_numel,
+    bool external_tensor_has_field_1o,
+    bool external_tensor_has_field_1e) {
+  if (external_tensor_total_numel <= 0) return false;
+  const bool has_rank1_field = external_tensor_has_field_1o || external_tensor_has_field_1e;
+  if (!has_rank1_field) return false;
+  if (external_tensor_total_numel == 3) return true;
+  return true;
 }
 
 }  // namespace
@@ -246,6 +264,14 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
   cached_nedges_ = 0;
   core_takes_external_tensor_arg_ = false;
   core_requires_external_tensor_ = false;
+  core_takes_fidelity_arg_ = false;
+  core_requires_runtime_fidelity_ = false;
+  external_tensor_irrep_.clear();
+  external_tensor_total_numel_ = 0;
+  num_fidelity_levels_ = 0;
+  export_fidelity_id_ = -1;
+  external_tensor_has_field_1o_ = false;
+  external_tensor_has_field_1e_ = false;
   core_exports_reciprocal_source_ = false;
   reciprocal_source_channels_ = 0;
   reciprocal_source_boundary_ = "periodic";
@@ -270,9 +296,11 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
     size_t nargs = schema.arguments().size();
     if (nargs > 0 && schema.arguments()[0].name() == "self") nargs -= 1;
     core_takes_external_tensor_arg_ = (nargs >= 9);
+    core_takes_fidelity_arg_ = (nargs >= 10);
   } catch (...) {
     // Keep compatibility with older LibTorch builds that may not expose schema details cleanly.
     core_takes_external_tensor_arg_ = false;
+    core_takes_fidelity_arg_ = false;
   }
 
   auto probe_cell = torch::eye(3, torch::TensorOptions().dtype(torch::kFloat32).device(device_)).unsqueeze(0) * 100.0f;
@@ -299,6 +327,16 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
       (void)parse_double_from_metadata(content, "\"long_range_screening\"", long_range_screening_);
       (void)parse_double_from_metadata(content, "\"long_range_softening\"", long_range_softening_);
       (void)parse_double_from_metadata(content, "\"long_range_energy_scale\"", long_range_energy_scale_);
+      (void)parse_string_from_metadata(content, "\"external_tensor_irrep\"", external_tensor_irrep_);
+      (void)parse_int64_from_metadata(content, "\"external_tensor_total_numel\"", external_tensor_total_numel_);
+      (void)parse_int64_from_metadata(content, "\"num_fidelity_levels\"", num_fidelity_levels_);
+      (void)parse_int64_from_metadata(content, "\"export_fidelity_id\"", export_fidelity_id_);
+      (void)parse_bool_from_metadata(content, "\"external_tensor_has_field_1o\"", external_tensor_has_field_1o_);
+      (void)parse_bool_from_metadata(content, "\"external_tensor_has_field_1e\"", external_tensor_has_field_1e_);
+      bool runtime_fidelity_input = false;
+      if (parse_bool_from_metadata(content, "\"runtime_fidelity_input\"", runtime_fidelity_input)) {
+        core_requires_runtime_fidelity_ = runtime_fidelity_input;
+      }
       if (long_range_source_channels_ <= 0) long_range_source_channels_ = reciprocal_source_channels_;
       if (long_range_runtime_backend_ == "none" && core_exports_reciprocal_source_ && reciprocal_source_channels_ > 0) {
         long_range_runtime_backend_ = "mesh_fft";
@@ -307,6 +345,13 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
   }
   if (core_takes_external_tensor_arg_) {
     bool parsed = parse_external_tensor_rank_from_metadata(core_pt_path + ".json", core_requires_external_tensor_);
+    if (external_tensor_total_numel_ > 0) {
+      core_requires_external_tensor_ = true;
+      parsed = true;
+    }
+    if (external_tensor_irrep_.empty()) {
+      (void)parse_external_tensor_irrep_from_metadata(core_pt_path + ".json", external_tensor_irrep_);
+    }
     if (!parsed) {
       const auto empty_external = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
       const auto rank1_external = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
@@ -321,6 +366,9 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
       }
     }
   }
+  if (num_fidelity_levels_ > 0 && export_fidelity_id_ < 0 && core_takes_fidelity_arg_) {
+    core_requires_runtime_fidelity_ = true;
+  }
 }
 
 void MFFTorchEngine::warmup(int64_t N, int64_t E) {
@@ -333,29 +381,57 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   auto edge_shifts = torch::zeros({E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
   auto cell = torch::eye(3, torch::TensorOptions().dtype(torch::kFloat32).device(device_)).unsqueeze(0) * 100.0f;
   std::vector<torch::Tensor> warmup_external_tensors;
+  std::vector<torch::Tensor> warmup_fidelity_tensors;
   if (core_takes_external_tensor_arg_) {
     warmup_external_tensors.push_back(
         torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
-    warmup_external_tensors.push_back(
-        torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
-    warmup_external_tensors.push_back(
-        torch::zeros({3, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
+    if (external_tensor_total_numel_ > 0) {
+      if (should_use_flat_external_tensor(
+              external_tensor_total_numel_, external_tensor_has_field_1o_, external_tensor_has_field_1e_)) {
+        warmup_external_tensors.push_back(
+            torch::zeros({external_tensor_total_numel_}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
+      } else if (external_tensor_total_numel_ == 9) {
+        warmup_external_tensors.push_back(
+            torch::zeros({3, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
+      } else {
+        warmup_external_tensors.push_back(
+            torch::zeros({external_tensor_total_numel_}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
+      }
+    } else {
+      warmup_external_tensors.push_back(
+          torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
+      warmup_external_tensors.push_back(
+          torch::zeros({3, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
+    }
   } else {
     warmup_external_tensors.push_back(
         torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(device_)));
   }
+  if (core_takes_fidelity_arg_) {
+    warmup_fidelity_tensors.push_back(
+        torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt64).device(device_)));
+    if (num_fidelity_levels_ > 1) {
+      warmup_fidelity_tensors.push_back(
+          torch::full({1}, 1, torch::TensorOptions().dtype(torch::kInt64).device(device_)));
+    }
+  } else {
+    warmup_fidelity_tensors.push_back(torch::Tensor());
+  }
 
   bool warmed = false;
   for (const auto& external_tensor : warmup_external_tensors) {
-    try {
-      for (int i = 0; i < 3; i++) {
-        compute(N, N, pos, A, edge_src, edge_dst, edge_shifts, cell, external_tensor, false);
+    for (const auto& fidelity_ids : warmup_fidelity_tensors) {
+      try {
+        for (int i = 0; i < 3; i++) {
+          compute(N, N, pos, A, edge_src, edge_dst, edge_shifts, cell, external_tensor, fidelity_ids, false);
+        }
+        warmed = true;
+        break;
+      } catch (...) {
+        // Try the next candidate tensor shape.
       }
-      warmed = true;
-      break;
-    } catch (...) {
-      // Try the next candidate external tensor shape.
     }
+    if (warmed) break;
   }
   if (!warmed) throw std::runtime_error("MFFTorchEngine warmup failed for all supported external tensor shapes");
   if (device_.is_cuda()) torch::cuda::synchronize();
@@ -369,6 +445,7 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
                                   const torch::Tensor& edge_shifts_in,
                                   const torch::Tensor& cell_in,
                                   const torch::Tensor& external_tensor_in,
+                                  const torch::Tensor& fidelity_ids_in,
                                   bool need_energy,
                                   bool need_atom_virial) {
   if (!loaded_) throw std::runtime_error("MFFTorchEngine not loaded");
@@ -396,13 +473,19 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
     }
     if (!external_tensor_in.defined() || external_tensor_in.numel() == 0) {
       external_tensor = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
-    } else if (external_tensor_in.numel() != 3 && external_tensor_in.numel() != 9) {
+    } else if (external_tensor_total_numel_ > 0 && external_tensor_in.numel() != external_tensor_total_numel_) {
+      throw std::runtime_error(
+          "USER-MFFTORCH external_tensor length does not match core.pt metadata");
+    } else if (external_tensor_total_numel_ == 0 && external_tensor_in.numel() != 3 && external_tensor_in.numel() != 9) {
       throw std::runtime_error(
           "USER-MFFTORCH currently supports rank-1 (3 values) and rank-2 (9 values) external tensors only");
-    } else if (external_tensor_in.numel() == 3) {
+    } else if (
+        should_use_flat_external_tensor(
+            external_tensor_total_numel_, external_tensor_has_field_1o_, external_tensor_has_field_1e_) ||
+        (external_tensor_total_numel_ == 0 && external_tensor_in.numel() == 3)) {
       external_tensor = (external_tensor_in.device() == device_ && external_tensor_in.dtype() == torch::kFloat32)
-                            ? external_tensor_in.reshape({3})
-                            : external_tensor_in.to(device_, torch::kFloat32).reshape({3});
+                            ? external_tensor_in.reshape({external_tensor_in.numel()})
+                            : external_tensor_in.to(device_, torch::kFloat32).reshape({external_tensor_in.numel()});
     } else {
       external_tensor = (external_tensor_in.device() == device_ && external_tensor_in.dtype() == torch::kFloat32)
                             ? external_tensor_in.reshape({3, 3})
@@ -413,6 +496,37 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
       throw std::runtime_error(
           "pair_style mff/torch received an external field, but core.pt does not accept external_tensor");
     }
+  }
+  torch::Tensor fidelity_ids;
+  if (core_takes_fidelity_arg_) {
+    if (core_requires_runtime_fidelity_ && (!fidelity_ids_in.defined() || fidelity_ids_in.numel() == 0)) {
+      throw std::runtime_error(
+          "TorchScript core expects fidelity_ids, but pair_style mff/torch did not provide fidelity");
+    }
+    if (!fidelity_ids_in.defined() || fidelity_ids_in.numel() == 0) {
+      const int64_t graph_count = cell.size(0);
+      const int64_t fallback_fid = export_fidelity_id_ >= 0 ? export_fidelity_id_ : 0;
+      fidelity_ids = torch::full({graph_count},
+                                 fallback_fid,
+                                 torch::TensorOptions().dtype(torch::kInt64).device(device_));
+    } else {
+      fidelity_ids = (fidelity_ids_in.device() == device_ && fidelity_ids_in.dtype() == torch::kInt64)
+                         ? fidelity_ids_in.reshape({fidelity_ids_in.numel()})
+                         : fidelity_ids_in.to(device_, torch::kInt64).reshape({fidelity_ids_in.numel()});
+      const int64_t graph_count = cell.size(0);
+      if (fidelity_ids.numel() != graph_count) {
+        throw std::runtime_error("USER-MFFTORCH fidelity_ids length does not match number of graphs");
+      }
+      if (num_fidelity_levels_ > 0) {
+        auto min_id = fidelity_ids.min().item<int64_t>();
+        auto max_id = fidelity_ids.max().item<int64_t>();
+        if (min_id < 0 || max_id >= num_fidelity_levels_) {
+          throw std::runtime_error("USER-MFFTORCH fidelity_ids value is out of range for core.pt metadata");
+        }
+      }
+    }
+  } else if (fidelity_ids_in.defined() && fidelity_ids_in.numel() > 0) {
+    throw std::runtime_error("pair_style mff/torch received fidelity input, but core.pt does not accept fidelity_ids");
   }
 
   if (cached_ntotal_ != ntotal) {
@@ -440,7 +554,7 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   auto edge_vec = pos.index_select(0, edge_dst) - pos.index_select(0, edge_src) + shift_leaf;
 
   std::vector<torch::jit::IValue> inputs;
-  inputs.reserve(core_takes_external_tensor_arg_ ? 9 : 8);
+  inputs.reserve((core_takes_external_tensor_arg_ ? 1 : 0) + (core_takes_fidelity_arg_ ? 10 : 8));
   inputs.push_back(pos);
   inputs.push_back(A);
   inputs.push_back(buf_batch_);
@@ -450,6 +564,7 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   inputs.push_back(cell);
   inputs.push_back(edge_vec);
   if (core_takes_external_tensor_arg_) inputs.push_back(external_tensor);
+  if (core_takes_fidelity_arg_) inputs.push_back(fidelity_ids);
 
   auto core_out = core_.forward(inputs);
   torch::Tensor atom_e;
@@ -478,13 +593,13 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
       throw std::runtime_error("TorchScript core global_phys last dim must be 22");
     }
     if (atom_phys.defined() && atom_phys.numel() > 0 && atom_phys.size(-1) != kAtomPhysWidth) {
-      throw std::runtime_error("TorchScript core atom_phys last dim must be 22");
+      throw std::runtime_error("TorchScript core atom_phys last dim must be 31");
     }
     if (global_phys_mask.defined() && global_phys_mask.numel() > 0 && global_phys_mask.numel() != kPhysMaskWidth) {
-      throw std::runtime_error("TorchScript core global_phys_mask dim must be 4");
+      throw std::runtime_error("TorchScript core global_phys_mask dim must be 5");
     }
     if (atom_phys_mask.defined() && atom_phys_mask.numel() > 0 && atom_phys_mask.numel() != kPhysMaskWidth) {
-      throw std::runtime_error("TorchScript core atom_phys_mask dim must be 4");
+      throw std::runtime_error("TorchScript core atom_phys_mask dim must be 5");
     }
   } else {
     throw std::runtime_error("TorchScript core returned unsupported type (expected Tensor or tuple)");

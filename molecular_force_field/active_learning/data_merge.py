@@ -89,8 +89,9 @@ def external_field_tensor_shape(n_values: int) -> tuple:
 def _inject_external_field_into_h5(
     h5_path: str,
     external_field: list,
+    dataset_name: str = "external_field",
 ) -> None:
-    """Write a uniform external_field into every sample of an H5 file.
+    """Write a uniform external field tensor into every sample of an H5 file.
 
     The value is reshaped according to :func:`external_field_tensor_shape`
     (e.g. 3 values → ``(3,)`` for rank-1, 9 values → ``(3,3)`` for rank-2).
@@ -101,10 +102,10 @@ def _inject_external_field_into_h5(
     with h5py.File(h5_path, "a") as f:
         for key in f.keys():
             if key.startswith("sample_"):
-                if "external_field" in f[key]:
-                    del f[key]["external_field"]
-                f[key].create_dataset("external_field", data=field)
-    logger.info(f"Injected external_field shape={shape} into {h5_path}")
+                if dataset_name in f[key]:
+                    del f[key][dataset_name]
+                f[key].create_dataset(dataset_name, data=field)
+    logger.info(f"Injected {dataset_name} shape={shape} into {h5_path}")
 
 
 def merge_training_data(
