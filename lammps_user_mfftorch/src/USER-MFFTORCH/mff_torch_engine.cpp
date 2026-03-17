@@ -1,6 +1,7 @@
 #include "mff_torch_engine.h"
 
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <fstream>
@@ -369,10 +370,26 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
   if (num_fidelity_levels_ > 0 && export_fidelity_id_ < 0 && core_takes_fidelity_arg_) {
     core_requires_runtime_fidelity_ = true;
   }
+
+  // CUDA Graph replay (opt-in via MFF_CUDA_GRAPH=1).
+  use_cuda_graph_ = false;
+#if MFF_HAS_CUDA_GRAPH
+  if (device_.is_cuda()) {
+    const char* env = std::getenv("MFF_CUDA_GRAPH");
+    if (env && (std::string(env) == "1" || std::string(env) == "true" || std::string(env) == "yes")) {
+      use_cuda_graph_ = true;
+    }
+  }
+#endif
 }
 
 void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   if (!loaded_) return;
+
+  // Suspend CUDA Graph during warmup — Kokkos background ops (cudaFreeHost
+  // etc.) are incompatible with CUDA stream capture.
+  const bool saved_cuda_graph = use_cuda_graph_;
+  use_cuda_graph_ = false;
 
   auto pos = torch::zeros({N, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
   auto A = torch::ones({N}, torch::TensorOptions().dtype(torch::kInt64).device(device_));
@@ -435,8 +452,10 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   }
   if (!warmed) throw std::runtime_error("MFFTorchEngine warmup failed for all supported external tensor shapes");
   if (device_.is_cuda()) torch::cuda::synchronize();
+  use_cuda_graph_ = saved_cuda_graph;
 }
 
+// Core forward+backward logic shared by eager and CUDA-graph paths.
 MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
                                   const torch::Tensor& pos_in,
                                   const torch::Tensor& A_in,
@@ -536,14 +555,208 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   }
   cached_nedges_ = nedges;
 
-  auto pos = pos0.clone().detach().requires_grad_(true);
-  auto edge_batch = buf_batch_.index_select(0, edge_src);
-  auto edge_cells = cell.index_select(0, edge_batch);
-  auto shift_vec = torch::einsum("ni,nij->nj", {edge_shifts, edge_cells});
+#if MFF_HAS_CUDA_GRAPH
+  if (use_cuda_graph_ && device_.is_cuda()) {
+    return compute_with_cuda_graph(nlocal, ntotal, pos0, A, edge_src, edge_dst,
+                                  edge_shifts, cell, external_tensor, fidelity_ids,
+                                  need_energy, need_atom_virial);
+  }
+#endif
 
-  // When per-atom virial is requested, also differentiate w.r.t. the periodic
-  // edge offset. This yields edge forces without losing the real-space position
-  // dependence needed by future long-range modules.
+  return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
+                              external_tensor, fidelity_ids,
+                              nlocal, ntotal, need_energy, need_atom_virial);
+}
+
+#if MFF_HAS_CUDA_GRAPH
+MFFOutputs MFFTorchEngine::compute_with_cuda_graph(
+    int64_t nlocal, int64_t ntotal,
+    const torch::Tensor& pos0, const torch::Tensor& A,
+    const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+    const torch::Tensor& edge_shifts, const torch::Tensor& cell,
+    const torch::Tensor& external_tensor, const torch::Tensor& fidelity_ids,
+    bool need_energy, bool need_atom_virial) {
+
+  const int64_t nedges = edge_src.size(0);
+  const bool can_replay =
+      cg_cache_.valid &&
+      cg_cache_.ntotal == ntotal &&
+      cg_cache_.nedges == nedges &&
+      cg_cache_.nlocal == nlocal &&
+      cg_cache_.need_atom_virial == need_atom_virial;
+
+  if (can_replay) {
+    // Overwrite pre-allocated input buffers with new step data, then replay.
+    c10::cuda::CUDAStreamGuard guard(cg_cache_.capture_stream);
+    cg_cache_.pos_in.copy_(pos0);
+    cg_cache_.A_in.copy_(A);
+    cg_cache_.edge_src_in.copy_(edge_src);
+    cg_cache_.edge_dst_in.copy_(edge_dst);
+    cg_cache_.edge_shifts_in.copy_(edge_shifts);
+    cg_cache_.cell_in.copy_(cell);
+    if (external_tensor.defined() && external_tensor.numel() > 0 && cg_cache_.external_tensor_in.defined()) {
+      cg_cache_.external_tensor_in.copy_(external_tensor);
+    }
+    if (fidelity_ids.defined() && fidelity_ids.numel() > 0 && cg_cache_.fidelity_ids_in.defined()) {
+      cg_cache_.fidelity_ids_in.copy_(fidelity_ids);
+    }
+    cg_cache_.graph.replay();
+    cg_cache_.capture_stream.synchronize();
+
+    MFFOutputs out;
+    out.forces = cg_cache_.forces_out;
+    out.atom_energy = cg_cache_.atom_e_out;
+    out.global_phys = cg_cache_.global_phys_out;
+    out.atom_phys = cg_cache_.atom_phys_out;
+    out.global_phys_mask = cg_cache_.global_phys_mask_out;
+    out.atom_phys_mask = cg_cache_.atom_phys_mask_out;
+    out.reciprocal_source = cg_cache_.reciprocal_source_out;
+    out.atom_virial = cg_cache_.atom_vir_out;
+    if (need_energy) {
+      out.energy = cg_cache_.E_local_out.detach().to(torch::kCPU).item<double>();
+    }
+    return out;
+  }
+
+  // Sizes changed or first call — attempt to capture a new graph.
+  capture_cuda_graph(nlocal, ntotal, nedges, need_atom_virial);
+
+  if (!cg_cache_.valid) {
+    // Capture failed; use_cuda_graph_ was already turned off.
+    // Fall through to eager path.
+    return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
+                                external_tensor, fidelity_ids,
+                                nlocal, ntotal, need_energy, need_atom_virial);
+  }
+
+  // The capture run produced valid results; return them directly.
+  MFFOutputs out;
+  out.forces = cg_cache_.forces_out;
+  out.atom_energy = cg_cache_.atom_e_out;
+  out.global_phys = cg_cache_.global_phys_out;
+  out.atom_phys = cg_cache_.atom_phys_out;
+  out.global_phys_mask = cg_cache_.global_phys_mask_out;
+  out.atom_phys_mask = cg_cache_.atom_phys_mask_out;
+  out.reciprocal_source = cg_cache_.reciprocal_source_out;
+  out.atom_virial = cg_cache_.atom_vir_out;
+  if (need_energy) {
+    out.energy = cg_cache_.E_local_out.detach().to(torch::kCPU).item<double>();
+  }
+  return out;
+}
+
+void MFFTorchEngine::capture_cuda_graph(
+    int64_t nlocal, int64_t ntotal, int64_t nedges,
+    bool need_atom_virial) {
+  cg_cache_.valid = false;
+
+  // Allocate static input buffers on the engine device.
+  auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+  auto iopt = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+  cg_cache_.pos_in = torch::zeros({ntotal, 3}, fopt);
+  cg_cache_.A_in = torch::ones({ntotal}, iopt);
+  cg_cache_.edge_src_in = torch::zeros({nedges}, iopt);
+  cg_cache_.edge_dst_in = torch::zeros({nedges}, iopt);
+  cg_cache_.edge_shifts_in = torch::zeros({nedges, 3}, fopt);
+  cg_cache_.cell_in = torch::eye(3, fopt).unsqueeze(0) * 100.0f;
+  if (core_takes_external_tensor_arg_) {
+    if (external_tensor_total_numel_ > 0) {
+      cg_cache_.external_tensor_in = torch::zeros({external_tensor_total_numel_}, fopt);
+    } else {
+      cg_cache_.external_tensor_in = torch::empty({0}, fopt);
+    }
+  }
+  if (core_takes_fidelity_arg_) {
+    cg_cache_.fidelity_ids_in = torch::zeros({1}, iopt);
+  }
+
+  // Warmup run (populates CUDA caching allocator and JIT caches).
+  // Must run with grad enabled so autograd kernels are exercised.
+  try {
+    run_forward_backward(cg_cache_.pos_in, cg_cache_.A_in,
+                         cg_cache_.edge_src_in, cg_cache_.edge_dst_in,
+                         cg_cache_.edge_shifts_in, cg_cache_.cell_in,
+                         cg_cache_.external_tensor_in, cg_cache_.fidelity_ids_in,
+                         nlocal, ntotal, false, need_atom_virial);
+  } catch (...) {
+    // Warmup may fail for degenerate inputs; proceed to capture.
+  }
+  if (device_.is_cuda()) torch::cuda::synchronize();
+
+  // Drain all GPU work from every stream before capture.  Kokkos background
+  // ops (cudaFreeHost, etc.) are globally illegal during stream capture.
+  torch::cuda::synchronize();
+
+  // Capture the graph on a dedicated non-default stream.
+  cg_cache_.capture_stream = c10::cuda::getStreamFromPool(false, device_.index());
+  try {
+    c10::cuda::CUDAStreamGuard guard(cg_cache_.capture_stream);
+    cg_cache_.graph.capture_begin();
+
+    auto result = run_forward_backward(
+        cg_cache_.pos_in, cg_cache_.A_in,
+        cg_cache_.edge_src_in, cg_cache_.edge_dst_in,
+        cg_cache_.edge_shifts_in, cg_cache_.cell_in,
+        cg_cache_.external_tensor_in, cg_cache_.fidelity_ids_in,
+        nlocal, ntotal, true, need_atom_virial);
+
+    cg_cache_.forces_out = result.forces;
+    cg_cache_.atom_e_out = result.atom_energy;
+    cg_cache_.E_local_out = torch::zeros({1}, fopt);
+    cg_cache_.global_phys_out = result.global_phys;
+    cg_cache_.atom_phys_out = result.atom_phys;
+    cg_cache_.global_phys_mask_out = result.global_phys_mask;
+    cg_cache_.atom_phys_mask_out = result.atom_phys_mask;
+    cg_cache_.reciprocal_source_out = result.reciprocal_source;
+    cg_cache_.atom_vir_out = result.atom_virial;
+
+    auto atom_e_flat = result.atom_energy.view({result.atom_energy.size(0)});
+    cg_cache_.E_local_out = atom_e_flat.narrow(0, 0, nlocal).sum();
+
+    cg_cache_.graph.capture_end();
+    cg_cache_.capture_stream.synchronize();
+
+    cg_cache_.ntotal = ntotal;
+    cg_cache_.nedges = nedges;
+    cg_cache_.nlocal = nlocal;
+    cg_cache_.need_atom_virial = need_atom_virial;
+    cg_cache_.valid = true;
+  } catch (const std::exception& e) {
+    // Capture failed (Kokkos conflict, unsupported op, etc.) — fall back
+    // to eager mode permanently for this run.
+    use_cuda_graph_ = false;
+    cg_cache_.valid = false;
+    fprintf(stderr, "[MFFTorchEngine] CUDA Graph capture failed: %s\n"
+                    "[MFFTorchEngine] Falling back to eager mode.\n", e.what());
+  } catch (...) {
+    use_cuda_graph_ = false;
+    cg_cache_.valid = false;
+    fprintf(stderr, "[MFFTorchEngine] CUDA Graph capture failed (unknown error), "
+                    "falling back to eager mode.\n");
+  }
+}
+#endif  // MFF_HAS_CUDA_GRAPH
+
+MFFOutputs MFFTorchEngine::run_forward_backward(
+    const torch::Tensor& pos0, const torch::Tensor& A,
+    const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+    const torch::Tensor& edge_shifts, const torch::Tensor& cell,
+    const torch::Tensor& external_tensor, const torch::Tensor& fidelity_ids,
+    int64_t nlocal, int64_t ntotal, bool need_energy, bool need_atom_virial) {
+
+  auto pos = pos0.clone().detach().requires_grad_(true);
+
+  // In MD there is always a single graph (cell is [1,3,3], batch is all-zero).
+  // Use a single matmul instead of 2× index_select + einsum (saves 2 kernel launches).
+  torch::Tensor shift_vec;
+  if (cell.size(0) == 1) {
+    shift_vec = torch::mm(edge_shifts, cell.squeeze(0));
+  } else {
+    auto edge_batch = buf_batch_.index_select(0, edge_src);
+    auto edge_cells = cell.index_select(0, edge_batch);
+    shift_vec = torch::einsum("ni,nij->nj", {edge_shifts, edge_cells});
+  }
+
   torch::Tensor shift_leaf;
   if (need_atom_virial) {
     shift_leaf = shift_vec.clone().detach().requires_grad_(true);
@@ -607,7 +820,6 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   auto atom_e_flat = atom_e.view({atom_e.size(0)});
   auto E_local = atom_e_flat.narrow(0, 0, nlocal).sum();
 
-  // Differentiate w.r.t. pos (forces) and optionally shift_leaf (edge forces).
   std::vector<torch::Tensor> grad_inputs = {pos};
   if (need_atom_virial) grad_inputs.push_back(shift_leaf);
 
@@ -625,12 +837,9 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   out.reciprocal_source = reciprocal_source;
 
   if (need_atom_virial && grads.size() > 1 && grads[1].defined()) {
-    auto edge_forces = -grads[1];  // [nedges, 3]
+    auto edge_forces = -grads[1];
 
-    // Per-edge virial in Voigt order (LAMMPS convention):
-    //   v = del ⊗ f_on_src,  where del = x[src]-x[dst] = -rij,  f_on_src = -edge_forces
-    //   v = (-rij) ⊗ (-edge_forces) = rij ⊗ edge_forces
-    auto r0 = edge_vec.select(1, 0);  // [E]
+    auto r0 = edge_vec.select(1, 0);
     auto r1 = edge_vec.select(1, 1);
     auto r2 = edge_vec.select(1, 2);
     auto f0 = edge_forces.select(1, 0);
@@ -638,15 +847,14 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
     auto f2 = edge_forces.select(1, 2);
 
     auto edge_vir = torch::stack({
-        r0 * f0,  // xx
-        r1 * f1,  // yy
-        r2 * f2,  // zz
-        r0 * f1,  // xy
-        r0 * f2,  // xz
-        r1 * f2,  // yz
-    }, 1);  // [nedges, 6]
+        r0 * f0,
+        r1 * f1,
+        r2 * f2,
+        r0 * f1,
+        r0 * f2,
+        r1 * f2,
+    }, 1);
 
-    // Scatter half to each endpoint (gauge-invariant split).
     auto atom_vir = torch::zeros({ntotal, 6}, edge_vir.options());
     auto half_vir = 0.5f * edge_vir;
     auto src_idx = edge_src.unsqueeze(1).expand_as(half_vir);

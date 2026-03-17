@@ -48,6 +48,10 @@ class PairMFFTorchKokkos : public PairMFFTorch {
   torch::Tensor buf_edge_shifts_;
   torch::Tensor buf_pos_;
   torch::Tensor buf_type_idx_;
+
+  // Cached Kokkos views to avoid per-step GPU allocation.
+  int cached_inum_ = 0;
+  Kokkos::View<int64_t *, DeviceType> cached_d_offsets_;
 };
 
 }  // namespace LAMMPS_NS

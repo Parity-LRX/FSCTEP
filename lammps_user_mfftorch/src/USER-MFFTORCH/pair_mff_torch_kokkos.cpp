@@ -164,6 +164,9 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
         tree_fmm_solver_->set_config(cfg);
       }
       validate_external_field_configuration();
+      // Kokkos memory management (cudaFreeHost) is globally incompatible
+      // with CUDA stream capture, so CUDA Graph must be disabled here.
+      engine_->set_use_cuda_graph(false);
       engine_loaded_ = true;
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("Failed to load TorchScript core: ") + e.what()).c_str());
@@ -268,8 +271,12 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   Kokkos::fence();
   if (Etotal <= 1) return;
 
-  // Exclusive-scan offsets on device using parallel_scan.
-  Kokkos::View<int64_t *, DeviceType> d_offsets("mfftorch::offsets", inum);
+  // Exclusive-scan offsets on device; reuse cached view when inum unchanged.
+  if (cached_inum_ != inum) {
+    cached_d_offsets_ = Kokkos::View<int64_t *, DeviceType>("mfftorch::offsets", inum);
+    cached_inum_ = inum;
+  }
+  auto d_offsets = cached_d_offsets_;
   Kokkos::parallel_scan(
       "mfftorch::scan_offsets", inum,
       KOKKOS_LAMBDA(const int ii, int64_t &update, const bool is_final) {

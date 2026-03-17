@@ -7,6 +7,13 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 
+#if __has_include(<ATen/cuda/CUDAGraph.h>)
+#include <ATen/cuda/CUDAGraph.h>
+#define MFF_HAS_CUDA_GRAPH 1
+#else
+#define MFF_HAS_CUDA_GRAPH 0
+#endif
+
 namespace mfftorch {
 
 struct MFFOutputs {
@@ -32,6 +39,7 @@ class MFFTorchEngine {
 
   const torch::Device& device() const { return device_; }
   bool is_cuda() const { return device_.is_cuda(); }
+  void set_use_cuda_graph(bool enable) { use_cuda_graph_ = enable; }
   bool accepts_external_tensor() const { return core_requires_external_tensor_; }
   const std::string& external_tensor_irrep() const { return external_tensor_irrep_; }
   int64_t external_tensor_total_numel() const { return external_tensor_total_numel_; }
@@ -110,6 +118,66 @@ class MFFTorchEngine {
   int64_t cached_ntotal_ = 0;
   int64_t cached_nedges_ = 0;
   torch::Tensor buf_batch_;
+
+  // Cached intermediate buffers to avoid per-step allocation in compute().
+  torch::Tensor buf_edge_shifts_fp32_;
+
+  // CUDA Graph replay support (MFF_CUDA_GRAPH=1 to enable).
+  bool use_cuda_graph_ = false;
+#if MFF_HAS_CUDA_GRAPH
+  struct CUDAGraphCache {
+    bool valid = false;
+    int64_t ntotal = 0;
+    int64_t nedges = 0;
+    int64_t nlocal = 0;
+    bool need_atom_virial = false;
+
+    // Pre-allocated input buffers whose data is overwritten each step.
+    torch::Tensor pos_in;
+    torch::Tensor A_in;
+    torch::Tensor edge_src_in;
+    torch::Tensor edge_dst_in;
+    torch::Tensor edge_shifts_in;
+    torch::Tensor cell_in;
+    torch::Tensor external_tensor_in;
+    torch::Tensor fidelity_ids_in;
+
+    // Captured output references (addresses fixed across replays).
+    torch::Tensor forces_out;
+    torch::Tensor atom_e_out;
+    torch::Tensor E_local_out;
+    torch::Tensor global_phys_out;
+    torch::Tensor atom_phys_out;
+    torch::Tensor global_phys_mask_out;
+    torch::Tensor atom_phys_mask_out;
+    torch::Tensor reciprocal_source_out;
+    torch::Tensor atom_vir_out;
+    torch::Tensor shift_leaf_out;
+
+    at::cuda::CUDAGraph graph;
+    c10::cuda::CUDAStream capture_stream{c10::cuda::getStreamFromPool()};
+  };
+  CUDAGraphCache cg_cache_;
+
+  MFFOutputs compute_with_cuda_graph(
+      int64_t nlocal, int64_t ntotal,
+      const torch::Tensor& pos, const torch::Tensor& A,
+      const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+      const torch::Tensor& edge_shifts, const torch::Tensor& cell,
+      const torch::Tensor& external_tensor, const torch::Tensor& fidelity_ids,
+      bool need_energy, bool need_atom_virial);
+
+  void capture_cuda_graph(
+      int64_t nlocal, int64_t ntotal, int64_t nedges,
+      bool need_atom_virial);
+#endif
+
+  MFFOutputs run_forward_backward(
+      const torch::Tensor& pos0, const torch::Tensor& A,
+      const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+      const torch::Tensor& edge_shifts, const torch::Tensor& cell,
+      const torch::Tensor& external_tensor, const torch::Tensor& fidelity_ids,
+      int64_t nlocal, int64_t ntotal, bool need_energy, bool need_atom_virial);
 };
 
 }  // namespace mfftorch

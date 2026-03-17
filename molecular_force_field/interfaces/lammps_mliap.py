@@ -1548,6 +1548,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             device = torch.device("cpu")
         self.device = device
         self.wrapper = self.wrapper.to(device)
+        self._elem_to_Z = self._elem_to_Z.to(device)
 
         # Optional: torch.compile for 2-5x speedup (PyTorch 2.0+)
         if os.environ.get("MLIAP_USE_COMPILE", "").lower() in ("1", "true", "yes"):

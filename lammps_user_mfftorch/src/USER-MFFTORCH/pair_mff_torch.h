@@ -82,6 +82,23 @@ class PairMFFTorch : public Pair {
   std::unique_ptr<mfftorch::MFFReciprocalSolver> reciprocal_solver_;
   std::unique_ptr<mfftorch::MFFTreeFmmSolver> tree_fmm_solver_;
   bool engine_loaded_ = false;
+
+  // Persistent per-step CPU buffers (avoid repeated heap allocation).
+  std::vector<int64_t> buf_A_cpu_;
+  std::vector<float> buf_pos_cpu_;
+  std::vector<int64_t> buf_edge_src_cpu_;
+  std::vector<int64_t> buf_edge_dst_cpu_;
+  std::vector<float> buf_edge_shifts_cpu_;
+
+  // Persistent torch tensors (avoid from_blob().clone() every step).
+  int64_t cached_compute_ntotal_ = 0;
+  int64_t cached_compute_nedges_ = 0;
+  torch::Tensor cached_pos_t_;
+  torch::Tensor cached_A_t_;
+  torch::Tensor cached_edge_src_t_;
+  torch::Tensor cached_edge_dst_t_;
+  torch::Tensor cached_edge_shifts_t_;
+  torch::Tensor cached_cell_t_;
 };
 
 }  // namespace LAMMPS_NS

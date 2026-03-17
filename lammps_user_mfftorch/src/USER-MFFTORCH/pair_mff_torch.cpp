@@ -544,16 +544,15 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   int *type = atom->type;
 
   // Build type->Z mapped A (CPU then move to engine device).
-  std::vector<int64_t> A_cpu(ntotal);
-  std::vector<float> pos_cpu;
-  pos_cpu.reserve(static_cast<size_t>(ntotal) * 3);
+  // Reuse persistent buffers to avoid heap allocation every step.
+  buf_A_cpu_.resize(static_cast<size_t>(ntotal));
+  buf_pos_cpu_.resize(static_cast<size_t>(ntotal) * 3);
   for (int i = 0; i < ntotal; i++) {
     const int itype = type[i];
-    const int64_t Z = (itype >= 0 && itype < static_cast<int>(type2Z_.size())) ? type2Z_[itype] : 0;
-    A_cpu[i] = Z;
-    pos_cpu.push_back(static_cast<float>(x[i][0]));
-    pos_cpu.push_back(static_cast<float>(x[i][1]));
-    pos_cpu.push_back(static_cast<float>(x[i][2]));
+    buf_A_cpu_[i] = (itype >= 0 && itype < static_cast<int>(type2Z_.size())) ? type2Z_[itype] : 0;
+    buf_pos_cpu_[static_cast<size_t>(i) * 3 + 0] = static_cast<float>(x[i][0]);
+    buf_pos_cpu_[static_cast<size_t>(i) * 3 + 1] = static_cast<float>(x[i][1]);
+    buf_pos_cpu_[static_cast<size_t>(i) * 3 + 2] = static_cast<float>(x[i][2]);
   }
 
   const CellGeom geom = build_cell_geom(domain);
@@ -596,17 +595,18 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   }
 
   // Count edges (upper bound) and build edges + lattice shifts.
+  // Reuse persistent buffers to avoid heap allocation every step.
   int64_t Emax = 0;
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
     Emax += numneigh[i];
   }
-  std::vector<int64_t> edge_src_cpu;
-  std::vector<int64_t> edge_dst_cpu;
-  std::vector<float> edge_shifts_cpu;
-  edge_src_cpu.reserve(static_cast<size_t>(Emax));
-  edge_dst_cpu.reserve(static_cast<size_t>(Emax));
-  edge_shifts_cpu.reserve(static_cast<size_t>(Emax) * 3);
+  buf_edge_src_cpu_.clear();
+  buf_edge_dst_cpu_.clear();
+  buf_edge_shifts_cpu_.clear();
+  buf_edge_src_cpu_.reserve(static_cast<size_t>(Emax));
+  buf_edge_dst_cpu_.reserve(static_cast<size_t>(Emax));
+  buf_edge_shifts_cpu_.reserve(static_cast<size_t>(Emax) * 3);
 
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
@@ -632,31 +632,48 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       const double rsq = delx * delx + dely * dely + delz * delz;
       if (rsq > cutsq_global_) continue;
 
-      edge_src_cpu.push_back(static_cast<int64_t>(i));
-      edge_dst_cpu.push_back(static_cast<int64_t>(j));
-      edge_shifts_cpu.push_back(static_cast<float>(sx));
-      edge_shifts_cpu.push_back(static_cast<float>(sy));
-      edge_shifts_cpu.push_back(static_cast<float>(sz));
+      buf_edge_src_cpu_.push_back(static_cast<int64_t>(i));
+      buf_edge_dst_cpu_.push_back(static_cast<int64_t>(j));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(sx));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(sy));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(sz));
     }
   }
 
-  const int64_t E = static_cast<int64_t>(edge_src_cpu.size());
+  const int64_t E = static_cast<int64_t>(buf_edge_src_cpu_.size());
   if (E <= 1) return;
 
-  // Torch tensors (CPU -> device copy).
-  auto pos_t = torch::from_blob(pos_cpu.data(), {ntotal, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
-  auto A_t = torch::from_blob(A_cpu.data(), {ntotal}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)).clone();
-  auto edge_src_t = torch::from_blob(edge_src_cpu.data(), {E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)).clone();
-  auto edge_dst_t = torch::from_blob(edge_dst_cpu.data(), {E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)).clone();
-  auto edge_shifts_t = torch::from_blob(edge_shifts_cpu.data(), {E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
+  // Reuse persistent torch tensors; only reallocate when sizes change.
+  if (cached_compute_ntotal_ != static_cast<int64_t>(ntotal)) {
+    cached_pos_t_ = torch::empty({ntotal, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    cached_A_t_ = torch::empty({ntotal}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    cached_compute_ntotal_ = static_cast<int64_t>(ntotal);
+  }
+  if (cached_compute_nedges_ != E) {
+    cached_edge_src_t_ = torch::empty({E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    cached_edge_dst_t_ = torch::empty({E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    cached_edge_shifts_t_ = torch::empty({E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    cached_compute_nedges_ = E;
+  }
+  std::memcpy(cached_pos_t_.data_ptr<float>(), buf_pos_cpu_.data(),
+              static_cast<size_t>(ntotal) * 3 * sizeof(float));
+  std::memcpy(cached_A_t_.data_ptr<int64_t>(), buf_A_cpu_.data(),
+              static_cast<size_t>(ntotal) * sizeof(int64_t));
+  std::memcpy(cached_edge_src_t_.data_ptr<int64_t>(), buf_edge_src_cpu_.data(),
+              static_cast<size_t>(E) * sizeof(int64_t));
+  std::memcpy(cached_edge_dst_t_.data_ptr<int64_t>(), buf_edge_dst_cpu_.data(),
+              static_cast<size_t>(E) * sizeof(int64_t));
+  std::memcpy(cached_edge_shifts_t_.data_ptr<float>(), buf_edge_shifts_cpu_.data(),
+              static_cast<size_t>(E) * 3 * sizeof(float));
   auto external_tensor_t = current_external_tensor(torch::kCPU);
   auto fidelity_ids_t = current_fidelity_tensor(torch::kCPU);
 
   const bool want_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
-    out = engine_->compute(nlocal, ntotal, pos_t, A_t, edge_src_t, edge_dst_t, edge_shifts_t, cell_t, external_tensor_t,
-                           fidelity_ids_t,
+    out = engine_->compute(nlocal, ntotal, cached_pos_t_, cached_A_t_,
+                           cached_edge_src_t_, cached_edge_dst_t_, cached_edge_shifts_t_,
+                           cell_t, external_tensor_t, fidelity_ids_t,
                            static_cast<bool>(eflag), want_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
@@ -683,7 +700,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       }
       auto reciprocal_inputs = make_reciprocal_inputs(
           world,
-          pos_t.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous(),
+          cached_pos_t_.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous(),
           local_source,
           cell_t.to(reciprocal_device, torch::kFloat32).contiguous(),
           geom,
