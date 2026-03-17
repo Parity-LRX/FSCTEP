@@ -1,7 +1,7 @@
 # FusedSCEquiTensorPot
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.12%2B-orange)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 **FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for atomistic modeling with multiple tensor-product backends, explicit external-field conditioning, physical-tensor supervision, multi-fidelity training, and direct LAMMPS deployment.
@@ -536,7 +536,7 @@ rebuild/
 ## Requirements
 
 - Python >= 3.8
-- PyTorch >= 1.12.0
+- PyTorch >= 2.0.0
 - e3nn >= 0.5.0
 - ASE >= 3.22.0
 - See `requirements.txt` for full list
@@ -590,8 +590,6 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 ### Real-World Task Performance
 
 **Dataset**: Five nitrogen oxide and carbon structure reaction pathways from NEB (Nudged Elastic Band) calculations, filtered to fmax=0.2, totaling 2,788 structures. Test set: 1-2 complete or incomplete structures per reaction.
-
-**Test Configuration**: 64 channels, lmax=2, float64
 
 <table>
 <thead>

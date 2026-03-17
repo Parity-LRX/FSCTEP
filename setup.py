@@ -32,8 +32,8 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=[
-        "torch>=1.12.0",
-        "numpy>=1.21.0",
+        "torch>=2.0.0",
+        "numpy>=1.20.0",
         "pandas>=1.3.0",
         # Keep compatible with mace-torch (often pins e3nn==0.4.4)
         "e3nn>=0.4.4,<0.6.0",
