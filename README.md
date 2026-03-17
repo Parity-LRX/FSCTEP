@@ -556,17 +556,19 @@ The library supports **eight equivariant tensor product modes**, each optimized 
 
 All modes maintain O(3) equivariance (including rotation and reflection). Performance comparison:
 
-| Mode | Equivariance | Speed (CPU)* | Speed (GPU)** | Parameters* | Equivariance Error* | Use Case |
-|------|--------------|-------------|---------------|-------------|---------------------|----------|
-| `spherical` | ✅ Strict | 1.00x (baseline) | 1.00x (baseline) | 100% (baseline) | ~1e-15 | Default, maximum compatibility, research/publication |
-| `partial-cartesian` | ✅ Strict | 0.16x-1.06x | 0.75x (lmax=2) | 82.6% (-17.4%) | ~1e-14 | Strict equivariance with fewer parameters |
-| `partial-cartesian-loose` | ⚠️ Approximate | 0.17x-1.37x | 1.15x (lmax=2) | 82.7% (-17.3%) | ~1e-15 | Fast iteration (CPU, lmax≤3), approximate equivariance acceptable |
-| `pure-cartesian-sparse` | ✅ Strict | 0.53x-1.39x | **1.17x (lmax=2)** | 70.4% (-29.6%) | ~1e-15 | Best balance: fewer params, stable performance |
-| `pure-cartesian-ictd` | ✅ Strict | **1.58x-4.12x (fastest)** | **2.10x (lmax=2, fastest)** | **27.9% (-72.1%)** | ~1e-7 | **Best overall**: fewest params, fastest on CPU/GPU, strictly equivariant |
-| `pure-cartesian` | ✅ Strict | 0.02x-0.36x (slowest) | 0.06x (lmax=2, fails at lmax≥4) | 514.0% (+414%) | ~1e-14 | ❌ Not recommended (too slow, too many params) |
+| Mode | Equivariance | Speed (CPU) l=0-6 | Speed (GPU) common configuration | Parameters | Equivariance Error | Use Case |
+|------|--------------|-------------------|----------------------------------|------------|---------------------|----------|
+| `spherical` | Strict | 1.00x (baseline) | 1.00x (baseline) | 100% (baseline) | ~1e-15 | Default, maximum compatibility, research/publication |
+| `spherical-save-cue` | Strict | - | 16x | 32.6% (-67.4%) | ~1e-15 | Different GCN structure, design for highest speed MD. **CAN NOT compare with other modes** |
+| `partial-cartesian` | Strict | 0.16x-1.06x | 0.75x | 82.6% (-17.4%) | ~1e-14 | Strict equivariance with fewer parameters |
+| `partial-cartesian-loose` | Approximate | 0.17x-1.37x | 1.15x | 82.7% (-17.3%) | ~1e-15 | Fast iteration, approximate equivariance acceptable |
+| `pure-cartesian-sparse` | SO3 Strict | 0.53x-1.39x | 1.17x | 70.4% (-29.6%) | ~1e-15 | Best balance: fewer params, stable performance |
+| `pure-cartesian-ictd` | Strict | **1.58x-4.12x (fastest)** | **5.0x** | **27.9% (-72.1%)** | ~1e-12 | **Best overall**: fewest params, fastest on CPU/GPU, strictly equivariant |
+| `pure-cartesian` | Strict | 0.02x-0.36x (slowest) | 0.06x | 514.0% (+414%) | ~1e-14 | ❌ Not recommended (too slow, too many params) |
 
 *CPU benchmark: channels=64, lmax=0-6, 32 atoms, 256 edges, float64. Speed shown is total training time (forward+backward) acceleration ratio relative to spherical.  
-**GPU benchmark: channels=64, lmax=0-6, 32 atoms, 256 edges, RTX 3090, float64. Speed shown is total training time (forward+backward) acceleration ratio relative to spherical.  
+*GPU benchmark: channels=64, lmax=0-6, 32 atoms, 256 edges, RTX 3090, float64. Speed shown is total training time (forward+backward) acceleration ratio relative to spherical.  
+*`spherical-save-cue` uses a different GCN structure and cannot be directly compared with other modes.  
 All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-6).
 
 ### Quick Recommendations
@@ -578,7 +580,7 @@ All modes pass O(3) equivariance tests (including parity/reflection, error < 1e-
 - **Standard Baseline**: Use `spherical` (highest precision, standard implementation)
 
 #### GPU Environment (Recommended for Training)
-- **Speed + Memory**: Use `pure-cartesian-ictd` (**2.10x faster**, 72.1% fewer parameters, lmax≤3)
+- **Speed + Memory**: Use `pure-cartesian-ictd` (**5.0x faster**, 72.1% fewer parameters, lmax≤3)
 - **High Precision**: Use `spherical` or `pure-cartesian-sparse` (equivariance error ~1e-15)
 - **Best Balance**: Use `pure-cartesian-sparse` (**1.17x faster**, 29.6% fewer params, strict equivariance)
 - **Avoid**: `pure-cartesian` (too slow, fails at lmax≥4)
@@ -594,7 +596,7 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 <table>
 <thead>
 <tr>
-<th style="text-align:center">Method</th>
+<th style="text-align:center">Model</th>
 <th style="text-align:center">Configuration</th>
 <th style="text-align:center">Mode</th>
 <th style="text-align:center">Energy RMSE<br/>(mev/atom)</th>
@@ -603,7 +605,7 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 </thead>
 <tbody>
 <tr>
-<td rowspan="3" style="text-align:center;vertical-align:middle"><strong>MACE</strong></td>
+<td rowspan="3" style="text-align:center;vertical-align:middle"><strong>MACE correction=3</strong></td>
 <td style="text-align:center">Lmax=2, 64ch</td>
 <td style="text-align:center">-</td>
 <td style="text-align:center">0.13</td>
@@ -618,25 +620,35 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 <tr>
 <td style="text-align:center">Lmax=2, 198ch</td>
 <td style="text-align:center">-</td>
-<td style="text-align:center">0.24</td>
+<td style="text-align:center">0.12</td>
 <td style="text-align:center">15.1</td>
 </tr>
 <tr>
-<td rowspan="4" style="text-align:center;vertical-align:middle"><strong>FSCETP</strong></td>
-<td rowspan="4" style="text-align:center;vertical-align:middle">Lmax=2, 64ch</td>
-<td style="text-align:center"><strong>spherical</strong></td>
-<td style="text-align:center"><strong>0.044</strong> ⭐</td>
-<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+<td rowspan="6" style="text-align:center;vertical-align:middle"><strong>FSCETP</strong></td>
+<td rowspan="6" style="text-align:center;vertical-align:middle">Lmax=2, 64ch</td>
+<td style="text-align:center">spherical</td>
+<td style="text-align:center">0.044</td>
+<td style="text-align:center">7.4</td>
 </tr>
 <tr>
-<td style="text-align:center"><strong>partial-cartesian</strong></td>
+<td style="text-align:center">spherical-save-cue</td>
+<td style="text-align:center">0.076</td>
+<td style="text-align:center">8.0</td>
+</tr>
+<tr>
+<td style="text-align:center">partial-cartesian</td>
 <td style="text-align:center">0.045</td>
-<td style="text-align:center"><strong>7.4</strong> ⭐</td>
+<td style="text-align:center">7.4</td>
 </tr>
 <tr>
 <td style="text-align:center">partial-cartesian-loose</td>
 <td style="text-align:center">0.048</td>
 <td style="text-align:center">8.4</td>
+</tr>
+<tr>
+<td style="text-align:center"><strong>pure-cartesian-sparse</strong></td>
+<td style="text-align:center"><strong>0.044</strong> ⭐</td>
+<td style="text-align:center"><strong>6.5</strong> ⭐</td>
 </tr>
 <tr>
 <td style="text-align:center">pure-cartesian-ictd</td>
@@ -647,10 +659,10 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 </table>
 
 **Key Findings**:
-- **Energy Accuracy**: FSCETP achieves **66.2% lower** energy RMSE than MACE (64ch) (0.044 vs 0.13 mev/atom)
-- **Force Accuracy**: FSCETP achieves **36.2% lower** force RMSE than MACE (64ch) (7.4 vs 11.6 mev/Å)
-- **Best Performance**: `spherical` and `partial-cartesian` modes show the best accuracy (Energy: 0.044-0.045, Force: 7.4)
-- **Efficiency**: `pure-cartesian-ictd` achieves competitive accuracy (Energy: 0.046, Force: 9.0) with **72.1% fewer parameters** and **2.10x faster** training speed
+- **Energy Accuracy**: FSCETP achieves **66.2% lower** energy RMSE than MACE correction=3 (64ch) (0.044 vs 0.13 mev/atom)
+- **Force Accuracy**: FSCETP achieves **43.9% lower** force RMSE than MACE correction=3 (64ch) (6.5 vs 11.6 mev/Å) with `pure-cartesian-sparse`
+- **Best Performance**: `pure-cartesian-sparse` achieves the best force RMSE (6.5 mev/Å) with competitive energy (0.044 mev/atom)
+- **Efficiency**: `pure-cartesian-ictd` achieves competitive accuracy (Energy: 0.046, Force: 9.0) with **72.1% fewer parameters** and **5.0x faster** training speed
 
 ## 📚 Documentation
 
