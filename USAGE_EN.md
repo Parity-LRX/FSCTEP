@@ -31,6 +31,7 @@ After installation, you can verify that the CLI is available using the following
 
 ```bash
 mff-preprocess --help
+mff-convert-dataset --help
 mff-train --help
 mff-evaluate --help
 mff-export-core --help   # LAMMPS LibTorch export
@@ -54,9 +55,86 @@ Python API examples: [Example 5a: LAMMPS LibTorch](#example-5a-lammps-libtorch-i
 
 ## Complete Workflow
 
+### Step 0: Common Datasets and extxyz Conversion
+
+The recommended raw input format before training is `extxyz`. Minimum requirements:
+
+- Each frame's comment line contains `energy=...`
+- Atomic columns include at least `species`, `pos`, and `force`
+- Periodic systems may add `Lattice=... pbc="T T T"`, and `stress=` or `virial=`
+
+CLI for conversion:
+
+```bash
+mff-convert-dataset --help
+```
+
+If `mff-convert-dataset` triggers top-level `torch` import issues in your environment, you can run the standalone script directly:
+
+```bash
+python scripts/convert_dataset_to_extxyz.py --help
+```
+
+**Recommended datasets and conversion:**
+
+| Dataset | Use Case | Input Format | Conversion |
+|---------|----------|--------------|------------|
+| **rMD17** | Molecular PES, quick validation, smoke test | `.npz` | `--format rmd17 --input rmd17_aspirin.npz --output data/rmd17_aspirin.extxyz` |
+| **ANI-1x** | Organic molecules (H/C/N/O) | HDF5 | `--format ani1x --input ani1x.h5 --output data/ani1x.extxyz` |
+| **QM7-X** | Small molecules, high-accuracy multi-config (C/N/O/S/Cl/H) | HDF5 | `--format qm7x --input 1000.hdf5 --output data/qm7x_1000.extxyz` |
+| **SPICE** | Large-scale organic/pharma molecules | HDF5 | `--format spice --input spice.h5 --output data/spice.extxyz` |
+
+**rMD17 example:**
+```bash
+python scripts/convert_dataset_to_extxyz.py \
+  --format rmd17 \
+  --input rmd17_aspirin.npz \
+  --output data/rmd17_aspirin.extxyz
+```
+
+**ANI-1x example** (use `--inspect` first if key names differ, then override):
+```bash
+python scripts/convert_dataset_to_extxyz.py --format ani1x --input ani1x.h5 --inspect
+python scripts/convert_dataset_to_extxyz.py \
+  --format ani1x \
+  --input ani1x.h5 \
+  --output data/ani1x.extxyz \
+  --energy-key wb97x_dz.energy \
+  --force-key wb97x_dz.forces
+```
+
+**Generic HDF5 conversion** (non-standard formats):
+```bash
+python scripts/convert_dataset_to_extxyz.py --format generic-h5 --input your_data.h5 --inspect
+python scripts/convert_dataset_to_extxyz.py \
+  --format generic-h5 \
+  --input your_data.h5 \
+  --output data/custom.extxyz \
+  --species-key atomic_numbers \
+  --coord-key conformations \
+  --energy-key dft_total_energy \
+  --force-key dft_total_gradient \
+  --distance-unit bohr \
+  --energy-unit hartree \
+  --force-unit hartree/bohr \
+  --force-is-gradient
+```
+
+**Large dataset sampling** (recommended to sample first for validation):
+```bash
+python scripts/convert_dataset_to_extxyz.py \
+  --format spice \
+  --input spice.h5 \
+  --output data/spice_10k.extxyz \
+  --limit 10000 \
+  --stride 10
+```
+
+After conversion, proceed to [Step 1](#step-1-data-preprocessing) for `mff-preprocess`.
+
 ### Step 1: Data Preprocessing
 
-First, you need to preprocess your raw XYZ file into a format that the library can use.
+First, you need to preprocess your raw XYZ or extxyz file into a format that the library can use.
 
 ```bash
 mff-preprocess \

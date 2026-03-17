@@ -55,9 +55,86 @@ Python API 示例见[示例 5a：LAMMPS LibTorch 接口](#示例-5a-使用-lammp
 
 ## 完整使用流程
 
+### 步骤 0: 常用数据集与 extxyz 转换
+
+训练前的原始输入推荐使用 `extxyz`。最低要求是：
+
+- 每帧 comment 行带 `energy=...`
+- 原子列至少包含 `species/pos/force`
+- 周期体系可额外带 `Lattice=... pbc="T T T"`，以及 `stress=` 或 `virial=`
+
+新增 CLI：
+
+```bash
+mff-convert-dataset --help
+```
+
+如果你的环境里 `mff-convert-dataset` 触发了仓库顶层 `torch` 导入问题，也可以直接运行独立脚本：
+
+```bash
+python scripts/convert_dataset_to_extxyz.py --help
+```
+
+**推荐数据集及转换：**
+
+| 数据集 | 适用场景 | 输入格式 | 转换命令 |
+|--------|----------|----------|----------|
+| **rMD17** | 分子势能面、入门验证、快速 smoke test | `.npz` | `--format rmd17 --input rmd17_aspirin.npz --output data/rmd17_aspirin.extxyz` |
+| **ANI-1x** | 有机分子通用势（H/C/N/O） | HDF5 | `--format ani1x --input ani1x.h5 --output data/ani1x.extxyz` |
+| **QM7-X** | 小分子高精度多构型（C/N/O/S/Cl/H） | HDF5 | `--format qm7x --input 1000.hdf5 --output data/qm7x_1000.extxyz` |
+| **SPICE** | 大规模有机/药化分子 | HDF5 | `--format spice --input spice.h5 --output data/spice.extxyz` |
+
+**rMD17 示例：**
+```bash
+python scripts/convert_dataset_to_extxyz.py \
+  --format rmd17 \
+  --input rmd17_aspirin.npz \
+  --output data/rmd17_aspirin.extxyz
+```
+
+**ANI-1x 示例**（键名不同时可先 `--inspect` 再覆盖）：
+```bash
+python scripts/convert_dataset_to_extxyz.py --format ani1x --input ani1x.h5 --inspect
+python scripts/convert_dataset_to_extxyz.py \
+  --format ani1x \
+  --input ani1x.h5 \
+  --output data/ani1x.extxyz \
+  --energy-key wb97x_dz.energy \
+  --force-key wb97x_dz.forces
+```
+
+**通用 HDF5 转换**（非标准格式）：
+```bash
+python scripts/convert_dataset_to_extxyz.py --format generic-h5 --input your_data.h5 --inspect
+python scripts/convert_dataset_to_extxyz.py \
+  --format generic-h5 \
+  --input your_data.h5 \
+  --output data/custom.extxyz \
+  --species-key atomic_numbers \
+  --coord-key conformations \
+  --energy-key dft_total_energy \
+  --force-key dft_total_gradient \
+  --distance-unit bohr \
+  --energy-unit hartree \
+  --force-unit hartree/bohr \
+  --force-is-gradient
+```
+
+**大数据集抽样**（建议先抽样验证）：
+```bash
+python scripts/convert_dataset_to_extxyz.py \
+  --format spice \
+  --input spice.h5 \
+  --output data/spice_10k.extxyz \
+  --limit 10000 \
+  --stride 10
+```
+
+转换完成后，接[步骤 1](#步骤-1-数据预处理)进行 `mff-preprocess`。
+
 ### 步骤 1: 数据预处理
 
-首先，你需要将原始的XYZ文件预处理成库可以使用的格式。
+首先，你需要将原始的 XYZ 或 extxyz 文件预处理成库可以使用的格式。
 
 ```bash
 mff-preprocess \

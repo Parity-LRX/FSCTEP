@@ -22,7 +22,7 @@
 - End-to-end workflow from preprocessing and training to `core.pt` export and LAMMPS runtime.
 - Research-oriented extensions such as long-range prototypes, active learning, NEB, phonons, and thermal transport.
 
-Dataset notes and conversion examples are in [DATASETS.md](DATASETS.md).
+Dataset notes and conversion examples (rMD17, ANI-1x, QM7-X, SPICE, generic HDF5) are in [USAGE.md](USAGE.md#步骤-0-常用数据集与-extxyz-转换) (中文) and [USAGE_EN.md](USAGE_EN.md#step-0-common-datasets-and-extxyz-conversion) (English).
 
 ## Installation
 
