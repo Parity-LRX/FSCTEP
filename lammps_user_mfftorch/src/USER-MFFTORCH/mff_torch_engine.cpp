@@ -745,17 +745,9 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
     int64_t nlocal, int64_t ntotal, bool need_energy, bool need_atom_virial) {
 
   auto pos = pos0.clone().detach().requires_grad_(true);
-
-  // In MD there is always a single graph (cell is [1,3,3], batch is all-zero).
-  // Use a single matmul instead of 2× index_select + einsum (saves 2 kernel launches).
-  torch::Tensor shift_vec;
-  if (cell.size(0) == 1) {
-    shift_vec = torch::mm(edge_shifts, cell.squeeze(0));
-  } else {
-    auto edge_batch = buf_batch_.index_select(0, edge_src);
-    auto edge_cells = cell.index_select(0, edge_batch);
-    shift_vec = torch::einsum("ni,nij->nj", {edge_shifts, edge_cells});
-  }
+  auto edge_batch = buf_batch_.index_select(0, edge_src);
+  auto edge_cells = cell.index_select(0, edge_batch);
+  auto shift_vec = torch::einsum("ni,nij->nj", {edge_shifts, edge_cells});
 
   torch::Tensor shift_leaf;
   if (need_atom_virial) {

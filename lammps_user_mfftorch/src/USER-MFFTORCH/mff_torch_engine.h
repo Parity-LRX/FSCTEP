@@ -39,7 +39,6 @@ class MFFTorchEngine {
 
   const torch::Device& device() const { return device_; }
   bool is_cuda() const { return device_.is_cuda(); }
-  void set_use_cuda_graph(bool enable) { use_cuda_graph_ = enable; }
   bool accepts_external_tensor() const { return core_requires_external_tensor_; }
   const std::string& external_tensor_irrep() const { return external_tensor_irrep_; }
   int64_t external_tensor_total_numel() const { return external_tensor_total_numel_; }

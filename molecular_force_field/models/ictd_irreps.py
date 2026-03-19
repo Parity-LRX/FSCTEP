@@ -33,6 +33,10 @@ from molecular_force_field.models.ictd_fast import (
     _build_laplacian_matrix,
     _build_r2k_lift,
 )
+from molecular_force_field.models.ictd_irreps_cuda import (
+    bucketed_tp_forward as _tp_cuda_ext_bucket_forward,
+    normalize_ictd_tp_backend,
+)
 
 # ---------------------------------------------------------------------------
 # torch.compile (Dynamo) integration helpers
@@ -65,6 +69,51 @@ _SPARSE_MIN_ZERO_FRAC = 0.4
 _SPARSE_ZERO_THRESHOLD = 1e-12
 # Set ICTD_USE_SPARSE_TP=0 to disable sparse path (use dense Triton or PyTorch only)
 _USE_SPARSE_TP = os.environ.get("ICTD_USE_SPARSE_TP", "1") == "1"
+
+
+def _segment_offsets_from_segments(segments: List[Tuple[int, ...]]) -> torch.Tensor:
+    offsets = [int(seg[-2]) for seg in segments]
+    offsets.append(int(segments[-1][-1]) if segments else 0)
+    return torch.tensor(offsets, dtype=torch.long)
+
+
+def _stack_group_weights(
+    *,
+    w_param: torch.Tensor,
+    segments: List[Tuple[int, ...]],
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    stacked = torch.stack(
+        [w_param[int(seg[0])].to(dtype=compute_dtype) for seg in segments],
+        dim=0,
+    )
+    return stacked.contiguous().view(stacked.shape[0], stacked.shape[1], -1)
+
+
+def _build_kdim_buckets(
+    *,
+    segments: List[Tuple[int, ...]],
+    U: torch.Tensor,
+) -> List[Dict[str, object]]:
+    buckets_by_kdim: Dict[int, List[Tuple[int, ...]]] = {}
+    for seg in segments:
+        start = int(seg[-2])
+        end = int(seg[-1])
+        buckets_by_kdim.setdefault(end - start, []).append(seg)
+
+    buckets: List[Dict[str, object]] = []
+    for kdim, bucket_segments in sorted(buckets_by_kdim.items()):
+        starts = [int(seg[-2]) for seg in bucket_segments]
+        path_indices = [int(seg[0]) for seg in bucket_segments]
+        U_bucket = torch.cat([U[:, s : s + kdim] for s in starts], dim=1).contiguous()
+        bucket: Dict[str, object] = {
+            "kdim": kdim,
+            "segments": bucket_segments,
+            "path_indices": path_indices,
+            "U_bucket": U_bucket,
+        }
+        buckets.append(bucket)
+    return buckets
 
 
 def sym_dim(L: int) -> int:
@@ -685,6 +734,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         normalization: str = "component",
         # Internal computation dtype for CG tensors and projections (default: float64 for stability)
         internal_compute_dtype: torch.dtype = torch.float64,
+        ictd_tp_backend: str = "auto",
     ):
         super().__init__()
         self.mul_in1 = mul_in1
@@ -694,6 +744,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.internal_weights = internal_weights
         self._normalization = normalization
         self.internal_compute_dtype = internal_compute_dtype
+        self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
 
         # Enumerate all valid (l1,l2,l3) with parity selection (even step)
         all_paths: List[Tuple[int, int, int]] = []
@@ -775,6 +826,8 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
         # Sparse U per group when zero_frac >= _SPARSE_MIN_ZERO_FRAC: list of None or (d_idx, k_idx, vals)
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
+        # Packed same-kdim buckets for the custom CUDA backend.
+        self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -863,6 +916,21 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         return self._proj_sparse_cache_by_dev_dtype[key]
 
     @_dynamo_disable
+    def _get_proj_bucket_list(self, device: torch.device, dtype: torch.dtype) -> List[List[Dict[str, object]]]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._proj_bucket_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        buckets = [
+            _build_kdim_buckets(segments=g["segments"], U=proj_list[g_idx])  # type: ignore[arg-type]
+            for g_idx, g in enumerate(self._groups)
+        ]
+        self._proj_bucket_cache_by_dev_dtype[key] = buckets
+        return buckets
+
+    @_dynamo_disable
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         """Pre-build internal caches on (device, dtype).
 
@@ -872,6 +940,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         _ = self._get_cg_list(device=device, dtype=dtype)
         _ = self._get_proj_group_list(device=device, dtype=dtype)
         _ = self._get_proj_sparse_list(device=device, dtype=dtype)
+        _ = self._get_proj_bucket_list(device=device, dtype=dtype)
 
     def forward(
         self,
@@ -908,6 +977,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Fast path: internal_weights + per-path scalar gates (this is what our models use).
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
             # Only fetch sparse list on CUDA (Triton is CUDA-only; avoids extra work on CPU)
             sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
@@ -927,31 +997,66 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 m1 = 2 * l1 + 1
                 m2 = 2 * l2 + 1
                 U = proj_list[g_idx]  # (m1*m2, K_total) in compute_dtype
+                num_paths_in_group = len(segments)
                 # Convert inputs to compute_dtype for numerical stability
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+                B_flat = 1
+                for s in batch_shape:
+                    B_flat *= int(s)
+                a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
+                b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
+                if a_comp.dim() >= 2:
+                    bucket_outputs: list[tuple[int, torch.Tensor]] = []
+                    cuda_supported = True
+                    for bucket in bucket_list[g_idx]:
+                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
+                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
+                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
+                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
+                        W_bucket = _stack_group_weights(
+                            w_param=w_param,
+                            segments=bucket_segments,
+                            compute_dtype=compute_dtype,
+                        ).to(device=a_comp.device)
+                        gates_bucket = None
+                        if weights is not None:
+                            gates_bucket = torch.stack(
+                                [weights[..., int(p_idx)] for p_idx in bucket_path_indices], dim=-1
+                            ).reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
+                        bucket_out = _tp_cuda_ext_bucket_forward(
+                            backend=self.ictd_tp_backend,
+                            a=a_flat,
+                            b=b_flat,
+                            U_bucket=U_bucket,
+                            W_stack=W_bucket,
+                            gates=gates_bucket,
+                            compute_dtype=compute_dtype,
+                        )
+                        if bucket_out is None:
+                            cuda_supported = False
+                            break
+                        bucket_out = bucket_out.reshape(*batch_shape, self.mul_out, kdim)
+                        bucket_outputs.append((int(bucket_segments[0][1]), bucket_out))
+                    if cuda_supported and bucket_outputs:
+                        for l3, bucket_out in bucket_outputs:
+                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
+                            out[l3] = out[l3] + bucket_out
+                        continue
                 # FlashTP-style: fused projection+channel-mix (one kernel), or sparse/dense TP then per-path mix
                 y = None
                 used_fused_mix = False
                 if a_comp.is_cuda and a_comp.dim() >= 2:
-                    B_flat = 1
-                    for s in batch_shape:
-                        B_flat *= int(s)
-                    a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
-                    b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                    num_paths_in_group = len(segments)
                     # Try fused outer-product + projection + channel mixing (one kernel, no y write-back)
                     if (
                         _tp_fused_outer_proj_channel_mix is not None
                         and num_paths_in_group <= 16
                     ):
-                        W_stack = torch.stack(
-                            [w_param[int(p_idx)].to(dtype=compute_dtype) for p_idx, _, _, _ in segments],
-                            dim=0,
-                        )
-                        W_stack = W_stack.to(device=a_comp.device).contiguous().view(
-                            num_paths_in_group, self.mul_out, self.mul_in1 * self.mul_in2
-                        )
+                        W_stack = _stack_group_weights(
+                            w_param=w_param,
+                            segments=segments,
+                            compute_dtype=compute_dtype,
+                        ).to(device=a_comp.device)
                         out_buf = _tp_fused_outer_proj_channel_mix(
                             a_flat, b_flat, U, W_stack, segments, k_total, self.mul_out, m1, m2
                         )
@@ -1207,6 +1312,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         max_rank_other: int | None = None,
         normalization: str = "component",
         internal_compute_dtype: torch.dtype = torch.float64,
+        ictd_tp_backend: str = "auto",
     ):
         super().__init__()
         self.mul_in1 = int(mul_in1)
@@ -1216,6 +1322,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self.internal_weights = bool(internal_weights)
         self._normalization = normalization
         self.internal_compute_dtype = internal_compute_dtype
+        self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
         self.active_irreps = (
             [_normalize_irrep_key(l, p) for l, p in active_irreps]
             if active_irreps is not None
@@ -1279,6 +1386,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
             )
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
+        self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -1349,10 +1457,25 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         return self._proj_sparse_cache_by_dev_dtype[key]
 
     @_dynamo_disable
+    def _get_proj_bucket_list(self, device: torch.device, dtype: torch.dtype) -> List[List[Dict[str, object]]]:
+        key = (str(device), str(self.internal_compute_dtype))
+        cached = self._proj_bucket_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        buckets = [
+            _build_kdim_buckets(segments=g["segments"], U=proj_list[g_idx])  # type: ignore[arg-type]
+            for g_idx, g in enumerate(self._groups)
+        ]
+        self._proj_bucket_cache_by_dev_dtype[key] = buckets
+        return buckets
+
+    @_dynamo_disable
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         _ = self._get_cg_list(device=device, dtype=dtype)
         _ = self._get_proj_group_list(device=device, dtype=dtype)
         _ = self._get_proj_sparse_list(device=device, dtype=dtype)
+        _ = self._get_proj_bucket_list(device=device, dtype=dtype)
 
     def forward(
         self,
@@ -1382,6 +1505,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
 
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+            bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
             sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
                 l1 = int(g["l1"])
@@ -1397,25 +1521,60 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                 m1 = 2 * l1 + 1
                 m2 = 2 * l2 + 1
                 U = proj_list[g_idx]
+                num_paths_in_group = len(segments)
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+                B_flat = 1
+                for s in batch_shape:
+                    B_flat *= int(s)
+                a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
+                b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
+                if a_comp.dim() >= 2:
+                    bucket_outputs: list[tuple[tuple[int, int], torch.Tensor]] = []
+                    cuda_supported = True
+                    for bucket in bucket_list[g_idx]:
+                        bucket_segments = bucket["segments"]  # type: ignore[assignment]
+                        bucket_path_indices = bucket["path_indices"]  # type: ignore[assignment]
+                        U_bucket = bucket["U_bucket"]  # type: ignore[assignment]
+                        kdim = int(bucket["kdim"])  # type: ignore[arg-type]
+                        W_bucket = _stack_group_weights(
+                            w_param=w_param,
+                            segments=bucket_segments,
+                            compute_dtype=compute_dtype,
+                        ).to(device=a_comp.device)
+                        gates_bucket = None
+                        if weights is not None:
+                            gates_bucket = torch.stack(
+                                [weights[..., int(p_idx)] for p_idx in bucket_path_indices], dim=-1
+                            ).reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
+                        bucket_out = _tp_cuda_ext_bucket_forward(
+                            backend=self.ictd_tp_backend,
+                            a=a_flat,
+                            b=b_flat,
+                            U_bucket=U_bucket,
+                            W_stack=W_bucket,
+                            gates=gates_bucket,
+                            compute_dtype=compute_dtype,
+                        )
+                        if bucket_out is None:
+                            cuda_supported = False
+                            break
+                        bucket_out = bucket_out.reshape(*batch_shape, self.mul_out, kdim)
+                        bucket_outputs.append(((int(bucket_segments[0][1]), int(bucket_segments[0][2])), bucket_out))
+                    if cuda_supported and bucket_outputs:
+                        for key_ir, bucket_out in bucket_outputs:
+                            bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
+                            out[key_ir] = out[key_ir] + bucket_out
+                        continue
                 y = None
                 used_fused_mix = False
                 if a_comp.is_cuda and a_comp.dim() >= 2:
-                    B_flat = 1
-                    for s in batch_shape:
-                        B_flat *= int(s)
-                    a_flat = a_comp.reshape(B_flat, self.mul_in1, m1)
-                    b_flat = b_comp.reshape(B_flat, self.mul_in2, m2)
-                    num_paths_in_group = len(segments)
                     if _tp_fused_outer_proj_channel_mix is not None and num_paths_in_group <= 16:
-                        W_stack = torch.stack(
-                            [w_param[int(p_idx)].to(dtype=compute_dtype) for p_idx, _, _, _, _ in segments],
-                            dim=0,
-                        )
-                        W_stack = W_stack.to(device=a_comp.device).contiguous().view(
-                            num_paths_in_group, self.mul_out, self.mul_in1 * self.mul_in2
-                        )
+                        W_stack = _stack_group_weights(
+                            w_param=w_param,
+                            segments=segments,
+                            compute_dtype=compute_dtype,
+                        ).to(device=a_comp.device)
                         fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, _p3, s, e in segments]
                         out_buf = _tp_fused_outer_proj_channel_mix(
                             a_flat, b_flat, U, W_stack, fused_segments, k_total, self.mul_out, m1, m2

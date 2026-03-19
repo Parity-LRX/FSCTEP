@@ -1860,6 +1860,7 @@ def main():
             " SAVE" if args.tensor_product_mode == "pure-cartesian-sparse-save" else "",
         )
         logging.info(f"  max_rank_other={args.max_rank_other}, k_policy={args.k_policy}, num_interaction={args.num_interaction}")
+        physical_tensor_outputs = restored_physical_tensor_outputs or {}
         sparse_cls = (
             PureCartesianSparseTransformerLayerSave
             if args.tensor_product_mode == "pure-cartesian-sparse-save"
@@ -1888,7 +1889,6 @@ def main():
             external_tensor_rank=args.external_tensor_rank,
             external_tensor_specs=external_tensor_specs,
             num_fidelity_levels=num_fidelity_levels,
-            multi_fidelity_mode=multi_fidelity_mode,
             device=device,
             **common_invariant_kwargs,
             **common_long_range_kwargs,

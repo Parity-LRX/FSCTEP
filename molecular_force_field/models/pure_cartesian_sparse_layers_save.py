@@ -310,6 +310,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         external_tensor_rank: int | None = None,
         external_tensor_specs: list[dict] | None = None,
         num_fidelity_levels: int = 0,
+        multi_fidelity_mode: str = "conditioning",
         external_tensor_scale_init: float = 0.0,
     ):
         super().__init__()

@@ -1,13 +1,55 @@
 """Setup script for molecular_force_field package."""
 
-from setuptools import setup, find_packages
+import os
 from pathlib import Path
+
+from setuptools import find_packages, setup
+
+try:
+    from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
+except Exception:  # pragma: no cover - torch may be unavailable during lightweight metadata reads
+    BuildExtension = None
+    CppExtension = None
+    CUDAExtension = None
+    CUDA_HOME = None
 
 # Read README if exists
 readme_file = Path(__file__).parent / "README.md"
 long_description = ""
 if readme_file.exists():
     long_description = readme_file.read_text(encoding='utf-8')
+
+def _get_ext_modules():
+    if os.environ.get("MFF_BUILD_ICTD_TP_EXT", "1") != "1":
+        return []
+    if CppExtension is None:
+        return []
+    use_cuda = (
+        os.environ.get("MFF_BUILD_ICTD_TP_CUDA", "1") == "1"
+        and CUDAExtension is not None
+        and CUDA_HOME is not None
+    )
+    extension_cls = CUDAExtension if use_cuda else CppExtension
+    sources = ["molecular_force_field/csrc/ictd_tp.cpp"]
+    extra_compile_args = {"cxx": ["-O3"]}
+    define_macros = []
+    if use_cuda:
+        sources.append("molecular_force_field/csrc/ictd_tp_cuda.cu")
+        extra_compile_args["nvcc"] = ["-O3"]
+        define_macros.append(("WITH_CUDA", None))
+    return [
+        extension_cls(
+            name="molecular_force_field._C_ictd_tp",
+            sources=sources,
+            extra_compile_args=extra_compile_args,
+            define_macros=define_macros,
+        )
+    ]
+
+
+ext_modules = _get_ext_modules()
+cmdclass = {"build_ext": BuildExtension} if ext_modules and BuildExtension is not None else {}
+
 
 setup(
     name="molecular_force_field",
@@ -97,4 +139,6 @@ setup(
             "mff-merge-multifidelity=molecular_force_field.cli.merge_multifidelity_h5:main",
         ],
     },
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
 )

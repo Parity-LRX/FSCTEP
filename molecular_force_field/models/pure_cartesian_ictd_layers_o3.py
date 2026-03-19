@@ -305,6 +305,7 @@ class ICTDO3E3Conv(nn.Module):
         path_policy: str = "full",
         max_rank_other: int | None = None,
         internal_compute_dtype: torch.dtype = torch.float64,
+        ictd_tp_backend: str = "auto",
         external_tensor_rank: int | None = None,
         external_tensor_irrep: str | None = None,
         external_tensor_specs: list[dict] | None = None,
@@ -346,6 +347,7 @@ class ICTDO3E3Conv(nn.Module):
             path_policy=path_policy,
             max_rank_other=max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
+            ictd_tp_backend=ictd_tp_backend,
         )
         self.fc = nn.Sequential(
             nn.Linear(number_of_basis, 64),
@@ -549,6 +551,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
         ictd_tp_path_policy: str = "full",
         ictd_tp_max_rank_other: int | None = None,
         internal_compute_dtype: torch.dtype = torch.float64,
+        ictd_tp_backend: str = "auto",
         invariant_channels: int = 32,
         physical_tensor_outputs: dict[str, dict] | None = None,
         external_tensor_rank: int | None = None,
@@ -702,6 +705,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
             path_policy=ictd_tp_path_policy,
             max_rank_other=ictd_tp_max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
+            ictd_tp_backend=ictd_tp_backend,
             external_tensor_rank=external_tensor_rank,
             external_tensor_irrep=self.external_tensor_irrep,
             external_tensor_specs=self.external_tensor_specs,
@@ -725,6 +729,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
                 path_policy=ictd_tp_path_policy,
                 max_rank_other=ictd_tp_max_rank_other,
                 internal_compute_dtype=internal_compute_dtype,
+                ictd_tp_backend=ictd_tp_backend,
             )
             fc2 = nn.Sequential(
                 nn.Linear(main_number_of_basis, 64),

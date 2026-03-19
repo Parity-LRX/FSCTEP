@@ -164,9 +164,6 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
         tree_fmm_solver_->set_config(cfg);
       }
       validate_external_field_configuration();
-      // Kokkos memory management (cudaFreeHost) is globally incompatible
-      // with CUDA stream capture, so CUDA Graph must be disabled here.
-      engine_->set_use_cuda_graph(false);
       engine_loaded_ = true;
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("Failed to load TorchScript core: ") + e.what()).c_str());

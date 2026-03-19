@@ -643,6 +643,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         avg_num_neighbors: float | None = None,
         # Internal computation dtype for ICTD operations (default: float64 for stability)
         internal_compute_dtype: torch.dtype = torch.float64,
+        ictd_tp_backend: str = "auto",
     ):
         super().__init__()
         self.max_radius = max_radius
@@ -670,6 +671,7 @@ class ICTDIrrepsE3Conv(nn.Module):
             path_policy=ictd_tp_path_policy,
             max_rank_other=ictd_tp_max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
+            ictd_tp_backend=ictd_tp_backend,
         )
         self.fc = nn.Sequential(
             nn.Linear(number_of_basis, 64),
@@ -763,6 +765,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         k_policy: str = "k0",
         # Internal computation dtype for ICTD operations (default: float64 for stability)
         internal_compute_dtype: torch.dtype = torch.float64,
+        ictd_tp_backend: str = "auto",
         # Optional: allow per-l multiplicities for the "product_5-like" scalar invariant vector.
         # If None: keep current behavior (mul_l = channels for all l).
         # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
@@ -839,6 +842,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             ictd_tp_path_policy=ictd_tp_path_policy,
             ictd_tp_max_rank_other=ictd_tp_max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
+            ictd_tp_backend=ictd_tp_backend,
         )
 
         # conv2..convN: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
@@ -854,6 +858,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 path_policy=ictd_tp_path_policy,
                 max_rank_other=ictd_tp_max_rank_other,
                 internal_compute_dtype=internal_compute_dtype,
+                ictd_tp_backend=ictd_tp_backend,
             )
             fc2 = nn.Sequential(
                 nn.Linear(main_number_of_basis, 64),
