@@ -28,6 +28,7 @@ from molecular_force_field.active_learning.diversity_selector import (
     load_per_atom_devi,
     parse_max_devi_f,
 )
+from molecular_force_field.active_learning.geometry_filter import filter_xyz_by_geometry
 from molecular_force_field.active_learning.model_devi import ModelDeviCalculator
 from molecular_force_field.active_learning.pes_coverage import evaluate_pes_coverage
 from molecular_force_field.active_learning.stage_scheduler import (
@@ -133,6 +134,8 @@ def _run_one_stage(
     master_port: int = 29500,
     launcher: str = "auto",
     external_field: Optional[list] = None,
+    geometry_min_dist: float = 0.5,
+    geometry_covalent_scale: float = 0.75,
 ) -> int:
     """Run iterations for one stage until converged or max_iters reached.
 
@@ -270,6 +273,27 @@ def _run_one_stage(
             if not os.path.exists(traj_path):
                 raise FileNotFoundError(f"Exploration failed: {traj_path}")
 
+        filtered_traj_path = os.path.join(iter_path, "explore_traj.filtered.xyz")
+        n_kept_traj, n_rejected_traj, traj_reason_counts = filter_xyz_by_geometry(
+            traj_path,
+            filtered_traj_path,
+            min_dist=geometry_min_dist,
+            covalent_scale=geometry_covalent_scale,
+        )
+        if n_rejected_traj:
+            logger.info(
+                "Geometry filter (trajectory): kept=%d rejected=%d reasons=%s",
+                n_kept_traj,
+                n_rejected_traj,
+                dict(traj_reason_counts),
+            )
+        if n_kept_traj == 0:
+            logger.warning("No valid explored frames after geometry filtering; continuing to next iteration.")
+            scheduler.increment_iter(stage_idx)
+            _save_loop_state(work_dir, scheduler)
+            continue
+        traj_path = filtered_traj_path
+
         # ---- 3. Model deviation (+ per-atom data for diversity) ----
         candidate_path = os.path.join(iter_path, "candidate.xyz")
         model_devi_path = os.path.join(iter_path, "model_devi.out")
@@ -300,12 +324,14 @@ def _run_one_stage(
                 logger.info(f"Reusing existing model deviation file: {model_devi_path}")
             else:
                 import torch
-                calc = ModelDeviCalculator(
+                calc_kwargs = dict(
                     checkpoint_paths=checkpoints,
                     device=torch.device(device),
                     atomic_energy_file=e0_path,
-                    external_field=external_field,
                 )
+                if external_field is not None:
+                    calc_kwargs["external_field"] = external_field
+                calc = ModelDeviCalculator(**calc_kwargs)
                 calc.compute_from_trajectory(traj_path, output_path=model_devi_path)
 
             # ---- 4. Layer 0 + 1: uncertainty gate (+ fail recovery) ----
@@ -374,6 +400,27 @@ def _run_one_stage(
                     f"{len(diverse_atoms)} candidates"
                 )
 
+        filtered_candidate_path = os.path.join(iter_path, "candidate.filtered.xyz")
+        n_kept_cand, n_rejected_cand, cand_reason_counts = filter_xyz_by_geometry(
+            candidate_path,
+            filtered_candidate_path,
+            min_dist=geometry_min_dist,
+            covalent_scale=geometry_covalent_scale,
+        )
+        if n_rejected_cand:
+            logger.info(
+                "Geometry filter (candidate): kept=%d rejected=%d reasons=%s",
+                n_kept_cand,
+                n_rejected_cand,
+                dict(cand_reason_counts),
+            )
+        if n_kept_cand == 0:
+            logger.warning("No valid candidate frames after geometry filtering; continuing to next iteration.")
+            scheduler.increment_iter(stage_idx)
+            _save_loop_state(work_dir, scheduler)
+            continue
+        candidate_path = filtered_candidate_path
+
         # ---- 6. Label ----
         labeled_path = os.path.join(iter_path, "labeled.xyz")
         if os.path.exists(labeled_path):
@@ -386,13 +433,15 @@ def _run_one_stage(
         if os.path.exists(merge_done):
             logger.info(f"Merge already completed for this iteration: {merge_done}")
         else:
-            merge_training_data(
+            merge_kwargs = dict(
                 data_dir=data_dir,
                 new_xyz_path=labeled_path,
                 e0_csv_path=e0_path,
                 max_radius=max_radius,
-                external_field=external_field,
             )
+            if external_field is not None:
+                merge_kwargs["external_field"] = external_field
+            merge_training_data(**merge_kwargs)
             with open(merge_done, "w") as f:
                 f.write("ok\n")
         scheduler.increment_iter(stage_idx)
@@ -435,6 +484,8 @@ def run_active_learning_loop(
     master_port: int = 29500,
     launcher: str = "auto",
     external_field: Optional[list] = None,
+    geometry_min_dist: float = 0.5,
+    geometry_covalent_scale: float = 0.75,
 ) -> None:
     """Run DPGen2-style active learning loop with multi-layer filtering.
 
@@ -593,6 +644,8 @@ def run_active_learning_loop(
             master_port=master_port,
             launcher=launcher,
             external_field=external_field,
+            geometry_min_dist=geometry_min_dist,
+            geometry_covalent_scale=geometry_covalent_scale,
         )
 
     logger.info(scheduler.summary())

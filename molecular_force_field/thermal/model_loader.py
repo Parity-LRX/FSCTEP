@@ -119,6 +119,7 @@ def _build_model(
     long_range_energy_partition: str,
     long_range_green_mode: str,
     long_range_assignment: str,
+    long_range_mesh_fft_full_ewald: bool,
     feature_spectral_mode: str,
     feature_spectral_bottleneck_dim: int,
     feature_spectral_mesh_size: int,
@@ -127,6 +128,7 @@ def _build_model(
     feature_spectral_slab_padding_factor: int,
     feature_spectral_neutralize: bool,
     feature_spectral_include_k0: bool,
+    feature_spectral_assignment: str,
     feature_spectral_gate_init: float,
     invariant_channels: int,
 ):
@@ -188,6 +190,7 @@ def _build_model(
             long_range_energy_partition=long_range_energy_partition,
             long_range_green_mode=long_range_green_mode,
             long_range_assignment=long_range_assignment,
+            long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             long_range_far_source_dim=long_range_far_source_dim,
             long_range_far_num_shells=long_range_far_num_shells,
             long_range_far_shell_growth=long_range_far_shell_growth,
@@ -205,6 +208,7 @@ def _build_model(
             feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
     elif tensor_product_mode == "pure-cartesian-ictd-save":
@@ -371,6 +375,7 @@ def _build_model(
             long_range_energy_partition=long_range_energy_partition,
             long_range_green_mode=long_range_green_mode,
             long_range_assignment=long_range_assignment,
+            long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             long_range_far_source_dim=long_range_far_source_dim,
             long_range_far_num_shells=long_range_far_num_shells,
             long_range_far_shell_growth=long_range_far_shell_growth,
@@ -388,6 +393,7 @@ def _build_model(
             feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
     else:
@@ -499,6 +505,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
     long_range_energy_partition = str(_get_resolved_option(None, arch_meta, "long_range_energy_partition", "potential"))
     long_range_green_mode = str(_get_resolved_option(None, arch_meta, "long_range_green_mode", "poisson"))
     long_range_assignment = str(_get_resolved_option(None, arch_meta, "long_range_assignment", "cic"))
+    long_range_mesh_fft_full_ewald = bool(_get_resolved_option(None, arch_meta, "long_range_mesh_fft_full_ewald", False))
     long_range_theta = float(_get_resolved_option(None, arch_meta, "long_range_theta", 0.5))
     long_range_leaf_size = int(_get_resolved_option(None, arch_meta, "long_range_leaf_size", 32))
     long_range_multipole_order = int(_get_resolved_option(None, arch_meta, "long_range_multipole_order", 0))
@@ -526,6 +533,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
     feature_spectral_slab_padding_factor = int(_get_resolved_option(None, arch_meta, "feature_spectral_slab_padding_factor", 2))
     feature_spectral_neutralize = bool(_get_resolved_option(None, arch_meta, "feature_spectral_neutralize", True))
     feature_spectral_include_k0 = bool(_get_resolved_option(None, arch_meta, "feature_spectral_include_k0", False))
+    feature_spectral_assignment = str(_get_resolved_option(None, arch_meta, "feature_spectral_assignment", "cic"))
     feature_spectral_gate_init = float(_get_resolved_option(None, arch_meta, "feature_spectral_gate_init", 0.0))
 
     tensor_product_mode = options.tensor_product_mode or checkpoint.get("tensor_product_mode", "spherical")
@@ -558,6 +566,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
         long_range_energy_partition=long_range_energy_partition,
         long_range_green_mode=long_range_green_mode,
         long_range_assignment=long_range_assignment,
+        long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_theta=long_range_theta,
         long_range_leaf_size=long_range_leaf_size,
         long_range_multipole_order=long_range_multipole_order,
@@ -578,6 +587,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
         feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
         invariant_channels=int(_get_resolved_option(None, arch_meta, "invariant_channels", 32)),
     )

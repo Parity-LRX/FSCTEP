@@ -151,14 +151,18 @@ def bucketed_tp_forward(
             raise RuntimeError("ictd_tp_backend='cuda_ext' is unavailable for this call: mul_in2_not_supported")
         return None
 
-    with _exact_cuda_matmul_mode(a):
-        y = _project_forward_op(
-            a.contiguous(),
-            b.contiguous(),
-            U_bucket.contiguous(),
-            int(W_stack.shape[0]),
-        )
-        out, _ = _mix_forward_op(y, W_stack.contiguous(), gates)
+    a_c = a.contiguous()
+    b_c = b.contiguous()
+    u_c = U_bucket.contiguous()
+    w_c = W_stack.contiguous()
+    num_paths = int(W_stack.shape[0])
+
+    with _exact_cuda_matmul_mode(a_c):
+        if not torch.is_grad_enabled():
+            y = _ictd_tp_ext.project_bucket_forward(a_c, b_c, u_c, num_paths)
+        else:
+            y = _project_forward_op(a_c, b_c, u_c, num_paths)
+        out, _ = _mix_forward_op(y, w_c, gates)
     return out
 
 

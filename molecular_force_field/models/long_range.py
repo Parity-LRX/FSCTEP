@@ -78,35 +78,98 @@ def _prepare_frac_for_boundary(
     return frac
 
 
-def _corner_weights_from_frac(frac: torch.Tensor) -> torch.Tensor:
-    wx0 = 1.0 - frac[:, 0]
-    wy0 = 1.0 - frac[:, 1]
-    wz0 = 1.0 - frac[:, 2]
-    wx1 = frac[:, 0]
-    wy1 = frac[:, 1]
-    wz1 = frac[:, 2]
-    return torch.stack(
-        [
-            wx0 * wy0 * wz0,
-            wx0 * wy0 * wz1,
-            wx0 * wy1 * wz0,
-            wx0 * wy1 * wz1,
-            wx1 * wy0 * wz0,
-            wx1 * wy0 * wz1,
-            wx1 * wy1 * wz0,
-            wx1 * wy1 * wz1,
-        ],
-        dim=1,
-    )
+def _assignment_stencil_size(assignment: str) -> int:
+    if assignment == "cic":
+        return 2
+    if assignment == "tsc":
+        return 3
+    if assignment == "pcs":
+        return 4
+    raise ValueError(f"Unsupported mesh assignment: {assignment!r}")
+
+
+def _build_assignment_offsets(assignment: str) -> torch.Tensor:
+    stencil = _assignment_stencil_size(assignment)
+    values = torch.arange(stencil, dtype=torch.long)
+    return torch.cartesian_prod(values, values, values)
+
+
+def _assignment_kernel_1d(scaled: torch.Tensor, assignment: str) -> tuple[torch.Tensor, torch.Tensor]:
+    if assignment == "cic":
+        base = torch.floor(scaled).to(dtype=torch.long)
+        frac = scaled - base.to(dtype=scaled.dtype)
+        weights = torch.stack([1.0 - frac, frac], dim=-1)
+        return base, weights
+
+    if assignment == "tsc":
+        shifted = scaled - 0.5
+        base = torch.floor(shifted).to(dtype=torch.long)
+        local = scaled - base.to(dtype=scaled.dtype)
+        weights = torch.stack(
+            [
+                0.5 * (1.5 - local).square(),
+                0.75 - (local - 1.0).square(),
+                0.5 * (local - 0.5).square(),
+            ],
+            dim=-1,
+        )
+        return base, weights
+
+    if assignment == "pcs":
+        floor_scaled = torch.floor(scaled).to(dtype=torch.long)
+        base = floor_scaled - 1
+        frac = scaled - floor_scaled.to(dtype=scaled.dtype)
+        frac2 = frac * frac
+        frac3 = frac2 * frac
+        weights = torch.stack(
+            [
+                ((1.0 - frac).pow(3)) / 6.0,
+                (3.0 * frac3 - 6.0 * frac2 + 4.0) / 6.0,
+                (-3.0 * frac3 + 3.0 * frac2 + 3.0 * frac + 1.0) / 6.0,
+                frac3 / 6.0,
+            ],
+            dim=-1,
+        )
+        return base, weights
+
+    raise ValueError(f"Unsupported mesh assignment: {assignment!r}")
+
+
+def _assignment_weights_from_scaled(scaled: torch.Tensor, assignment: str) -> tuple[torch.Tensor, torch.Tensor]:
+    base_components: list[torch.Tensor] = []
+    weight_components: list[torch.Tensor] = []
+    for dim in range(3):
+        base_dim, weights_dim = _assignment_kernel_1d(scaled[:, dim], assignment)
+        base_components.append(base_dim)
+        weight_components.append(weights_dim)
+    base = torch.stack(base_components, dim=-1)
+    weights = (
+        weight_components[0][:, :, None, None]
+        * weight_components[1][:, None, :, None]
+        * weight_components[2][:, None, None, :]
+    ).reshape(scaled.size(0), -1)
+    return base, weights
+
+
+def _assignment_window_1d(
+    *,
+    mesh_size: int,
+    assignment: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    exponent = _assignment_stencil_size(assignment)
+    freq = _fft_integer_frequencies(mesh_size, device=device, dtype=dtype)
+    return torch.sinc(freq / float(mesh_size)).pow(exponent)
 
 
 def _apply_mesh_boundary(idx: torch.Tensor, *, mesh_size: int, boundary: str) -> torch.Tensor:
     if boundary == "periodic":
         return torch.remainder(idx, mesh_size)
     idx_wrapped = idx.clone()
-    idx_wrapped[:, 0] = torch.remainder(idx_wrapped[:, 0], mesh_size)
-    idx_wrapped[:, 1] = torch.remainder(idx_wrapped[:, 1], mesh_size)
-    idx_wrapped[:, 2] = idx_wrapped[:, 2].clamp(0, mesh_size - 1)
+    idx_wrapped[..., 0] = torch.remainder(idx_wrapped[..., 0], mesh_size)
+    idx_wrapped[..., 1] = torch.remainder(idx_wrapped[..., 1], mesh_size)
+    idx_wrapped[..., 2] = idx_wrapped[..., 2].clamp(0, mesh_size - 1)
     return idx_wrapped
 
 
@@ -115,24 +178,26 @@ def _spread_source_to_mesh(
     source: torch.Tensor,
     *,
     mesh_size: int,
-    corner_offsets: torch.Tensor,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
     boundary: str,
 ) -> torch.Tensor:
     channels = int(source.size(1))
     mesh = source.new_zeros((mesh_size, mesh_size, mesh_size, channels))
     flat_mesh = mesh.view(-1, channels)
     scaled = frac * float(mesh_size)
-    base = torch.floor(scaled).to(dtype=torch.long)
-    frac_offset = scaled - base.to(dtype=scaled.dtype)
-    corner_weights = _corner_weights_from_frac(frac_offset)
-    for corner in range(8):
-        idx = _apply_mesh_boundary(base + corner_offsets[corner], mesh_size=mesh_size, boundary=boundary)
-        flat_idx = ((idx[:, 0] * mesh_size) + idx[:, 1]) * mesh_size + idx[:, 2]
-        flat_mesh.scatter_add_(
-            0,
-            flat_idx.unsqueeze(-1).expand(-1, channels),
-            source * corner_weights[:, corner].unsqueeze(-1),
-        )
+    base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
+    idx = _apply_mesh_boundary(
+        base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
+        mesh_size=mesh_size,
+        boundary=boundary,
+    )
+    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    flat_mesh.scatter_add_(
+        0,
+        flat_idx.reshape(-1, 1).expand(-1, channels),
+        (source.unsqueeze(1) * stencil_weights.unsqueeze(-1)).reshape(-1, channels),
+    )
     return mesh
 
 
@@ -141,21 +206,22 @@ def _gather_source_from_mesh(
     mesh: torch.Tensor,
     *,
     mesh_size: int,
-    corner_offsets: torch.Tensor,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
     boundary: str,
 ) -> torch.Tensor:
     channels = int(mesh.size(-1))
     flat_mesh = mesh.view(-1, channels)
     scaled = frac * float(mesh_size)
-    base = torch.floor(scaled).to(dtype=torch.long)
-    frac_offset = scaled - base.to(dtype=scaled.dtype)
-    corner_weights = _corner_weights_from_frac(frac_offset)
-    gathered = frac.new_zeros((frac.size(0), channels))
-    for corner in range(8):
-        idx = _apply_mesh_boundary(base + corner_offsets[corner], mesh_size=mesh_size, boundary=boundary)
-        flat_idx = ((idx[:, 0] * mesh_size) + idx[:, 1]) * mesh_size + idx[:, 2]
-        gathered = gathered + flat_mesh.index_select(0, flat_idx) * corner_weights[:, corner].unsqueeze(-1)
-    return gathered
+    base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
+    idx = _apply_mesh_boundary(
+        base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
+        mesh_size=mesh_size,
+        boundary=boundary,
+    )
+    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
+    return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
 
 
 class FeatureSpectralFilterGrid(nn.Module):
@@ -234,6 +300,7 @@ class FeatureSpectralResidualBlock(nn.Module):
         slab_padding_factor: int = 2,
         neutralize: bool = True,
         include_k0: bool = False,
+        assignment: str = "cic",
         gate_init: float = 0.0,
     ):
         super().__init__()
@@ -246,6 +313,7 @@ class FeatureSpectralResidualBlock(nn.Module):
         self.slab_padding_factor = max(int(slab_padding_factor), 1)
         self.neutralize = bool(neutralize)
         self.include_k0 = bool(include_k0)
+        self.assignment = str(assignment)
         self.input_norm = nn.LayerNorm(self.feature_dim)
         self.in_proj = nn.Linear(self.feature_dim, self.bottleneck_dim)
         self.out_proj = nn.Linear(self.bottleneck_dim, self.feature_dim, bias=False)
@@ -258,28 +326,13 @@ class FeatureSpectralResidualBlock(nn.Module):
             include_k0=self.include_k0,
         )
         self.gate = nn.Parameter(torch.tensor(float(gate_init)))
-        corner_offsets = torch.tensor(
-            [
-                [0, 0, 0],
-                [0, 0, 1],
-                [0, 1, 0],
-                [0, 1, 1],
-                [1, 0, 0],
-                [1, 0, 1],
-                [1, 1, 0],
-                [1, 1, 1],
-            ],
-            dtype=torch.long,
-        )
-        self.register_buffer("corner_offsets", corner_offsets, persistent=False)
+        assignment_offsets = _build_assignment_offsets(self.assignment)
+        self.register_buffer("assignment_offsets", assignment_offsets, persistent=False)
 
     def _neutralize_source(self, source: torch.Tensor) -> torch.Tensor:
         if not self.neutralize:
             return source
         return source - source.mean(dim=0, keepdim=True)
-
-    def _corner_weights(self, frac: torch.Tensor) -> torch.Tensor:
-        return _corner_weights_from_frac(frac)
 
     def _effective_cell(self, cell: torch.Tensor) -> torch.Tensor:
         return _effective_cell_for_boundary(
@@ -305,7 +358,8 @@ class FeatureSpectralResidualBlock(nn.Module):
             frac,
             source,
             mesh_size=self.mesh_size,
-            corner_offsets=self.corner_offsets,
+            assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets,
             boundary=self.boundary,
         )
 
@@ -314,7 +368,8 @@ class FeatureSpectralResidualBlock(nn.Module):
             frac,
             mesh,
             mesh_size=self.mesh_size,
-            corner_offsets=self.corner_offsets,
+            assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets,
             boundary=self.boundary,
         )
 
@@ -1509,6 +1564,7 @@ class MeshLongRangeKernel3D(nn.Module):
         energy_partition: str = "potential",
         green_mode: str = "poisson",
         assignment: str = "cic",
+        full_ewald: bool = False,
         k_norm_floor: float = 1.0e-6,
     ):
         super().__init__()
@@ -1516,7 +1572,7 @@ class MeshLongRangeKernel3D(nn.Module):
             raise ValueError(f"Unsupported reciprocal mesh boundary: {boundary!r}")
         if energy_partition not in {"potential", "uniform"}:
             raise ValueError(f"Unsupported reciprocal energy partition: {energy_partition!r}")
-        if assignment != "cic":
+        if assignment not in {"cic", "tsc", "pcs"}:
             raise ValueError(f"Unsupported mesh assignment: {assignment!r}")
         self.mesh_size = int(mesh_size)
         self.boundary = str(boundary)
@@ -1525,31 +1581,66 @@ class MeshLongRangeKernel3D(nn.Module):
         self.energy_partition = str(energy_partition)
         self.green_mode = str(green_mode)
         self.assignment = str(assignment)
+        self.full_ewald = bool(full_ewald)
         self.k_norm_floor = float(k_norm_floor)
+        self.ewald_alpha_prefactor = 5.0
+        self.assignment_window_floor = 1.0e-6
         self.green_kernel = ReciprocalGreenKernel(
             green_mode=self.green_mode,
             hidden_dim=int(filter_hidden_dim),
             k_norm_floor=self.k_norm_floor,
         )
-        corner_offsets = torch.tensor(
-            [
-                [0, 0, 0],
-                [0, 0, 1],
-                [0, 1, 0],
-                [0, 1, 1],
-                [1, 0, 0],
-                [1, 0, 1],
-                [1, 1, 0],
-                [1, 1, 1],
-            ],
-            dtype=torch.long,
-        )
-        self.register_buffer("corner_offsets", corner_offsets, persistent=False)
+        assignment_offsets = _build_assignment_offsets(self.assignment)
+        self.register_buffer("assignment_offsets", assignment_offsets, persistent=False)
+        self.register_buffer("real_space_shift_index", self._init_real_space_shifts(), persistent=False)
+        self.register_buffer("_assignment_window_cache", torch.empty(0), persistent=False)
+        self.register_buffer("_cached_spectral_cell", torch.empty(0), persistent=False)
+        self.register_buffer("_cached_spectral_weights", torch.empty(0), persistent=False)
+        self.register_buffer("_cached_spectral_alpha", torch.empty(0), persistent=False)
+        self.register_buffer("_cached_spectral_volume", torch.empty(0), persistent=False)
+        self.register_buffer("_cached_spectral_real_cutoff", torch.empty(0), persistent=False)
 
     @property
     def num_k(self) -> int:
         total = self.mesh_size * self.mesh_size * self.mesh_size
         return total if self.include_k0 else max(total - 1, 0)
+
+    def _periodic_axes(self) -> tuple[bool, bool, bool]:
+        if self.boundary == "periodic":
+            return True, True, True
+        return True, True, False
+
+    def _estimate_real_cutoff(self, cell: torch.Tensor) -> torch.Tensor:
+        periodic_axes = torch.tensor(self._periodic_axes(), device=cell.device, dtype=torch.bool)
+        periodic_vectors = cell[periodic_axes]
+        periodic_lengths = torch.linalg.vector_norm(periodic_vectors, dim=-1)
+        return 0.5 * periodic_lengths.min().clamp_min(self.k_norm_floor)
+
+    def _estimate_ewald_alpha(self, real_cutoff: torch.Tensor) -> torch.Tensor:
+        return real_cutoff.new_tensor(self.ewald_alpha_prefactor) / real_cutoff.clamp_min(self.k_norm_floor)
+
+    def _init_real_space_shifts(self) -> torch.Tensor:
+        ranges: list[torch.Tensor] = []
+        for is_periodic in self._periodic_axes():
+            values = [-1, 0, 1] if is_periodic else [0]
+            ranges.append(torch.tensor(values, dtype=torch.long))
+        return torch.cartesian_prod(*ranges)
+
+    def _build_assignment_window(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        cached = self._assignment_window_cache
+        expected_numel = self.mesh_size * self.mesh_size * self.mesh_size
+        if cached.numel() == expected_numel and cached.device == device and cached.dtype == dtype:
+            return cached
+        window_1d = _assignment_window_1d(
+            mesh_size=self.mesh_size,
+            assignment=self.assignment,
+            device=device,
+            dtype=dtype,
+        )
+        wx, wy, wz = torch.meshgrid(window_1d, window_1d, window_1d, indexing="ij")
+        window = wx * wy * wz
+        self._assignment_window_cache = window
+        return window
 
     def build_k_norms(self, cell: torch.Tensor, *, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         effective_cell = _effective_cell_for_boundary(
@@ -1567,19 +1658,95 @@ class MeshLongRangeKernel3D(nn.Module):
         volume = torch.abs(torch.linalg.det(effective_cell)).clamp_min(self.k_norm_floor)
         return k_norms, volume
 
-    def apply_green_kernel(self, mesh: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
-        mesh_dtype = mesh.dtype
-        mesh_complex = torch.fft.fftn(mesh, dim=(0, 1, 2))
-        k_norms, volume = self.build_k_norms(cell, dtype=mesh_dtype)
+    def _can_use_spectral_cache(self, cell: torch.Tensor, *, dtype: torch.dtype) -> bool:
+        if self.green_mode != "poisson" or self.training or torch.is_grad_enabled():
+            return False
+        cached_cell = self._cached_spectral_cell
+        return (
+            cached_cell.numel() == cell.numel()
+            and cached_cell.device == cell.device
+            and cached_cell.dtype == dtype
+            and torch.equal(cached_cell, cell.to(dtype=dtype))
+        )
+
+    def _build_reciprocal_spectral_weights(
+        self,
+        cell: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        if self._can_use_spectral_cache(cell, dtype=dtype):
+            alpha = self._cached_spectral_alpha if self.full_ewald and self._cached_spectral_alpha.numel() else None
+            real_cutoff = (
+                self._cached_spectral_real_cutoff
+                if self.full_ewald and self._cached_spectral_real_cutoff.numel()
+                else None
+            )
+            return self._cached_spectral_weights, alpha, self._cached_spectral_volume, real_cutoff
+
+        real_cutoff = None
+        alpha = None
+        k_norms, volume = self.build_k_norms(cell, dtype=dtype)
         spectral_weights = self.green_kernel(k_norms) / volume
-        if not self.include_k0:
+        if self.full_ewald:
+            real_cutoff = self._estimate_real_cutoff(cell.to(dtype=dtype))
+            alpha = self._estimate_ewald_alpha(real_cutoff)
+            spectral_weights = spectral_weights * torch.exp(-(k_norms.square()) / (4.0 * alpha * alpha))
+        if self.full_ewald or self.assignment != "cic":
+            assignment_window = self._build_assignment_window(device=cell.device, dtype=dtype)
+            assignment_scale = torch.reciprocal(assignment_window.clamp_min(self.assignment_window_floor).square())
+            spectral_weights = spectral_weights * assignment_scale
+        if self.full_ewald or (not self.include_k0):
             spectral_weights = torch.where(
                 k_norms > self.k_norm_floor,
                 spectral_weights,
                 torch.zeros_like(spectral_weights),
             )
+        if self.green_mode == "poisson" and (not self.training) and (not torch.is_grad_enabled()):
+            self._cached_spectral_cell = cell.to(dtype=dtype).detach().clone()
+            self._cached_spectral_weights = spectral_weights.detach().clone()
+            self._cached_spectral_volume = volume.detach().clone()
+            if alpha is None:
+                self._cached_spectral_alpha = volume.new_empty((0,))
+                self._cached_spectral_real_cutoff = volume.new_empty((0,))
+            else:
+                self._cached_spectral_alpha = alpha.detach().clone().reshape(())
+                self._cached_spectral_real_cutoff = real_cutoff.detach().clone().reshape(())
+        return spectral_weights, alpha, volume, real_cutoff
+
+    def apply_green_kernel(
+        self,
+        mesh: torch.Tensor,
+        cell: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        mesh_dtype = mesh.dtype
+        mesh_complex = torch.fft.fftn(mesh, dim=(0, 1, 2))
+        spectral_weights, alpha, volume, real_cutoff = self._build_reciprocal_spectral_weights(cell, dtype=mesh_dtype)
         filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1), dim=(0, 1, 2))
-        return filtered.real
+        return filtered.real, alpha, volume, real_cutoff
+
+    def _compute_real_space_potential(
+        self,
+        pos: torch.Tensor,
+        source: torch.Tensor,
+        cell: torch.Tensor,
+        *,
+        alpha: torch.Tensor,
+        real_cutoff: torch.Tensor,
+    ) -> torch.Tensor:
+        if pos.size(0) == 0:
+            return source.new_zeros(source.shape)
+        shift_index = self.real_space_shift_index.to(device=cell.device)
+        shift_cart = torch.matmul(shift_index.to(dtype=pos.dtype), cell.to(dtype=pos.dtype))
+        disp = pos.unsqueeze(1).unsqueeze(2) - pos.unsqueeze(0).unsqueeze(2) - shift_cart.unsqueeze(0).unsqueeze(0)
+        distance = torch.linalg.vector_norm(disp, dim=-1)
+        kernel = torch.special.erfc(alpha * distance) / distance.clamp_min(self.k_norm_floor)
+        valid = distance <= real_cutoff
+        zero_shift = (shift_index == 0).all(dim=1)
+        self_mask = torch.eye(pos.size(0), device=pos.device, dtype=torch.bool).unsqueeze(-1) & zero_shift.view(1, 1, -1)
+        kernel = kernel * (valid & (~self_mask)).to(dtype=source.dtype)
+        pair_kernel = kernel.sum(dim=-1)
+        return torch.matmul(pair_kernel, source)
 
     def forward(self, pos: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
         atom_energy = source.new_zeros((source.size(0), 1))
@@ -1600,18 +1767,40 @@ class MeshLongRangeKernel3D(nn.Module):
                 local_frac,
                 local_source,
                 mesh_size=self.mesh_size,
-                corner_offsets=self.corner_offsets,
+                assignment=self.assignment,
+                assignment_offsets=self.assignment_offsets,
                 boundary=self.boundary,
             )
-            potential_mesh = self.apply_green_kernel(mesh, cell[graph_idx])
-            potential = _gather_source_from_mesh(
+            potential_mesh, alpha, effective_volume, real_cutoff = self.apply_green_kernel(mesh, cell[graph_idx])
+            reciprocal_potential = _gather_source_from_mesh(
                 local_frac,
                 potential_mesh,
                 mesh_size=self.mesh_size,
-                corner_offsets=self.corner_offsets,
+                assignment=self.assignment,
+                assignment_offsets=self.assignment_offsets,
                 boundary=self.boundary,
             )
-            atom_energy_local = 0.5 * (local_source * potential).sum(dim=-1, keepdim=True)
+            total_potential = reciprocal_potential
+            if self.full_ewald:
+                assert alpha is not None and real_cutoff is not None
+                real_space_potential = self._compute_real_space_potential(
+                    local_pos,
+                    local_source,
+                    cell[graph_idx],
+                    alpha=alpha.to(dtype=local_pos.dtype),
+                    real_cutoff=real_cutoff.to(dtype=local_pos.dtype),
+                )
+                self_potential = (
+                    -2.0 * alpha.to(dtype=local_source.dtype) / math.sqrt(math.pi)
+                ) * local_source
+                net_source = local_source.sum(dim=0, keepdim=True)
+                background_potential = (
+                    -math.pi
+                    * net_source
+                    / (alpha.to(dtype=local_source.dtype).square() * effective_volume.to(dtype=local_source.dtype))
+                )
+                total_potential = reciprocal_potential + real_space_potential + self_potential + background_potential
+            atom_energy_local = 0.5 * (local_source * total_potential).sum(dim=-1, keepdim=True)
             if self.energy_partition == "uniform":
                 graph_total = atom_energy_local.sum()
                 atom_energy_local = graph_total.expand_as(atom_energy_local) / counts[graph_idx]
@@ -1639,6 +1828,7 @@ class LatentReciprocalLongRange(nn.Module):
         energy_partition: str = "potential",
         green_mode: str = "poisson",
         assignment: str = "cic",
+        mesh_fft_full_ewald: bool = False,
     ):
         super().__init__()
         if reciprocal_backend not in {"direct_kspace", "mesh_fft"}:
@@ -1658,6 +1848,10 @@ class LatentReciprocalLongRange(nn.Module):
         self.energy_partition = str(energy_partition)
         self.green_mode = str(green_mode)
         self.assignment = str(assignment)
+        self.mesh_fft_full_ewald = bool(mesh_fft_full_ewald)
+        self.source_kind = "latent_charge"
+        self.source_layout = "channels_last"
+        self.runtime_backend = "mesh_fft" if reciprocal_backend == "mesh_fft" else "none"
         self.source_head = LatentSourceHead(feature_dim, hidden_dim, source_channels=self.source_channels)
         if self.reciprocal_backend == "mesh_fft":
             self.kernel = MeshLongRangeKernel3D(
@@ -1669,6 +1863,7 @@ class LatentReciprocalLongRange(nn.Module):
                 energy_partition=self.energy_partition,
                 green_mode=self.green_mode,
                 assignment=self.assignment,
+                full_ewald=self.mesh_fft_full_ewald,
             )
             self.exports_reciprocal_source = True
             final_linear = self.source_head.net[-1]
@@ -1734,6 +1929,7 @@ def build_feature_spectral_module(
     slab_padding_factor: int = 2,
     neutralize: bool = True,
     include_k0: bool = False,
+    assignment: str = "cic",
     gate_init: float = 0.0,
 ) -> nn.Module | None:
     if mode == "none":
@@ -1748,6 +1944,7 @@ def build_feature_spectral_module(
             slab_padding_factor=slab_padding_factor,
             neutralize=neutralize,
             include_k0=include_k0,
+            assignment=assignment,
             gate_init=gate_init,
         )
     raise ValueError(f"Unsupported feature_spectral_mode: {mode!r}")
@@ -1771,6 +1968,7 @@ def build_long_range_module(
     energy_partition: str = "potential",
     green_mode: str = "poisson",
     assignment: str = "cic",
+    mesh_fft_full_ewald: bool = False,
     theta: float = 0.5,
     leaf_size: int = 32,
     multipole_order: int = 0,
@@ -1843,6 +2041,7 @@ def build_long_range_module(
             energy_partition=energy_partition,
             green_mode=green_mode,
             assignment=assignment,
+            mesh_fft_full_ewald=mesh_fft_full_ewald,
         )
     raise ValueError(f"Unsupported long_range_mode: {mode!r}")
 
@@ -1867,6 +2066,7 @@ def configure_long_range_modules(
     long_range_energy_partition: str = "potential",
     long_range_green_mode: str = "poisson",
     long_range_assignment: str = "cic",
+    long_range_mesh_fft_full_ewald: bool = False,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -1887,6 +2087,7 @@ def configure_long_range_modules(
     feature_spectral_slab_padding_factor: int = 2,
     feature_spectral_neutralize: bool = True,
     feature_spectral_include_k0: bool = False,
+    feature_spectral_assignment: str = "cic",
     feature_spectral_gate_init: float = 0.0,
 ) -> None:
     owner.long_range_mode = str(long_range_mode)
@@ -1904,6 +2105,7 @@ def configure_long_range_modules(
     owner.long_range_energy_partition = str(long_range_energy_partition)
     owner.long_range_green_mode = str(long_range_green_mode)
     owner.long_range_assignment = str(long_range_assignment)
+    owner.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
     owner.long_range_theta = float(long_range_theta)
     owner.long_range_leaf_size = int(long_range_leaf_size)
     owner.long_range_multipole_order = int(long_range_multipole_order)
@@ -1926,6 +2128,7 @@ def configure_long_range_modules(
     owner.feature_spectral_slab_padding_factor = int(feature_spectral_slab_padding_factor)
     owner.feature_spectral_neutralize = bool(feature_spectral_neutralize)
     owner.feature_spectral_include_k0 = bool(feature_spectral_include_k0)
+    owner.feature_spectral_assignment = str(feature_spectral_assignment)
     owner.feature_spectral_gate_init = float(feature_spectral_gate_init)
 
     owner.long_range_module = build_long_range_module(
@@ -1945,6 +2148,7 @@ def configure_long_range_modules(
         energy_partition=owner.long_range_energy_partition,
         green_mode=owner.long_range_green_mode,
         assignment=owner.long_range_assignment,
+        mesh_fft_full_ewald=owner.long_range_mesh_fft_full_ewald,
         theta=owner.long_range_theta,
         leaf_size=owner.long_range_leaf_size,
         multipole_order=owner.long_range_multipole_order,
@@ -1972,6 +2176,7 @@ def configure_long_range_modules(
         slab_padding_factor=owner.feature_spectral_slab_padding_factor,
         neutralize=owner.feature_spectral_neutralize,
         include_k0=owner.feature_spectral_include_k0,
+        assignment=owner.feature_spectral_assignment,
         gate_init=owner.feature_spectral_gate_init,
     )
     owner.long_range_runtime_backend = "none"

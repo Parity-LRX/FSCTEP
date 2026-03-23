@@ -37,9 +37,12 @@ from molecular_force_field.models.pure_cartesian_layers import (
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PureCartesianICTDTransformerLayer,
 )
-from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
-    PureCartesianICTDO3TransformerLayer,
-)
+try:
+    from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
+        PureCartesianICTDO3TransformerLayer,
+    )
+except ImportError:  # pragma: no cover
+    PureCartesianICTDO3TransformerLayer = None  # type: ignore[assignment]
 from molecular_force_field.models.pure_cartesian_sparse_layers import (
     PureCartesianSparseTransformerLayer,
 )
@@ -73,7 +76,6 @@ __all__ = [
     "EquivariantTensorProduct",
     "PureCartesianTransformerLayer",
     "PureCartesianICTDTransformerLayer",
-    "PureCartesianICTDO3TransformerLayer",
     "PureCartesianSparseTransformerLayer",
     "PureCartesianSparseTransformerLayerSave",
     "FastSymmetricSTF",
@@ -87,3 +89,6 @@ __all__ = [
     "MainNet2",
     "RMSELoss",
 ]
+
+if PureCartesianICTDO3TransformerLayer is not None:
+    __all__.append("PureCartesianICTDO3TransformerLayer")

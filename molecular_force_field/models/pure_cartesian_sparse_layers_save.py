@@ -16,6 +16,7 @@ from molecular_force_field.models.pure_cartesian import (
     PureCartesianElementwiseTensorProductO3,
     merge_by_rank_o3,
     split_by_rank_o3,
+    split_cat_by_rank_o3,
     total_dim_o3,
 )
 from molecular_force_field.models.pure_cartesian_sparse_layers import (
@@ -146,18 +147,24 @@ class PureCartesianSparseE3ConvSave(nn.Module):
         *,
         external_tensor: torch.Tensor | None = None,
         fidelity_ids: torch.Tensor | None = None,
+        edge_vec_cache: torch.Tensor | None = None,
+        edge_length_cache: torch.Tensor | None = None,
     ):
         dtype = next(self.parameters()).dtype
-        pos = pos.to(dtype=dtype)
-        cell = cell.to(dtype=dtype)
-        edge_shifts = edge_shifts.to(dtype=dtype)
 
-        edge_batch_idx = batch[edge_src]
-        edge_cells = cell[edge_batch_idx]
-        shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
-        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
-        edge_vec = edge_vec.to(dtype=dtype)
-        edge_length = edge_vec.norm(dim=1)
+        if edge_vec_cache is not None and edge_length_cache is not None:
+            edge_vec = edge_vec_cache
+            edge_length = edge_length_cache
+        else:
+            pos = pos.to(dtype=dtype)
+            cell = cell.to(dtype=dtype)
+            edge_shifts = edge_shifts.to(dtype=dtype)
+            edge_batch_idx = batch[edge_src]
+            edge_cells = cell[edge_batch_idx]
+            shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
+            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+            edge_vec = edge_vec.to(dtype=dtype)
+            edge_length = edge_vec.norm(dim=1)
 
         Ai = self.atom_mlp(self.atom_embedding(A.long()))
         Ai = apply_fidelity_embedding(Ai, batch, fidelity_ids, self.fidelity_embedding)
@@ -205,11 +212,12 @@ class PureCartesianSparseE3ConvSave(nn.Module):
                 dtype=Ai.dtype,
             )
             x1_blocks[(0, L)] = z
-            x1_blocks[(1, L)] = torch.zeros_like(z)
+            x1_blocks[(1, L)] = z  # Shared zero tensor (never written to)
         x1 = merge_by_rank_o3(x1_blocks, self.output_size, self.Lmax)
 
         e = self._edge_rank_powers(edge_vec, self.Lmax, normalize=True)
-        e_blocks = {(0, 0): e[0].view(-1, 1), (1, 0): torch.zeros_like(e[0].view(-1, 1))}
+        e0_view = e[0].view(-1, 1)
+        e_blocks = {(0, 0): e0_view, (1, 0): torch.zeros_like(e0_view)}
         for L in range(1, self.Lmax + 1):
             base = e[L].view(-1, 1, *([3] * L))
             e_blocks[(0, L)] = base
@@ -236,9 +244,7 @@ class PureCartesianSparseE3ConvSave(nn.Module):
         edge_features = self.tp(x1, e_flat, weights)
         num_nodes = pos.size(0)
         out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
-        num_edges_t = edge_features.new_ones(edge_src.shape[0]).sum()
-        num_nodes_t = out.new_ones(out.shape[0]).sum().clamp_min(1.0)
-        avg_num_neighbors = (num_edges_t / num_nodes_t).clamp_min(1e-8)
+        avg_num_neighbors = edge_features.new_tensor(edge_src.shape[0] / max(num_nodes, 1)).clamp_min(1e-8)
         out = out / avg_num_neighbors
         return out
 
@@ -285,6 +291,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         long_range_energy_partition: str = "potential",
         long_range_green_mode: str = "poisson",
         long_range_assignment: str = "cic",
+        long_range_mesh_fft_full_ewald: bool = False,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
         long_range_multipole_order: int = 0,
@@ -305,6 +312,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         feature_spectral_slab_padding_factor: int = 2,
         feature_spectral_neutralize: bool = True,
         feature_spectral_include_k0: bool = False,
+        feature_spectral_assignment: str = "cic",
         feature_spectral_gate_init: float = 0.0,
         physical_tensor_outputs: dict[str, dict] | None = None,
         external_tensor_rank: int | None = None,
@@ -429,6 +437,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
             long_range_energy_partition=long_range_energy_partition,
             long_range_green_mode=long_range_green_mode,
             long_range_assignment=long_range_assignment,
+            long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             long_range_theta=long_range_theta,
             long_range_leaf_size=long_range_leaf_size,
             long_range_multipole_order=long_range_multipole_order,
@@ -449,6 +458,7 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
             feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
         self.e3_conv_emb = self.e3_conv_layers[0]
@@ -521,6 +531,14 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
         edge_dst = edge_dst[sort_idx]
         edge_shifts = edge_shifts[sort_idx]
 
+        # Precompute edge geometry once for all conv layers
+        edge_batch_idx = batch[edge_src]
+        edge_cells = cell[edge_batch_idx]
+        shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
+        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+        edge_vec = edge_vec.to(dtype=dtype)
+        edge_length = edge_vec.norm(dim=1)
+
         features = []
         f_prev = self.e3_conv_layers[0](
             pos,
@@ -532,17 +550,16 @@ class PureCartesianSparseTransformerLayerSave(nn.Module):
             cell,
             external_tensor=external_tensor,
             fidelity_ids=fidelity_ids,
+            edge_vec_cache=edge_vec,
+            edge_length_cache=edge_length,
         )
         features.append(f_prev)
         for conv in self.e3_conv_layers[1:]:
-            f_prev = conv(f_prev, pos, batch, edge_src, edge_dst, edge_shifts, cell)
+            f_prev = conv(f_prev, pos, batch, edge_src, edge_dst, edge_shifts, cell,
+                          edge_vec_cache=edge_vec, edge_length_cache=edge_length)
             features.append(f_prev)
 
-        blocks_list = [split_by_rank_o3(f, self.channels, self.Lmax) for f in features]
-        combined_blocks = {}
-        for s in (0, 1):
-            for L in range(self.Lmax + 1):
-                combined_blocks[(s, L)] = torch.cat([blocks[(s, L)] for blocks in blocks_list], dim=1)
+        combined_blocks = split_cat_by_rank_o3(features, self.channels, self.Lmax)
         f_combine = merge_by_rank_o3(combined_blocks, self.combined_channels, self.Lmax)
 
         physical_out: dict[str, dict[int, torch.Tensor]] | None = None

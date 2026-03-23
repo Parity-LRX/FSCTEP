@@ -8,6 +8,7 @@ import torch
 
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
+    get_checkpoint_e3_state_dict,
     infer_physical_tensor_outputs_from_state_dict,
 )
 from molecular_force_field.utils.external_tensor_specs import normalize_external_tensor_specs
@@ -31,6 +32,7 @@ def build_e3trans_from_checkpoint(
         (e3trans, config)
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    selected_state_dict, state_source = get_checkpoint_e3_state_dict(ckpt)
     mode = tensor_product_mode or ckpt.get("tensor_product_mode")
     if mode is None:
         raise ValueError(
@@ -47,8 +49,7 @@ def build_e3trans_from_checkpoint(
     o3_irrep_preset = str(arch_meta.get("o3_irrep_preset", "auto"))
     o3_active_irreps = arch_meta.get("o3_active_irreps")
     if external_tensor_rank is None:
-        state = ckpt.get("e3trans_state_dict", {})
-        if "e3_conv_emb.external_tensor_scale_by_l" in state:
+        if "e3_conv_emb.external_tensor_scale_by_l" in selected_state_dict:
             external_tensor_rank = 1
     external_tensor_specs = normalize_external_tensor_specs(
         external_tensor_specs,
@@ -60,7 +61,7 @@ def build_e3trans_from_checkpoint(
     if physical_tensor_outputs is None:
         physical_tensor_outputs = arch_meta.get("physical_tensor_outputs")
     if physical_tensor_outputs is None:
-        physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(ckpt.get("e3trans_state_dict", {}))
+        physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(selected_state_dict)
 
     config = ModelConfig(dtype=torch.float64, max_radius=max_radius)
     if atomic_energy_file:
@@ -114,6 +115,7 @@ def build_e3trans_from_checkpoint(
     long_range_energy_partition = str(arch_meta.get("long_range_energy_partition", "potential"))
     long_range_green_mode = str(arch_meta.get("long_range_green_mode", "poisson"))
     long_range_assignment = str(arch_meta.get("long_range_assignment", "cic"))
+    long_range_mesh_fft_full_ewald = bool(arch_meta.get("long_range_mesh_fft_full_ewald", False))
     long_range_theta = float(arch_meta.get("long_range_theta", 0.5))
     long_range_leaf_size = int(arch_meta.get("long_range_leaf_size", 32))
     long_range_multipole_order = int(arch_meta.get("long_range_multipole_order", 0))
@@ -140,6 +142,7 @@ def build_e3trans_from_checkpoint(
     feature_spectral_slab_padding_factor = int(arch_meta.get("feature_spectral_slab_padding_factor", 2))
     feature_spectral_neutralize = bool(arch_meta.get("feature_spectral_neutralize", True))
     feature_spectral_include_k0 = bool(arch_meta.get("feature_spectral_include_k0", False))
+    feature_spectral_assignment = str(arch_meta.get("feature_spectral_assignment", "cic"))
     feature_spectral_gate_init = float(arch_meta.get("feature_spectral_gate_init", 0.0))
     common_long_range_kwargs = dict(
         long_range_mode=long_range_mode,
@@ -157,6 +160,7 @@ def build_e3trans_from_checkpoint(
         long_range_energy_partition=long_range_energy_partition,
         long_range_green_mode=long_range_green_mode,
         long_range_assignment=long_range_assignment,
+        long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_theta=long_range_theta,
         long_range_leaf_size=long_range_leaf_size,
         long_range_multipole_order=long_range_multipole_order,
@@ -177,6 +181,7 @@ def build_e3trans_from_checkpoint(
         feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
     )
     invariant_channels = int(arch_meta.get("invariant_channels", 32))
@@ -326,42 +331,6 @@ def build_e3trans_from_checkpoint(
             ictd_kwargs["external_tensor_irrep"] = external_tensor_irrep
         if external_tensor_specs is not None:
             ictd_kwargs["external_tensor_specs"] = external_tensor_specs
-        ictd_kwargs["long_range_mode"] = long_range_mode
-        ictd_kwargs["long_range_hidden_dim"] = long_range_hidden_dim
-        ictd_kwargs["long_range_boundary"] = long_range_boundary
-        ictd_kwargs["long_range_neutralize"] = long_range_neutralize
-        ictd_kwargs["long_range_filter_hidden_dim"] = long_range_filter_hidden_dim
-        ictd_kwargs["long_range_kmax"] = long_range_kmax
-        ictd_kwargs["long_range_mesh_size"] = long_range_mesh_size
-        ictd_kwargs["long_range_slab_padding_factor"] = long_range_slab_padding_factor
-        ictd_kwargs["long_range_include_k0"] = long_range_include_k0
-        ictd_kwargs["long_range_source_channels"] = long_range_source_channels
-        ictd_kwargs["long_range_backend"] = long_range_backend
-        ictd_kwargs["long_range_reciprocal_backend"] = long_range_reciprocal_backend
-        ictd_kwargs["long_range_energy_partition"] = long_range_energy_partition
-        ictd_kwargs["long_range_green_mode"] = long_range_green_mode
-        ictd_kwargs["long_range_assignment"] = long_range_assignment
-        ictd_kwargs["long_range_theta"] = long_range_theta
-        ictd_kwargs["long_range_leaf_size"] = long_range_leaf_size
-        ictd_kwargs["long_range_multipole_order"] = long_range_multipole_order
-        ictd_kwargs["long_range_far_source_dim"] = long_range_far_source_dim
-        ictd_kwargs["long_range_far_num_shells"] = long_range_far_num_shells
-        ictd_kwargs["long_range_far_shell_growth"] = long_range_far_shell_growth
-        ictd_kwargs["long_range_far_tail"] = long_range_far_tail
-        ictd_kwargs["long_range_far_tail_bins"] = long_range_far_tail_bins
-        ictd_kwargs["long_range_far_stats"] = long_range_far_stats
-        ictd_kwargs["long_range_far_max_radius_multiplier"] = long_range_far_max_radius_multiplier
-        ictd_kwargs["long_range_far_source_norm"] = long_range_far_source_norm
-        ictd_kwargs["long_range_far_gate_init"] = long_range_far_gate_init
-        ictd_kwargs["feature_spectral_mode"] = feature_spectral_mode
-        ictd_kwargs["feature_spectral_bottleneck_dim"] = feature_spectral_bottleneck_dim
-        ictd_kwargs["feature_spectral_mesh_size"] = feature_spectral_mesh_size
-        ictd_kwargs["feature_spectral_filter_hidden_dim"] = feature_spectral_filter_hidden_dim
-        ictd_kwargs["feature_spectral_boundary"] = feature_spectral_boundary
-        ictd_kwargs["feature_spectral_slab_padding_factor"] = feature_spectral_slab_padding_factor
-        ictd_kwargs["feature_spectral_neutralize"] = feature_spectral_neutralize
-        ictd_kwargs["feature_spectral_include_k0"] = feature_spectral_include_k0
-        ictd_kwargs["feature_spectral_gate_init"] = feature_spectral_gate_init
         e3trans = PureCartesianICTDTransformerLayerFull(
             **k_cartesian,
             physical_tensor_outputs=physical_tensor_outputs,
@@ -383,7 +352,6 @@ def build_e3trans_from_checkpoint(
             ictd_kwargs["external_tensor_irrep"] = external_tensor_irrep
         if external_tensor_specs is not None:
             ictd_kwargs["external_tensor_specs"] = external_tensor_specs
-        ictd_kwargs.update(common_long_range_kwargs)
         e3trans = PureCartesianICTDO3TransformerLayer(
             **k_cartesian,
             physical_tensor_outputs=physical_tensor_outputs,
@@ -407,8 +375,9 @@ def build_e3trans_from_checkpoint(
         )
 
     e3trans = e3trans.to(device=device, dtype=dtype)
-    state = ckpt.get("e3trans_ema_state_dict") or ckpt["e3trans_state_dict"]
-    e3trans.load_state_dict(state, strict=True)
+    if state_source == "ema":
+        logger.info("Using EMA weights from checkpoint: %s", checkpoint_path)
+    e3trans.load_state_dict(selected_state_dict, strict=True)
     e3trans = maybe_wrap_model_with_zbl(e3trans, arch_meta)
     e3trans.eval()
     return e3trans, config

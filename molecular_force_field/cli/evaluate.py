@@ -32,6 +32,7 @@ from molecular_force_field.evaluation.evaluator import Evaluator
 from molecular_force_field.evaluation.calculator import MyE3NNCalculator, DDPCalculator
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
+    get_checkpoint_e3_state_dict,
     get_checkpoint_atomic_energies,
     maybe_load_checkpoint,
     resolve_model_architecture,
@@ -324,10 +325,16 @@ def main():
                              'Recommended first-stage choice: poisson. '
                              'If not set, restore from checkpoint when available, else use poisson.')
     parser.add_argument('--long-range-assignment', type=str, default=None,
-                        choices=['cic'],
+                        choices=['cic', 'tsc', 'pcs'],
                         help='Particle-to-mesh assignment scheme for mesh_fft reciprocal long-range. '
-                             'Current recommended choice: cic. '
+                             'Current recommended choices: cic (fast baseline), tsc (better accuracy), pcs (highest-order). '
                              'If not set, restore from checkpoint when available, else use cic.')
+    parser.add_argument('--long-range-mesh-fft-full-ewald', dest='long_range_mesh_fft_full_ewald', action='store_true',
+                        help='Enable the complete Ewald correction stack for --long-range-reciprocal-backend=mesh_fft. '
+                             'This is slower and is disabled by default.')
+    parser.add_argument('--no-long-range-mesh-fft-full-ewald', dest='long_range_mesh_fft_full_ewald', action='store_false',
+                        help='Keep mesh_fft on the faster reciprocal-only path (default).')
+    parser.set_defaults(long_range_mesh_fft_full_ewald=None)
     parser.add_argument('--long-range-theta', type=float, default=None,
                         help='Opening-angle parameter for --long-range-backend tree_fmm. '
                              'Smaller values are more accurate and more expensive. '
@@ -397,6 +404,11 @@ def main():
     parser.add_argument('--no-feature-spectral-include-k0', dest='feature_spectral_include_k0', action='store_false',
                         help='Exclude the k=0 mode in the feature spectral block (default).')
     parser.set_defaults(feature_spectral_include_k0=None)
+    parser.add_argument('--feature-spectral-assignment', type=str, default=None,
+                        choices=['cic', 'tsc', 'pcs'],
+                        help='Particle-to-mesh assignment scheme for the feature spectral FFT block. '
+                             'Recommended choices: cic (fast baseline), tsc (better accuracy), pcs (highest-order). '
+                             'If not set, restore from checkpoint when available, else use cic.')
     parser.add_argument('--feature-spectral-gate-init', type=float, default=None,
                         help='Initial residual gate value for the feature spectral block.')
     parser.add_argument('--zbl-enabled', dest='zbl_enabled', action='store_true',
@@ -470,6 +482,7 @@ def main():
             "long_range_energy_partition": args.long_range_energy_partition,
             "long_range_green_mode": args.long_range_green_mode,
             "long_range_assignment": args.long_range_assignment,
+            "long_range_mesh_fft_full_ewald": args.long_range_mesh_fft_full_ewald,
             "long_range_theta": args.long_range_theta,
             "long_range_leaf_size": args.long_range_leaf_size,
             "long_range_multipole_order": args.long_range_multipole_order,
@@ -490,6 +503,7 @@ def main():
             "feature_spectral_slab_padding_factor": args.feature_spectral_slab_padding_factor,
             "feature_spectral_neutralize": args.feature_spectral_neutralize,
             "feature_spectral_include_k0": args.feature_spectral_include_k0,
+            "feature_spectral_assignment": args.feature_spectral_assignment,
             "feature_spectral_gate_init": args.feature_spectral_gate_init,
             "zbl_enabled": args.zbl_enabled,
             "zbl_inner_cutoff": args.zbl_inner_cutoff,
@@ -531,6 +545,7 @@ def main():
     args.long_range_energy_partition = resolved_arch["long_range_energy_partition"]
     args.long_range_green_mode = resolved_arch["long_range_green_mode"]
     args.long_range_assignment = resolved_arch["long_range_assignment"]
+    args.long_range_mesh_fft_full_ewald = resolved_arch["long_range_mesh_fft_full_ewald"]
     args.long_range_theta = resolved_arch["long_range_theta"]
     args.long_range_leaf_size = resolved_arch["long_range_leaf_size"]
     args.long_range_multipole_order = resolved_arch["long_range_multipole_order"]
@@ -551,6 +566,7 @@ def main():
     args.feature_spectral_slab_padding_factor = resolved_arch["feature_spectral_slab_padding_factor"]
     args.feature_spectral_neutralize = resolved_arch["feature_spectral_neutralize"]
     args.feature_spectral_include_k0 = resolved_arch["feature_spectral_include_k0"]
+    args.feature_spectral_assignment = resolved_arch["feature_spectral_assignment"]
     args.feature_spectral_gate_init = resolved_arch["feature_spectral_gate_init"]
     args.zbl_enabled = resolved_arch["zbl_enabled"]
     args.zbl_inner_cutoff = resolved_arch["zbl_inner_cutoff"]
@@ -664,6 +680,10 @@ def main():
                 "--long-range-mode reciprocal-spectral-v1 with --long-range-reciprocal-backend mesh_fft "
                 "requires --long-range-boundary periodic or slab"
             )
+        if args.long_range_mesh_fft_full_ewald and args.long_range_reciprocal_backend != "mesh_fft":
+            raise ValueError(
+                "--long-range-mesh-fft-full-ewald requires --long-range-reciprocal-backend mesh_fft"
+            )
 
     def _maybe_compile_e3trans(e3trans_module, *, precache_batch=None):
         if args.compile == 'none':
@@ -704,7 +724,9 @@ def main():
     # Load checkpoint
     if checkpoint is None:
         checkpoint = torch.load(args.checkpoint, map_location=device)
-    state_dict_ckpt = checkpoint.get("e3trans_state_dict", {})
+    state_dict_ckpt, checkpoint_weight_source = get_checkpoint_e3_state_dict(checkpoint)
+    if checkpoint_weight_source == "ema":
+        logging.info("Using EMA weights stored in checkpoint for evaluation.")
     physical_tensor_outputs_ckpt = resolved_arch["physical_tensor_outputs"]
     external_tensor_rank_ckpt = resolved_arch["external_tensor_rank"]
     external_tensor_irrep_ckpt = resolved_arch.get("external_tensor_irrep")
@@ -881,6 +903,7 @@ def main():
         long_range_energy_partition=args.long_range_energy_partition,
         long_range_green_mode=args.long_range_green_mode,
         long_range_assignment=args.long_range_assignment,
+        long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
         long_range_theta=args.long_range_theta,
         long_range_leaf_size=args.long_range_leaf_size,
         long_range_multipole_order=args.long_range_multipole_order,
@@ -901,6 +924,7 @@ def main():
         feature_spectral_slab_padding_factor=args.feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=args.feature_spectral_neutralize,
         feature_spectral_include_k0=args.feature_spectral_include_k0,
+        feature_spectral_assignment=args.feature_spectral_assignment,
         feature_spectral_gate_init=args.feature_spectral_gate_init,
     )
     common_invariant_kwargs = dict(invariant_channels=args.invariant_channels)
@@ -972,6 +996,7 @@ def main():
             long_range_energy_partition=args.long_range_energy_partition,
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
+            long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -1214,6 +1239,7 @@ def main():
             long_range_energy_partition=args.long_range_energy_partition,
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
+            long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -1264,7 +1290,7 @@ def main():
             **common_long_range_kwargs,
         ).to(device)
     
-    e3trans.load_state_dict(checkpoint['e3trans_state_dict'])
+    e3trans.load_state_dict(state_dict_ckpt)
     e3trans = maybe_wrap_model_with_zbl(e3trans, vars(args))
     e3trans.eval()
     

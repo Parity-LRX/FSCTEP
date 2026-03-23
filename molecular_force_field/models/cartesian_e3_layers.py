@@ -2769,7 +2769,7 @@ class CartesianTransformerLayerStrict(nn.Module):
                  long_range_include_k0: bool = False, long_range_source_channels: int = 1,
                  long_range_backend: str = "dense_pairwise", long_range_reciprocal_backend: str = "direct_kspace",
                  long_range_energy_partition: str = "potential", long_range_green_mode: str = "poisson",
-                 long_range_assignment: str = "cic", long_range_theta: float = 0.5,
+                 long_range_assignment: str = "cic", long_range_mesh_fft_full_ewald: bool = False, long_range_theta: float = 0.5,
                  long_range_leaf_size: int = 32, long_range_multipole_order: int = 0,
                  long_range_far_source_dim: int = 16, long_range_far_num_shells: int = 3,
                  long_range_far_shell_growth: float = 2.0, long_range_far_tail: bool = True,
@@ -2780,6 +2780,7 @@ class CartesianTransformerLayerStrict(nn.Module):
                  feature_spectral_mesh_size: int = 16, feature_spectral_filter_hidden_dim: int = 64,
                  feature_spectral_boundary: str = "periodic", feature_spectral_slab_padding_factor: int = 2,
                  feature_spectral_neutralize: bool = True, feature_spectral_include_k0: bool = False,
+                 feature_spectral_assignment: str = "cic",
                  feature_spectral_gate_init: float = 0.0):
         super().__init__()
         
@@ -2883,6 +2884,7 @@ class CartesianTransformerLayerStrict(nn.Module):
             long_range_energy_partition=long_range_energy_partition,
             long_range_green_mode=long_range_green_mode,
             long_range_assignment=long_range_assignment,
+            long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             long_range_theta=long_range_theta,
             long_range_leaf_size=long_range_leaf_size,
             long_range_multipole_order=long_range_multipole_order,
@@ -2903,6 +2905,7 @@ class CartesianTransformerLayerStrict(nn.Module):
             feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
         
@@ -3409,7 +3412,7 @@ class CartesianTransformerLayerLoose(nn.Module):
                  long_range_include_k0: bool = False, long_range_source_channels: int = 1,
                  long_range_backend: str = "dense_pairwise", long_range_reciprocal_backend: str = "direct_kspace",
                  long_range_energy_partition: str = "potential", long_range_green_mode: str = "poisson",
-                 long_range_assignment: str = "cic", long_range_theta: float = 0.5,
+                 long_range_assignment: str = "cic", long_range_mesh_fft_full_ewald: bool = False, long_range_theta: float = 0.5,
                  long_range_leaf_size: int = 32, long_range_multipole_order: int = 0,
                  long_range_far_source_dim: int = 16, long_range_far_num_shells: int = 3,
                  long_range_far_shell_growth: float = 2.0, long_range_far_tail: bool = True,
@@ -3420,6 +3423,7 @@ class CartesianTransformerLayerLoose(nn.Module):
                  feature_spectral_mesh_size: int = 16, feature_spectral_filter_hidden_dim: int = 64,
                  feature_spectral_boundary: str = "periodic", feature_spectral_slab_padding_factor: int = 2,
                  feature_spectral_neutralize: bool = True, feature_spectral_include_k0: bool = False,
+                 feature_spectral_assignment: str = "cic",
                  feature_spectral_gate_init: float = 0.0):
         super().__init__()
         
@@ -3524,6 +3528,7 @@ class CartesianTransformerLayerLoose(nn.Module):
             long_range_energy_partition=long_range_energy_partition,
             long_range_green_mode=long_range_green_mode,
             long_range_assignment=long_range_assignment,
+            long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             long_range_theta=long_range_theta,
             long_range_leaf_size=long_range_leaf_size,
             long_range_multipole_order=long_range_multipole_order,
@@ -3544,6 +3549,7 @@ class CartesianTransformerLayerLoose(nn.Module):
             feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
         

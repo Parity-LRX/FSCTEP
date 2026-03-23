@@ -140,6 +140,17 @@ def _resolve_init_structs(args):
     )
 
 
+def _resolve_mpi_command(command: str | None, mpi_ranks: int, mpi_launcher: str) -> str | None:
+    if command is None:
+        return None
+    if mpi_ranks <= 1:
+        return command
+    lowered = command.lower()
+    if "mpirun" in lowered or "mpiexec" in lowered:
+        return command
+    return f"{mpi_launcher} -np {mpi_ranks} {command}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DPGen2-style active learning for molecular force field.",
@@ -223,6 +234,11 @@ def main():
     parser.add_argument("--neb-final", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument(
+        "--dtype", type=str, default=None,
+        choices=["float32", "float64", "float", "double"],
+        help="Training dtype forwarded to mff-train (e.g. float32).",
+    )
+    parser.add_argument(
         "--tensor-product-mode", type=str, default=None,
         help=(
             "Tensor product mode for training (e.g. pure-cartesian-ictd, spherical). "
@@ -267,9 +283,18 @@ def main():
     )
     parser.add_argument(
         "--long-range-assignment", type=str, default=None,
-        choices=["cic"],
+        choices=["cic", "tsc", "pcs"],
         help="Forwarded to mff-train.",
     )
+    parser.add_argument(
+        "--long-range-mesh-fft-full-ewald", dest="long_range_mesh_fft_full_ewald", action="store_true",
+        help="Forwarded to mff-train. Enables the slower full Ewald correction path for mesh_fft.",
+    )
+    parser.add_argument(
+        "--no-long-range-mesh-fft-full-ewald", dest="long_range_mesh_fft_full_ewald", action="store_false",
+        help="Forwarded to mff-train. Keeps mesh_fft on the faster reciprocal-only path.",
+    )
+    parser.set_defaults(long_range_mesh_fft_full_ewald=None)
     parser.add_argument("--long-range-theta", type=float, default=None, help="Forwarded to mff-train.")
     parser.add_argument("--long-range-leaf-size", type=int, default=None, help="Forwarded to mff-train.")
     parser.add_argument("--long-range-multipole-order", type=int, default=None, help="Forwarded to mff-train.")
@@ -307,6 +332,11 @@ def main():
     )
     parser.set_defaults(long_range_neutralize=None)
     parser.add_argument(
+        "--feature-spectral-assignment", type=str, default=None,
+        choices=["cic", "tsc", "pcs"],
+        help="Forwarded to mff-train for feature_spectral_mode=fft.",
+    )
+    parser.add_argument(
         "--external-tensor-rank", type=int, default=None,
         help=(
             "External tensor rank for conv1 injection (e.g. 1 for electric field). "
@@ -342,6 +372,16 @@ def main():
             "1 (default): sequential. "
             ">1: launch that many concurrent threads via ThreadPoolExecutor. "
             "Only has effect when multiple --init-structure paths are given."
+        ),
+    )
+    parser.add_argument(
+        "--exploration-aggressiveness", type=float, default=1.0,
+        help=(
+            "High-level sampling knob for active learning. "
+            "1.0 = keep user/stage settings unchanged. "
+            "<1.0 = safer exploration: lowers temperature, timestep, steps, "
+            "and trust window while increasing Langevin damping. "
+            ">1.0 = more aggressive exploration."
         ),
     )
     parser.add_argument(
@@ -420,6 +460,19 @@ def main():
                         help="VASP smearing width in eV (default: 0.05)")
     parser.add_argument("--vasp-command", type=str, default=None,
                         help="Override ASE_VASP_COMMAND, e.g. 'mpiexec -np 8 vasp_std'")
+    parser.add_argument(
+        "--vasp-mpi-ranks", type=int, default=1,
+        help="MPI ranks per VASP job. >1 prefixes --vasp-command with the Intel MPI launcher.",
+    )
+    parser.add_argument(
+        "--vasp-mpi-launcher", type=str,
+        default="/opt/intel/oneapi/mpi/latest/bin/mpirun",
+        help="MPI launcher used when --vasp-mpi-ranks > 1 (default: Intel MPI mpirun).",
+    )
+    parser.add_argument(
+        "--vasp-ncore", type=int, default=None,
+        help="Optional INCAR NCORE for VASP performance tuning.",
+    )
     parser.add_argument("--vasp-cleanup", action="store_true",
                         help="Remove per-structure VASP run directories after success")
 
@@ -438,6 +491,15 @@ def main():
                         help="CP2K total system charge (default: 0)")
     parser.add_argument("--cp2k-command", type=str, default=None,
                         help="Override ASE_CP2K_COMMAND")
+    parser.add_argument(
+        "--cp2k-mpi-ranks", type=int, default=1,
+        help="MPI ranks per CP2K job. >1 prefixes --cp2k-command with the MPI launcher.",
+    )
+    parser.add_argument(
+        "--cp2k-mpi-launcher", type=str,
+        default="/opt/intel/oneapi/mpi/latest/bin/mpirun",
+        help="MPI launcher used when --cp2k-mpi-ranks > 1 (default: Intel MPI mpirun).",
+    )
     parser.add_argument("--cp2k-cleanup", action="store_true",
                         help="Remove per-structure CP2K run directories after success")
 
@@ -570,8 +632,29 @@ def main():
     parser.add_argument("--md-steps", type=int, default=10000)
     parser.add_argument("--md-timestep", type=float, default=1.0)
     parser.add_argument("--md-friction", type=float, default=0.01)
-    parser.add_argument("--md-relax-fmax", type=float, default=0.05)
+    parser.add_argument(
+        "--md-relax-fmax", type=float, default=0.0,
+        help=(
+            "Optional model-side pre-relaxation force threshold before MD. "
+            "Default: 0.0 (disabled) to preserve PES sampling."
+        ),
+    )
     parser.add_argument("--md-log-interval", type=int, default=10)
+    parser.add_argument(
+        "--geometry-min-dist", type=float, default=0.5,
+        help=(
+            "Absolute minimum allowed interatomic distance in Angstrom during "
+            "active-learning exploration/candidate filtering. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--geometry-covalent-scale", type=float, default=0.75,
+        help=(
+            "Chemistry-aware pair-distance threshold as "
+            "scale * (r_cov_i + r_cov_j). Applied together with "
+            "--geometry-min-dist; larger of the two wins. Set 0 to disable."
+        ),
+    )
 
     # ---- diversity selection (Layer 2) ----
     parser.add_argument(
@@ -652,6 +735,46 @@ def main():
             name="stage_0",
         )
 
+    if args.exploration_aggressiveness <= 0:
+        raise ValueError("--exploration-aggressiveness must be > 0")
+    if args.exploration_aggressiveness != 1.0:
+        factor = args.exploration_aggressiveness
+        for i, stage in enumerate(scheduler.stages):
+            base_temperature = stage.temperature
+            base_timestep = stage.timestep
+            base_nsteps = stage.nsteps
+            base_friction = stage.friction
+            base_level_f_lo = stage.level_f_lo
+            base_level_f_hi = stage.level_f_hi
+
+            stage.temperature = base_temperature * factor
+            stage.timestep = base_timestep * factor
+            stage.nsteps = max(1, int(round(base_nsteps * factor)))
+            stage.friction = base_friction / factor
+            stage.level_f_lo = base_level_f_lo * factor
+            stage.level_f_hi = max(stage.level_f_lo, base_level_f_hi * factor)
+
+            logging.info(
+                "Applied exploration aggressiveness %.3f to stage [%d] %s: "
+                "T %.3f->%.3f K, dt %.4f->%.4f fs, steps %d->%d, "
+                "friction %.4f->%.4f, level_f [%.4f, %.4f]->[%.4f, %.4f]",
+                factor,
+                i,
+                stage.name or f"stage_{i}",
+                base_temperature,
+                stage.temperature,
+                base_timestep,
+                stage.timestep,
+                base_nsteps,
+                stage.nsteps,
+                base_friction,
+                stage.friction,
+                base_level_f_lo,
+                base_level_f_hi,
+                stage.level_f_lo,
+                stage.level_f_hi,
+            )
+
     # ------------------------------------------------------------------ #
     # Build explore_fn
     # Accepts **kwargs so loop.py can pass input_structure / output_traj
@@ -684,6 +807,8 @@ def main():
                     relax_fmax=stage.relax_fmax,
                     log_interval=stage.log_interval,
                     external_field=efield,
+                    min_dist=args.geometry_min_dist,
+                    covalent_scale=args.geometry_covalent_scale,
                 )
             else:
                 if not args.neb_initial or not args.neb_final:
@@ -729,6 +854,9 @@ def main():
             return labeler.label(candidate_path, output_path, work_dir, checkpoint_path)
 
     elif args.label_type == "vasp":
+        vasp_kwargs = {}
+        if args.vasp_ncore is not None:
+            vasp_kwargs["ncore"] = args.vasp_ncore
         labeler = VaspLabeler(
             xc=args.vasp_xc,
             kpts=tuple(args.vasp_kpts),
@@ -736,7 +864,12 @@ def main():
             ediff=args.vasp_ediff,
             ismear=args.vasp_ismear,
             sigma=args.vasp_sigma,
-            command=args.vasp_command,
+            command=_resolve_mpi_command(
+                args.vasp_command,
+                args.vasp_mpi_ranks,
+                args.vasp_mpi_launcher,
+            ),
+            vasp_kwargs=vasp_kwargs,
             n_workers=args.label_n_workers,
             threads_per_worker=args.label_threads_per_worker,
             cleanup=args.vasp_cleanup,
@@ -754,7 +887,11 @@ def main():
             cutoff=args.cp2k_cutoff,
             max_scf=args.cp2k_max_scf,
             charge=args.cp2k_charge,
-            command=args.cp2k_command,
+            command=_resolve_mpi_command(
+                args.cp2k_command,
+                args.cp2k_mpi_ranks,
+                args.cp2k_mpi_launcher,
+            ),
             n_workers=args.label_n_workers,
             threads_per_worker=args.label_threads_per_worker,
             cleanup=args.cp2k_cleanup,
@@ -916,6 +1053,10 @@ def main():
     train_args = []
     if args.epochs is not None:
         train_args.extend(["--epochs", str(args.epochs)])
+    if args.device is not None:
+        train_args.extend(["--device", args.device])
+    if args.dtype is not None:
+        train_args.extend(["--dtype", args.dtype])
     if args.tensor_product_mode is not None:
         train_args.extend(["--tensor-product-mode", args.tensor_product_mode])
     if args.long_range_mode is not None:
@@ -944,6 +1085,10 @@ def main():
         train_args.extend(["--long-range-green-mode", args.long_range_green_mode])
     if args.long_range_assignment is not None:
         train_args.extend(["--long-range-assignment", args.long_range_assignment])
+    if args.long_range_mesh_fft_full_ewald is True:
+        train_args.append("--long-range-mesh-fft-full-ewald")
+    elif args.long_range_mesh_fft_full_ewald is False:
+        train_args.append("--no-long-range-mesh-fft-full-ewald")
     if args.long_range_theta is not None:
         train_args.extend(["--long-range-theta", str(args.long_range_theta)])
     if args.long_range_leaf_size is not None:
@@ -974,6 +1119,8 @@ def main():
         train_args.append("--long-range-neutralize")
     elif args.long_range_neutralize is False:
         train_args.append("--no-long-range-neutralize")
+    if args.feature_spectral_assignment is not None:
+        train_args.extend(["--feature-spectral-assignment", args.feature_spectral_assignment])
     if args.external_tensor_rank is not None:
         train_args.extend(["--external-tensor-rank", str(args.external_tensor_rank)])
     if args.external_field_file is not None:
@@ -1025,6 +1172,8 @@ def main():
         master_port=args.train_master_port,
         launcher=args.train_launcher,
         external_field=efield,
+        geometry_min_dist=args.geometry_min_dist,
+        geometry_covalent_scale=args.geometry_covalent_scale,
     )
 
 

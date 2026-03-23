@@ -147,6 +147,14 @@ def test_explicit_cuda_ext_backend_raises_on_unsupported_cpu_path():
         tp(x1, x2, gates)
 
 
+def test_optional_cuda_extension_module_import_has_safe_python_fallback():
+    import molecular_force_field._C_ictd_tp as ext
+
+    assert ext.has_cuda() is False
+    assert ictd_irreps_cuda.cuda_ext_available() is False
+    assert ictd_irreps_cuda.cuda_ext_has_cuda() is False
+
+
 def test_auto_backend_requires_experimental_env_before_considering_cuda(monkeypatch: pytest.MonkeyPatch):
     class _StubExt:
         @staticmethod

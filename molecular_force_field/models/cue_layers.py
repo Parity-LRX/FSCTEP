@@ -386,6 +386,7 @@ class E3_TransformerLayer_multi(nn.Module):
         long_range_energy_partition: str = "potential",
         long_range_green_mode: str = "poisson",
         long_range_assignment: str = "cic",
+        long_range_mesh_fft_full_ewald: bool = False,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
         long_range_multipole_order: int = 0,
@@ -406,6 +407,7 @@ class E3_TransformerLayer_multi(nn.Module):
         feature_spectral_slab_padding_factor: int = 2,
         feature_spectral_neutralize: bool = True,
         feature_spectral_include_k0: bool = False,
+        feature_spectral_assignment: str = "cic",
         feature_spectral_gate_init: float = 0.0,
     ):
         super().__init__()
@@ -515,6 +517,7 @@ class E3_TransformerLayer_multi(nn.Module):
             long_range_energy_partition=long_range_energy_partition,
             long_range_green_mode=long_range_green_mode,
             long_range_assignment=long_range_assignment,
+            long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
             long_range_theta=long_range_theta,
             long_range_leaf_size=long_range_leaf_size,
             long_range_multipole_order=long_range_multipole_order,
@@ -535,6 +538,7 @@ class E3_TransformerLayer_multi(nn.Module):
             feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
             feature_spectral_neutralize=feature_spectral_neutralize,
             feature_spectral_include_k0=feature_spectral_include_k0,
+            feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
 

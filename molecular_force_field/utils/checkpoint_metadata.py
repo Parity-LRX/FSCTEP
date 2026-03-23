@@ -44,6 +44,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "long_range_energy_partition": "potential",
     "long_range_green_mode": "poisson",
     "long_range_assignment": "cic",
+    "long_range_mesh_fft_full_ewald": False,
     "long_range_theta": 0.5,
     "long_range_leaf_size": 32,
     "long_range_multipole_order": 0,
@@ -65,6 +66,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "feature_spectral_slab_padding_factor": 2,
     "feature_spectral_neutralize": True,
     "feature_spectral_include_k0": False,
+    "feature_spectral_assignment": "cic",
     "feature_spectral_gate_init": 0.0,
     "zbl_enabled": False,
     "zbl_inner_cutoff": 0.8,
@@ -93,6 +95,34 @@ def maybe_load_checkpoint(path: str | None, *, map_location: str | torch.device 
         return None
     checkpoint = torch.load(path, map_location=map_location)
     return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def get_checkpoint_e3_state_dict(
+    checkpoint: Mapping[str, Any] | None,
+    *,
+    prefer_ema: bool = True,
+) -> tuple[Mapping[str, Any], str]:
+    """Return the model state_dict to use from a checkpoint.
+
+    By default we prefer EMA weights when they are available because they are the
+    weights used for validation/export in the EMA training flow.  The second
+    return value is a short source label: ``"ema"`` or ``"raw"``.
+    """
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Checkpoint must be a mapping to resolve e3trans weights.")
+
+    ema_state = checkpoint.get("e3trans_ema_state_dict")
+    if prefer_ema and isinstance(ema_state, Mapping):
+        return ema_state, "ema"
+
+    raw_state = checkpoint.get("e3trans_state_dict")
+    if isinstance(raw_state, Mapping):
+        return raw_state, "raw"
+
+    if isinstance(ema_state, Mapping):
+        return ema_state, "ema"
+
+    raise KeyError("Checkpoint does not contain e3trans_state_dict or e3trans_ema_state_dict.")
 
 
 def get_arch_metadata(checkpoint: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -401,6 +431,15 @@ def resolve_model_architecture(
             DEFAULT_MODEL_ARCHITECTURE["long_range_assignment"],
         )
     )
+    resolved["long_range_mesh_fft_full_ewald"] = bool(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "long_range_mesh_fft_full_ewald",
+            DEFAULT_MODEL_ARCHITECTURE["long_range_mesh_fft_full_ewald"],
+        )
+    )
     resolved["long_range_theta"] = float(
         _resolve_value(
             overrides,
@@ -586,6 +625,15 @@ def resolve_model_architecture(
             DEFAULT_MODEL_ARCHITECTURE["feature_spectral_include_k0"],
         )
     )
+    resolved["feature_spectral_assignment"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "feature_spectral_assignment",
+            DEFAULT_MODEL_ARCHITECTURE["feature_spectral_assignment"],
+        )
+    )
     resolved["feature_spectral_gate_init"] = float(
         _resolve_value(
             overrides,
@@ -648,7 +696,13 @@ def resolve_model_architecture(
         DEFAULT_MODEL_ARCHITECTURE["long_range_num_k"],
     )
 
-    state_dict = checkpoint.get("e3trans_state_dict", {}) if checkpoint is not None else {}
+    if checkpoint is not None:
+        try:
+            state_dict, _ = get_checkpoint_e3_state_dict(checkpoint)
+        except (KeyError, ValueError):
+            state_dict = {}
+    else:
+        state_dict = {}
     physical_tensor_outputs = checkpoint.get("physical_tensor_outputs") if checkpoint is not None else None
     if physical_tensor_outputs is None:
         physical_tensor_outputs = arch_meta.get("physical_tensor_outputs")

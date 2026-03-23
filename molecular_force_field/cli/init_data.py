@@ -30,6 +30,7 @@ import logging
 import os
 import subprocess
 import sys
+import shutil
 
 import numpy as np
 
@@ -73,6 +74,9 @@ def _build_labeler(args):
         threads_per_worker=args.label_threads_per_worker,
         error_handling=args.label_error_handling,
     )
+    vasp_kwargs = {}
+    if args.vasp_ncore is not None:
+        vasp_kwargs["ncore"] = args.vasp_ncore
 
     if args.label_type == "pyscf":
         return PySCFLabeler(
@@ -92,7 +96,8 @@ def _build_labeler(args):
             ediff=args.vasp_ediff,
             ismear=args.vasp_ismear,
             sigma=args.vasp_sigma,
-            command=args.vasp_command,
+            command=_resolve_mpi_command(args.vasp_command, args.vasp_mpi_ranks, args.vasp_mpi_launcher),
+            vasp_kwargs=vasp_kwargs,
             cleanup=args.vasp_cleanup,
             **common,
         )
@@ -104,7 +109,7 @@ def _build_labeler(args):
             cutoff=args.cp2k_cutoff,
             max_scf=args.cp2k_max_scf,
             charge=args.cp2k_charge,
-            command=args.cp2k_command,
+            command=_resolve_mpi_command(args.cp2k_command, args.cp2k_mpi_ranks, args.cp2k_mpi_launcher),
             cleanup=args.cp2k_cleanup,
             **common,
         )
@@ -152,6 +157,67 @@ def _build_labeler(args):
         raise ValueError(f"Unsupported label type: {args.label_type}")
 
 
+def _resolve_mpi_command(command, mpi_ranks, mpi_launcher):
+    if command is None:
+        return None
+    if mpi_ranks is None or mpi_ranks <= 1:
+        return command
+    lowered = command.lower()
+    if "mpirun" in lowered or "mpiexec" in lowered:
+        return command
+    return f"{mpi_launcher} -np {mpi_ranks} {command}"
+
+
+def _relax_seed_structures(structure_paths, labeler, output_dir, fmax=0.05, steps=200):
+    """Relax seed structures before perturbation for cold-start init data.
+
+    Uses the same ASE-backed backend as the later single-point labeling stage.
+    Non-ASE labelers are left untouched for compatibility.
+    """
+    if fmax <= 0:
+        logger.info("Seed relaxation disabled (fmax <= 0); using input structures directly.")
+        return structure_paths
+
+    if not hasattr(labeler, "_make_calculator"):
+        logger.warning(
+            "Labeler %s does not expose an ASE calculator; skipping seed relaxation.",
+            labeler.__class__.__name__,
+        )
+        return structure_paths
+
+    from ase.io import read as ase_read, write as ase_write
+    from ase.optimize import BFGS
+
+    relax_dir = os.path.join(output_dir, "relaxed_seeds")
+    if os.path.isdir(relax_dir):
+        shutil.rmtree(relax_dir)
+    os.makedirs(relax_dir, exist_ok=True)
+
+    relaxed_paths = []
+    for i, path in enumerate(structure_paths):
+        atoms = ase_read(path)
+        run_dir = os.path.join(relax_dir, f"seed_{i:04d}_work")
+        os.makedirs(run_dir, exist_ok=True)
+        calc = labeler._make_calculator(atoms, run_dir)
+        atoms.calc = calc
+        logger.info(
+            "Relaxing seed [%d] %s with %s (fmax=%s, steps=%d)",
+            i,
+            os.path.basename(path),
+            labeler.__class__.__name__,
+            fmax,
+            steps,
+        )
+        opt = BFGS(atoms, logfile=os.path.join(run_dir, "seed_relax.log"))
+        opt.run(fmax=fmax, steps=steps)
+        out_path = os.path.join(relax_dir, f"seed_{i:04d}.xyz")
+        ase_write(out_path, atoms, format="extxyz")
+        relaxed_paths.append(out_path)
+
+    logger.info("Relaxed %d seed structure(s) into %s", len(relaxed_paths), relax_dir)
+    return relaxed_paths
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate initial training data from seed structures.",
@@ -181,6 +247,23 @@ def main():
         help="Minimum interatomic distance filter in Å (default: 0.5)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    parser.add_argument(
+        "--seed-relax", dest="seed_relax", action="store_true",
+        help="Relax each cold-start seed structure before perturbation (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-seed-relax", dest="seed_relax", action="store_false",
+        help="Disable seed relaxation and perturb the raw input structures directly.",
+    )
+    parser.set_defaults(seed_relax=True)
+    parser.add_argument(
+        "--seed-relax-fmax", type=float, default=0.05,
+        help="Force threshold for cold-start seed relaxation (default: 0.05 eV/Ang).",
+    )
+    parser.add_argument(
+        "--seed-relax-steps", type=int, default=200,
+        help="Maximum optimizer steps for cold-start seed relaxation (default: 200).",
+    )
 
     # ---- output & preprocessing ----
     parser.add_argument(
@@ -228,6 +311,19 @@ def main():
     parser.add_argument("--vasp-ismear", type=int, default=0)
     parser.add_argument("--vasp-sigma", type=float, default=0.05)
     parser.add_argument("--vasp-command", type=str, default=None)
+    parser.add_argument(
+        "--vasp-mpi-ranks", type=int, default=1,
+        help="MPI ranks per VASP job. >1 prefixes --vasp-command with the Intel MPI launcher.",
+    )
+    parser.add_argument(
+        "--vasp-mpi-launcher", type=str,
+        default="/opt/intel/oneapi/mpi/latest/bin/mpirun",
+        help="MPI launcher used when --vasp-mpi-ranks > 1 (default: Intel MPI mpirun).",
+    )
+    parser.add_argument(
+        "--vasp-ncore", type=int, default=None,
+        help="Optional INCAR NCORE for VASP performance tuning.",
+    )
     parser.add_argument("--vasp-cleanup", action="store_true")
 
     # ---- CP2K ----
@@ -238,6 +334,15 @@ def main():
     parser.add_argument("--cp2k-max-scf", type=int, default=50)
     parser.add_argument("--cp2k-charge", type=float, default=0.0)
     parser.add_argument("--cp2k-command", type=str, default=None)
+    parser.add_argument(
+        "--cp2k-mpi-ranks", type=int, default=1,
+        help="MPI ranks per CP2K job. >1 prefixes --cp2k-command with the MPI launcher.",
+    )
+    parser.add_argument(
+        "--cp2k-mpi-launcher", type=str,
+        default="/opt/intel/oneapi/mpi/latest/bin/mpirun",
+        help="MPI launcher used when --cp2k-mpi-ranks > 1 (default: Intel MPI mpirun).",
+    )
     parser.add_argument("--cp2k-cleanup", action="store_true")
 
     # ---- QE ----
@@ -282,6 +387,18 @@ def main():
     for i, p in enumerate(structure_paths):
         logger.info(f"  [{i}] {p}")
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    labeler = _build_labeler(args)
+
+    if args.seed_relax:
+        structure_paths = _relax_seed_structures(
+            structure_paths,
+            labeler,
+            args.output_dir,
+            fmax=args.seed_relax_fmax,
+            steps=args.seed_relax_steps,
+        )
+
     # ---- 2. Generate perturbations ----
     from ase.io import write as ase_write
     all_atoms = generate_init_dataset(
@@ -293,13 +410,11 @@ def main():
         seed=args.seed,
     )
 
-    os.makedirs(args.output_dir, exist_ok=True)
     unlabeled_path = os.path.join(args.output_dir, "unlabeled.xyz")
     ase_write(unlabeled_path, all_atoms, format="extxyz")
     logger.info(f"Wrote {len(all_atoms)} unlabeled frames to {unlabeled_path}")
 
     # ---- 3. DFT labeling ----
-    labeler = _build_labeler(args)
     labeled_path = os.path.join(args.output_dir, "train.xyz")
     work_dir = os.path.join(args.output_dir, "_label_work")
     os.makedirs(work_dir, exist_ok=True)

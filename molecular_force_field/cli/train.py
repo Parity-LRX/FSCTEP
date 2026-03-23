@@ -340,13 +340,17 @@ def main():
     parser.add_argument('--learning-rate', type=float, default=1e-3,
                         help='Learning rate')
     parser.add_argument('--min-learning-rate', type=float, default=2e-5,
-                        help='Minimum learning rate')
+                        help='Minimum learning rate (eta_min for cosine / hard floor for step, default: 2e-5)')
     parser.add_argument('--warmup-batches', type=int, default=1000,
                         help='Number of warmup batches for learning rate (default: 1000)')
+    parser.add_argument('--lr-scheduler', type=str, default='step',
+                        choices=['cosine', 'step'],
+                        help='LR scheduler after warmup: "cosine" for CosineAnnealingLR, '
+                             '"step" for StepLR (default: cosine)')
     parser.add_argument('--lr-decay-patience', type=int, default=1000,
-                        help='Patience (in batches) before learning rate decay (default: 1000)')
+                        help='Step size (in batches) for StepLR scheduler (default: 1000)')
     parser.add_argument('--lr-decay-factor', type=float, default=0.98,
-                        help='Learning rate decay factor (default: 0.98)')
+                        help='Decay factor (gamma) for StepLR scheduler (default: 0.98)')
     parser.add_argument('--warmup-start-ratio', type=float, default=0.1,
                         help='Starting learning rate ratio during warmup (0.1 means start at 10%% of target LR, default: 0.1)')
     parser.add_argument('--checkpoint', type=str, default='combined_model.pth',
@@ -373,10 +377,11 @@ def main():
                         help='Float32 matmul precision. "high" (default) enables TF32 on Ampere+ GPUs for ~2x matmul speedup. Use "highest" for strict FP32.')
     parser.add_argument('--dump-frequency', type=int, default=250,
                         help='Frequency (in batches) for validation and model saving (default: 250)')
-    parser.add_argument('--train-eval-sample-ratio', type=float, default=0.2,
-                        help='Ratio of training set to evaluate during validation (0.0-1.0, default: 0.2). '
-                             'Set to 1.0 for full evaluation, or lower (e.g., 0.2 for 20%%) for faster validation. '
-                             'Useful for large datasets.')
+    parser.add_argument('--train-eval-sample-ratio', type=float, default=0.0,
+                        help='Ratio of training set to evaluate during validation (0.0-1.0, default: 0.0). '
+                             'When 0.0 (default), only the current batch loss is recorded as train loss (no extra forward pass). '
+                             'Set to e.g. 0.01 (1%%) to sample training set for more accurate train metrics, '
+                             'or 1.0 for full evaluation. Recommended: 0.01 for a good speed/accuracy trade-off.')
     parser.add_argument('--energy-log-frequency', type=int, default=100,
                         help='Frequency (in batches) to log energy predictions (default: 100)')
     parser.add_argument('--energy-weight', '-a', type=float, default=1.0,
@@ -413,9 +418,9 @@ def main():
     parser.add_argument('--ema-decay', type=float, default=0.999,
                         help='EMA decay factor in (0, 1). Larger -> smoother but slower (default: 0.999).')
     parser.add_argument('--use-ema-for-validation', action='store_true',
-                        help='Use EMA weights for validation forward pass (default: False).')
+                        help='Use EMA weights for validation forward pass. Auto-enabled when --ema-start-epoch is set.')
     parser.add_argument('--save-ema-model', action='store_true',
-                        help='Save EMA model weights into checkpoints (default: False).')
+                        help='Save EMA model weights into checkpoints. Auto-enabled when --ema-start-epoch is set.')
     parser.add_argument('--save-val-csv', action='store_true', default=False,
                         help='Save validation energy and force predictions to CSV files (default: True). '
                              'Files: val_energy_epoch{N}_batch{M}.csv and val_force_epoch{N}_batch{M}.csv')
@@ -701,10 +706,16 @@ def main():
                              'Recommended first-stage choice: poisson. '
                              'If not set, restore from checkpoint when available, else use poisson.')
     parser.add_argument('--long-range-assignment', type=str, default=None,
-                        choices=['cic'],
+                        choices=['cic', 'tsc', 'pcs'],
                         help='Particle-to-mesh assignment scheme for mesh_fft reciprocal long-range. '
-                             'Current recommended choice: cic. '
+                             'Current recommended choices: cic (fast baseline), tsc (better accuracy), pcs (highest-order). '
                              'If not set, restore from checkpoint when available, else use cic.')
+    parser.add_argument('--long-range-mesh-fft-full-ewald', dest='long_range_mesh_fft_full_ewald', action='store_true',
+                        help='Enable the complete Ewald correction stack for --long-range-reciprocal-backend=mesh_fft. '
+                             'This adds real-space, self, and background terms and is disabled by default.')
+    parser.add_argument('--no-long-range-mesh-fft-full-ewald', dest='long_range_mesh_fft_full_ewald', action='store_false',
+                        help='Keep mesh_fft on the faster reciprocal-only path (default).')
+    parser.set_defaults(long_range_mesh_fft_full_ewald=None)
     parser.add_argument('--long-range-theta', type=float, default=None,
                         help='Opening-angle parameter for --long-range-backend tree_fmm. '
                              'Smaller values are more accurate and more expensive. '
@@ -776,6 +787,11 @@ def main():
     parser.add_argument('--no-feature-spectral-include-k0', dest='feature_spectral_include_k0', action='store_false',
                         help='Exclude the k=0 mode in the feature spectral block (default).')
     parser.set_defaults(feature_spectral_include_k0=None)
+    parser.add_argument('--feature-spectral-assignment', type=str, default=None,
+                        choices=['cic', 'tsc', 'pcs'],
+                        help='Particle-to-mesh assignment scheme for the feature spectral FFT block. '
+                             'Recommended choices: cic (fast baseline), tsc (better accuracy), pcs (highest-order). '
+                             'If not set, restore from checkpoint when available, else use cic.')
     parser.add_argument('--feature-spectral-gate-init', type=float, default=None,
                         help='Initial residual gate value for the feature spectral block.')
     parser.add_argument('--zbl-enabled', dest='zbl_enabled', action='store_true',
@@ -877,6 +893,7 @@ def main():
             "long_range_energy_partition": args.long_range_energy_partition,
             "long_range_green_mode": args.long_range_green_mode,
             "long_range_assignment": args.long_range_assignment,
+            "long_range_mesh_fft_full_ewald": args.long_range_mesh_fft_full_ewald,
             "long_range_theta": args.long_range_theta,
             "long_range_leaf_size": args.long_range_leaf_size,
             "long_range_multipole_order": args.long_range_multipole_order,
@@ -897,6 +914,7 @@ def main():
             "feature_spectral_slab_padding_factor": args.feature_spectral_slab_padding_factor,
             "feature_spectral_neutralize": args.feature_spectral_neutralize,
             "feature_spectral_include_k0": args.feature_spectral_include_k0,
+            "feature_spectral_assignment": args.feature_spectral_assignment,
             "feature_spectral_gate_init": args.feature_spectral_gate_init,
             "zbl_enabled": args.zbl_enabled,
             "zbl_inner_cutoff": args.zbl_inner_cutoff,
@@ -936,6 +954,7 @@ def main():
     args.long_range_energy_partition = resolved_arch["long_range_energy_partition"]
     args.long_range_green_mode = resolved_arch["long_range_green_mode"]
     args.long_range_assignment = resolved_arch["long_range_assignment"]
+    args.long_range_mesh_fft_full_ewald = resolved_arch["long_range_mesh_fft_full_ewald"]
     args.long_range_theta = resolved_arch["long_range_theta"]
     args.long_range_leaf_size = resolved_arch["long_range_leaf_size"]
     args.long_range_multipole_order = resolved_arch["long_range_multipole_order"]
@@ -956,6 +975,7 @@ def main():
     args.feature_spectral_slab_padding_factor = resolved_arch["feature_spectral_slab_padding_factor"]
     args.feature_spectral_neutralize = resolved_arch["feature_spectral_neutralize"]
     args.feature_spectral_include_k0 = resolved_arch["feature_spectral_include_k0"]
+    args.feature_spectral_assignment = resolved_arch["feature_spectral_assignment"]
     args.feature_spectral_gate_init = resolved_arch["feature_spectral_gate_init"]
     args.zbl_enabled = resolved_arch["zbl_enabled"]
     args.zbl_inner_cutoff = resolved_arch["zbl_inner_cutoff"]
@@ -1180,6 +1200,10 @@ def main():
                 "--long-range-mode reciprocal-spectral-v1 with --long-range-reciprocal-backend mesh_fft "
                 "requires --long-range-boundary periodic or slab"
             )
+        if args.long_range_mesh_fft_full_ewald and args.long_range_reciprocal_backend != "mesh_fft":
+            raise ValueError(
+                "--long-range-mesh-fft-full-ewald requires --long-range-reciprocal-backend mesh_fft"
+            )
     
     # --- SWA (Stochastic Weight Averaging) ---
     if args.swa_start_epoch is not None:
@@ -1196,12 +1220,12 @@ def main():
             raise ValueError("--ema-start-epoch must be >= 1")
         if not (0.0 < args.ema_decay < 1.0):
             raise ValueError("--ema-decay must be in (0, 1)")
+        args.use_ema_for_validation = True
+        args.save_ema_model = True
         if rank == 0:
             logging.info(f"EMA enabled: Will start at epoch {args.ema_start_epoch} with decay={args.ema_decay}")
-            if args.use_ema_for_validation:
-                logging.info("  Using EMA model for validation")
-            if args.save_ema_model:
-                logging.info("  Will save EMA model in checkpoint")
+            logging.info("  Using EMA model for validation")
+            logging.info("  Will save EMA model in checkpoint")
     
     # --- Random seed ---
     torch.manual_seed(args.seed)
@@ -1531,6 +1555,7 @@ def main():
         long_range_energy_partition=args.long_range_energy_partition,
         long_range_green_mode=args.long_range_green_mode,
         long_range_assignment=args.long_range_assignment,
+        long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
         long_range_theta=args.long_range_theta,
         long_range_leaf_size=args.long_range_leaf_size,
         long_range_multipole_order=args.long_range_multipole_order,
@@ -1551,6 +1576,7 @@ def main():
         feature_spectral_slab_padding_factor=args.feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=args.feature_spectral_neutralize,
         feature_spectral_include_k0=args.feature_spectral_include_k0,
+        feature_spectral_assignment=args.feature_spectral_assignment,
         feature_spectral_gate_init=args.feature_spectral_gate_init,
     )
     common_invariant_kwargs = dict(invariant_channels=args.invariant_channels)
@@ -1705,6 +1731,7 @@ def main():
             long_range_energy_partition=args.long_range_energy_partition,
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
+            long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -1805,6 +1832,7 @@ def main():
             long_range_energy_partition=args.long_range_energy_partition,
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
+            long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -2042,6 +2070,7 @@ def main():
             long_range_energy_partition=args.long_range_energy_partition,
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
+            long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -2111,6 +2140,7 @@ def main():
         warmup_batches=args.warmup_batches,
         patience_opim=args.lr_decay_patience,
         gamma_value=args.lr_decay_factor,
+        lr_scheduler_type=args.lr_scheduler,
         epoch_numbers=args.epochs,
         checkpoint_path=args.checkpoint,
         use_checkpoint_loss_weights=not args.reset_loss_weights,

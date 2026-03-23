@@ -6,8 +6,8 @@ Key idea:
     (stored as (..., channels, 3, 3, ..., 3) with L copies of 3).
   - Build O(3)-equivariant bilinear maps using only:
       - outer products
-      - Kronecker delta contractions (δ_ij)
-      - Levi-Civita contractions (ε_ijk)
+      - Kronecker delta contractions (未_ij)
+      - Levi-Civita contractions (蔚_ijk)
     No spherical harmonics, no CG / wigner_3j, no explicit parity bookkeeping.
 
 This file provides:
@@ -119,6 +119,30 @@ def merge_by_rank_o3(blocks: Dict[Tuple[int, int], torch.Tensor], channels: int,
             parts.append(t.reshape(*batch_shape, channels * rank_dim(L)))
     return torch.cat(parts, dim=-1)
 
+
+def split_cat_by_rank_o3(features: List[torch.Tensor], channels: int, Lmax: int) -> Dict[Tuple[int, int], torch.Tensor]:
+    """
+    Split multiple O(3)-graded feature tensors by rank, then cat along channel dim.
+    Equivalent to split_by_rank_o3 on each feature then torch.cat per (s, L) block,
+    but avoids creating intermediate block dicts.
+    """
+    batch_shape = features[0].shape[:-1]
+    combined: Dict[Tuple[int, int], torch.Tensor] = {}
+    idx = 0
+    for s in (0, 1):
+        for L in range(Lmax + 1):
+            d = channels * rank_dim(L)
+            if L == 0:
+                parts = [f[..., idx:idx + d].view(*batch_shape, channels) for f in features]
+                combined[(s, L)] = torch.cat(parts, dim=1)
+            else:
+                shape = _rank_shape(L)
+                parts = [f[..., idx:idx + d].view(*batch_shape, channels, *shape) for f in features]
+                combined[(s, L)] = torch.cat(parts, dim=1)
+            idx += d
+    return combined
+
+
 def _o3_elementwise_tensor_product_0e_from_blocks(
     blocks1: Dict[Tuple[int, int], torch.Tensor],
     blocks2: Dict[Tuple[int, int], torch.Tensor],
@@ -135,10 +159,10 @@ def _o3_elementwise_tensor_product_0e_from_blocks(
     For each rank L and each channel c, we compute the O(3)-even scalar:
         out[L,c] = <x1[(0,L)][c], x2[(0,L)][c]> + <x1[(1,L)][c], x2[(1,L)][c]>
 
-    where the inner product is the full δ-contraction over all tensor indices.
+    where the inner product is the full 未-contraction over all tensor indices.
 
     This mirrors e3nn's `o3.ElementwiseTensorProduct(..., ["0e"])` behavior:
-      - it does NOT output pseudoscalars (0o), so we do not include cross terms (0·1 or 1·0).
+      - it does NOT output pseudoscalars (0o), so we do not include cross terms (0路1 or 1路0).
 
     Returns:
       (..., channels * (Lmax+1)) with blocks concatenated in L=0..Lmax order.
@@ -162,7 +186,7 @@ def _o3_elementwise_tensor_product_0e_from_blocks(
             t20f = t20.reshape(*batch_shape, channels, -1)
             t21f = t21.reshape(*batch_shape, channels, -1)
         # e3nn-style component normalization:
-        # if each Cartesian component has unit variance, Σ_i x_i y_i has variance = dim.
+        # if each Cartesian component has unit variance, 危_i x_i y_i has variance = dim.
         # Divide by sqrt(dim) to keep output components ~ unit scale.
         scale = 1.0 / math.sqrt(rank_dim(L))
         inv = ((t10f * t20f).sum(dim=-1) + (t11f * t21f).sum(dim=-1)) * scale  # (..., channels)
@@ -199,7 +223,7 @@ class PureCartesianElementwiseTensorProductO3(nn.Module):
 
 def epsilon_tensor(device=None, dtype=None) -> torch.Tensor:
     """
-    Levi-Civita symbol ε_{ijk} with indices in {0,1,2}.
+    Levi-Civita symbol 蔚_{ijk} with indices in {0,1,2}.
     """
     eps = torch.zeros(3, 3, 3, device=device, dtype=dtype)
     eps[0, 1, 2] = 1
@@ -272,7 +296,7 @@ def edge_rank_powers(edge_vec: torch.Tensor, Lmax: int, normalize: bool = True) 
     Returns dict:
       0: (..., 1) scalar 1
       1: (..., 3) unit direction n
-      L: (..., 3,...,3) n^{⊗L} (full outer power)
+      L: (..., 3,...,3) n^{鈯桳} (full outer power)
     """
     device, dtype = edge_vec.device, edge_vec.dtype
     batch_shape = edge_vec.shape[:-1]
@@ -285,7 +309,7 @@ def edge_rank_powers(edge_vec: torch.Tensor, Lmax: int, normalize: bool = True) 
     if Lmax >= 1:
         out[1] = n  # (..., 3)
     for L in range(2, Lmax + 1):
-        # n^{⊗L} via iterative outer product
+        # n^{鈯桳} via iterative outer product
         t = out[L - 1]  # (..., 3,...,3) with L-1 indices
         # append new index with broadcasting
         n_exp = n.view(*batch_shape, *([1] * (L - 1)), 3)
@@ -341,7 +365,7 @@ def _enumerate_paths_sparse(
       This sparse enumerator keeps only interactions where at least one side has rank <= max_rank_other.
 
     This still guarantees strict O(3) equivariance because every remaining path is built
-    purely from δ and ε contractions.
+    purely from 未 and 蔚 contractions.
     """
     paths: List[_Path] = []
 
@@ -406,7 +430,7 @@ def _einsum_for_path(L1: int, L2: int, k_delta: int, use_epsilon: bool) -> Tuple
 
     Canonical pattern:
       - delta contractions: contract last k_delta indices pairwise: i_{L1-k+r} with j_{L2-k+r}
-      - if use_epsilon: also consume the last remaining index of A and B (after delta) via ε_{p i j}
+      - if use_epsilon: also consume the last remaining index of A and B (after delta) via 蔚_{p i j}
         producing a new output index p appended at the end.
     """
     letters = "abcdefghijklmnopqrstuvwxyz"
@@ -470,7 +494,7 @@ class PureCartesianTensorProduct(nn.Module):
       Output: flat (..., Cout * sum_{L<=Lmax} 3^L)
 
     For each output rank Lout and each contraction path producing that rank from (L1,L2),
-    we compute a canonical δ/ε contraction (equivariant by construction), then mix channels
+    we compute a canonical 未/蔚 contraction (equivariant by construction), then mix channels
     with weights W[path, Cout, C1, C2].
     """
 
@@ -478,6 +502,7 @@ class PureCartesianTensorProduct(nn.Module):
         super().__init__()
         self.C1, self.C2, self.Cout, self.Lmax = C1, C2, Cout, Lmax
         self.internal_weights = internal_weights
+        self.use_triton_fast_path = False
 
         self.paths: List[_Path] = _enumerate_paths(Lmax)
         # Group by output rank for efficient accumulation
@@ -500,9 +525,7 @@ class PureCartesianTensorProduct(nn.Module):
         else:
             assert weights is not None
             w = weights
-            # Per-sample weights have one extra trailing weight dimension and otherwise
-            # match the input batch rank, which is trace-friendlier than shape tuple compares.
-            per_sample = w.dim() == x1.dim()
+            per_sample = w.dim() > 1 and w.shape[:-1] == batch_shape
 
         A = split_by_rank(x1, self.C1, self.Lmax)
         B = split_by_rank(x2, self.C2, self.Lmax)
@@ -602,6 +625,7 @@ class PureCartesianTensorProductO3(nn.Module):
         super().__init__()
         self.C1, self.C2, self.Cout, self.Lmax = C1, C2, Cout, Lmax
         self.internal_weights = internal_weights
+        self.use_triton_fast_path = False
 
         self.paths: List[_Path] = _enumerate_paths(Lmax)
         # 4 parity-combos (s1,s2) per path
@@ -619,7 +643,26 @@ class PureCartesianTensorProductO3(nn.Module):
         else:
             assert weights is not None
             w = weights
-            per_sample = w.dim() == x1.dim()
+            per_sample = w.dim() > 1 and w.shape[:-1] == batch_shape
+
+        if (
+            self.use_triton_fast_path
+            and (not torch.is_grad_enabled())
+            and per_sample
+            and min(self.C1, self.C2) >= 4
+            and self.Lmax == 2
+            and self.max_rank_other == 1
+            and self.k_policy == "k0"
+            and self.share_parity_weights
+            and self.assume_pseudo_zero
+            and (not self.allow_epsilon)
+            and x1.dim() == 2
+            and x2.dim() == 2
+            and w.dim() == 2
+        ):
+            from molecular_force_field.models.triton_sparse_tp import sparse_tp_fused
+
+            return sparse_tp_fused(x1, x2, w, self.C1, self.C2, self.Cout)
 
         A = split_by_rank_o3(x1, self.C1, self.Lmax)
         B = split_by_rank_o3(x2, self.C2, self.Lmax)
@@ -699,7 +742,7 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
     has rank <= max_rank_other (default: 1, i.e. scalar/vector).
 
     It preserves strict O(3) equivariance (including reflections) because it is still
-    constructed solely from δ and ε contractions, with the same Z2 grading rule:
+    constructed solely from 未 and 蔚 contractions, with the same Z2 grading rule:
         s_out = s1 xor s2 xor use_epsilon
     """
 
@@ -724,6 +767,7 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
         self.share_parity_weights = share_parity_weights
         self.assume_pseudo_zero = assume_pseudo_zero
         self.internal_weights = internal_weights
+        self.use_triton_fast_path = False
 
         self.paths: List[_Path] = _enumerate_paths_sparse(
             Lmax,
@@ -751,7 +795,7 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
         else:
             assert weights is not None
             w = weights
-            per_sample = w.dim() == x1.dim()
+            per_sample = w.dim() > 1 and w.shape[:-1] == batch_shape
 
         A = split_by_rank_o3(x1, self.C1, self.Lmax)
         B = split_by_rank_o3(x2, self.C2, self.Lmax)
@@ -883,3 +927,5 @@ class PureCartesianTensorProductO3Sparse(nn.Module):
                         out_blocks[(s_out, p.Lout)] = out_blocks[(s_out, p.Lout)] + out_c
 
         return merge_by_rank_o3(out_blocks, self.Cout, self.Lmax)
+
+

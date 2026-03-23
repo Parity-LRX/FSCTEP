@@ -602,6 +602,12 @@ class VaspLabeler(ASECalculatorLabeler):
     def _make_calculator(self, atoms, run_dir: str):
         from ase.calculators.vasp import Vasp
 
+        command = self.command
+        if command is None:
+            command = os.environ.get("ASE_VASP_COMMAND") or os.environ.get("VASP_COMMAND")
+        if command is not None and "ulimit -s" not in command:
+            command = f"ulimit -s unlimited; {command}"
+
         kwargs: Dict[str, Any] = dict(
             xc=self.xc,
             kpts=self.kpts,
@@ -609,11 +615,16 @@ class VaspLabeler(ASECalculatorLabeler):
             ismear=self.ismear,
             sigma=self.sigma,
             directory=run_dir,
+            # Active-learning labeling only needs energies/forces.
+            # Avoid writing large restart files by default, and work around
+            # environments where VASP may fail while finalizing them.
+            lwave=False,
+            lcharg=False,
         )
         if self.encut is not None:
             kwargs["encut"] = self.encut
-        if self.command is not None:
-            kwargs["command"] = self.command
+        if command is not None:
+            kwargs["command"] = command
         kwargs.update(self.vasp_kwargs)
         return Vasp(**kwargs)
 

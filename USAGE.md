@@ -527,11 +527,12 @@ mff-train \
 
 **学习率参数：**
 - `--learning-rate`: 目标学习率（默认1e-3）。这是预热后的学习率，也是训练过程中的主要学习率
-- `--min-learning-rate`: 最小学习率（默认2e-5）。学习率不会低于此值，即使经过多次衰减
+- `--min-learning-rate`: 最小学习率（默认2e-5）。step 模式下为硬底限；cosine 模式下为 eta_min
+- `--lr-scheduler`: 预热后的学习率调度模式（默认 step）。`step`：阶梯指数衰减；`cosine`：余弦退火
 - `--warmup-batches`: 学习率预热的批次数（默认1000）。前N个batch学习率从`learning_rate × warmup_start_ratio`线性增长到`learning_rate`
 - `--warmup-start-ratio`: 预热期间学习率的起始比例（默认0.1）。例如，如果`--learning-rate 1e-3`和`--warmup-start-ratio 0.1`，则学习率会从`1e-4`线性增长到`1e-3`
-- `--lr-decay-patience`: 学习率衰减的间隔批次数（默认1000）。每N个batch后，如果验证指标没有改善，学习率会乘以`--lr-decay-factor`
-- `--lr-decay-factor`: 学习率衰减因子（默认0.98）。每次衰减时学习率乘以该值（0.98表示减少2%）。学习率调度策略：如果验证损失在`lr-decay-patience`个batch内没有改善，学习率会乘以此因子
+- `--lr-decay-patience`: StepLR 的步长（默认1000）。每 N 个 batch 学习率乘以 `--lr-decay-factor`，仅对 `--lr-scheduler step` 有效
+- `--lr-decay-factor`: StepLR 的衰减因子（默认0.98）。每次衰减时学习率乘以该值，仅对 `--lr-scheduler step` 有效
 
 **损失权重参数：**
 - `--energy-weight` (或 `-a`): 能量损失的初始权重（默认1.0）。总损失 = `a × 能量损失 + b × 受力损失 + c × 应力损失`。训练过程中，`a`会根据`--weight-a-growth`自动增长
@@ -1410,10 +1411,31 @@ mff-init-data --structures water.xyz ethanol.xyz \
 mff-init-data --structures POSCAR.vasp \
     --n-perturb 20 --rattle-std 0.02 --cell-scale-range 0.03 \
     --label-type vasp --vasp-xc PBE --vasp-encut 500 \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp_gam \
+    --vasp-mpi-ranks 8 --vasp-ncore 2 \
     --output-dir data
 ```
 
-主要参数：`--n-perturb`（扰动数）、`--rattle-std`（位移 σ，Å）、`--cell-scale-range`（晶胞缩放范围，周期性体系）、`--min-dist`（最小原子间距过滤）。详见 [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md)。
+默认情况下，`mff-init-data` 会先对每个冷启动种子结构做一次弛豫，再在弛豫后的结构上生成微扰；如果你明确不想这样做，可以传 `--no-seed-relax`。
+
+常用参数：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--n-perturb` | `10` | 每个种子结构生成的微扰构型数 |
+| `--rattle-std` | `0.05` | 原子随机位移 σ (Å) |
+| `--cell-scale-range` | `0.0` | 周期性体系的随机晶胞缩放范围 |
+| `--min-dist` | `0.5` | 微扰后的最小原子间距过滤阈值 (Å) |
+| `--seed-relax` / `--no-seed-relax` | 默认开启 | 冷启动时先弛豫种子结构，再生成微扰 |
+| `--seed-relax-fmax` | `0.05` | 冷启动种子弛豫的力收敛阈值 (eV/Å) |
+| `--seed-relax-steps` | `200` | 冷启动种子弛豫的最大优化步数 |
+| `--vasp-mpi-ranks` | `1` | 单个 VASP 标注任务内部使用的 MPI ranks 数 |
+| `--vasp-mpi-launcher` | Intel MPI `mpirun` | 当 `--vasp-mpi-ranks > 1` 时使用的 MPI 启动器 |
+| `--vasp-ncore` | 无 | 透传到 INCAR 的 `NCORE`，用于单个 VASP 作业性能调优 |
+| `--cp2k-mpi-ranks` | `1` | 单个 CP2K 标注任务内部使用的 MPI ranks 数 |
+| `--cp2k-mpi-launcher` | Intel MPI `mpirun` | 当 `--cp2k-mpi-ranks > 1` 时使用的 MPI 启动器 |
+
+详见 [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md)。
 
 ---
 
@@ -1436,6 +1458,17 @@ mff-init-data --structures POSCAR.vasp \
 mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
     --pyscf-method b3lyp --pyscf-basis 6-31g* \
     --md-steps 500 --n-iterations 5
+```
+
+真实 DFT 标注时，推荐把探索强度和单作业资源一并写清楚，例如：
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type vasp \
+    --device cuda --epochs 200 \
+    --exploration-aggressiveness 0.2 \
+    --geometry-min-dist 0.5 --geometry-covalent-scale 0.75 \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp_gam \
+    --vasp-mpi-ranks 8 --vasp-ncore 2
 ```
 
 查看全部参数：
@@ -1488,13 +1521,16 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
 | `--explore-type` | 必选 | 探索后端：`ase` 或 `lammps` |
 | `--explore-mode` | `md` | 探索方式：`md`（分子动力学）或 `neb`（弹性带） |
 | `--explore-n-workers` | `1` | 多结构并行探索线程数；`1`=顺序，`>1`=并发（ThreadPoolExecutor） |
+| `--exploration-aggressiveness` | `1.0` | 高层探索强度旋钮。`1.0` 保持 stage/CLI 原值；`<1.0` 更保守，会降低温度/步长/步数/信任区间并提高阻尼；`>1.0` 更激进 |
 | `--label-type` | 必选 | 标注方式，见下表 |
 | `--md-temperature` | 300 | MD 温度 (K) |
 | `--md-steps` | 10000 | MD 步数 |
 | `--md-timestep` | 1.0 | MD 时间步长 (fs) |
 | `--md-friction` | 0.01 | Langevin 摩擦系数 |
-| `--md-relax-fmax` | 0.05 | 预优化力收敛阈值 (eV/Å) |
+| `--md-relax-fmax` | `0.0` | 模型侧预弛豫力阈值；默认关闭，避免在主动学习探索阶段改写势能面采样 |
 | `--md-log-interval` | 10 | 轨迹记录间隔 |
+| `--geometry-min-dist` | `0.5` | 绝对最小原子间距过滤阈值 (Å)，用于 exploration/candidate 几何安全检查 |
+| `--geometry-covalent-scale` | `0.75` | 基于共价半径的最小距离比例阈值，实际过滤时与 `--geometry-min-dist` 取更严格者 |
 | `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | 力偏差筛选阈值 (eV/Å) |
 | `--conv-accuracy` | 0.9 | 收敛判定比例 |
 | `--epochs` | 由 mff-train 默认 | 每轮每个模型的训练 epoch 数 |
@@ -1507,6 +1543,11 @@ mff-train --data-dir data --tensor-product-mode pure-cartesian-ictd \
 | `--resume` | 关闭 | 从 `work_dir/al_state.json` 和已有 `iterations/iter_*` 产物恢复主动学习 |
 | `--stages` | 无 | 多阶段 JSON 文件路径 |
 | `--device` | `cuda` | 推理设备 |
+| `--vasp-mpi-ranks` | `1` | 单个 VASP 标注任务内部使用的 MPI ranks 数 |
+| `--vasp-mpi-launcher` | Intel MPI `mpirun` | 当 `--vasp-mpi-ranks > 1` 时使用的 MPI 启动器 |
+| `--vasp-ncore` | 无 | 透传到 INCAR 的 `NCORE`，用于单个 VASP 作业性能调优 |
+| `--cp2k-mpi-ranks` | `1` | 单个 CP2K 标注任务内部使用的 MPI ranks 数 |
+| `--cp2k-mpi-launcher` | Intel MPI `mpirun` | 当 `--cp2k-mpi-ranks > 1` 时使用的 MPI 启动器 |
 | `--max-radius` | 5.0 | 邻居搜索最大半径 (Å) |
 | `--atomic-energy-file` | `data/fitted_E0.csv` | 原子参考能量 CSV |
 | `--neb-initial` / `--neb-final` | 无 | NEB 模式下的初/末结构 |
@@ -4056,10 +4097,9 @@ mff-train \
    - 使用更慢的调整速率（`--weight-a-growth 1.005 --weight-b-decay 0.995`）
    - 固定权重（设置`--update-param`为一个很大的值，如1000000）
 
-8. **学习率策略**: 学习率会经历三个阶段：
-   - **预热阶段**（前`--warmup-batches`个batch）：从`learning_rate × warmup_start_ratio`线性增长到`learning_rate`
-   - **稳定阶段**：保持`learning_rate`
-   - **衰减阶段**：如果验证指标不改善，每`--lr-decay-patience`个batch后乘以`--lr-decay-factor`
+8. **学习率策略**: 学习率先经过**预热阶段**（前`--warmup-batches`个 batch：从`learning_rate × warmup_start_ratio`线性增长到`learning_rate`），之后按 `--lr-scheduler` 选择衰减方式：
+   - **step**（默认）：每`--lr-decay-patience`个 batch 乘以`--lr-decay-factor`，阶梯指数衰减
+   - **cosine**：余弦退火，从 `learning_rate` 平滑衰减到 `--min-learning-rate`（eta_min）
 
 ## 张量积模式对比
 
@@ -4378,4 +4418,71 @@ tp_ext = CartesianFullyConnectedTensorProduct(
 )
 weights = weight_network(edge_features)  # shape: (..., tp_ext.weight_numel)
 out = tp_ext(x1, x2, weights)
+```
+
+## Feature-space FFT 插值阶数
+
+当启用 `feature_spectral_mode=fft` 时，现在可以用 `--feature-spectral-assignment` 选择粒子到网格的插值阶数：
+
+- `cic`
+- `tsc`
+- `pcs`
+
+默认值是 `cic`。
+
+建议：
+
+- `cic`：速度最快，适合作为默认基线
+- `tsc`：通常是精度和性能的较好折中
+- `pcs`：插值阶数最高，但 spread/gather 开销也最大
+
+示例：
+
+```bash
+mff-train \
+  --feature-spectral-mode fft \
+  --feature-spectral-assignment tsc
+```
+
+## Mesh FFT + Full Ewald + 插值阶数
+
+当使用 reciprocal long-range 的 `mesh_fft` 后端时，可以通过 `--long-range-mesh-fft-full-ewald` 显式开启完整 Ewald 求和，并用 `--long-range-assignment` 选择粒子到网格的插值阶数：
+
+- `--long-range-assignment cic`
+- `--long-range-assignment tsc`
+- `--long-range-assignment pcs`
+
+默认情况下不会开启完整 Ewald；只有显式传入 `--long-range-mesh-fft-full-ewald` 时才会启用。
+
+建议：
+
+- `cic`：最快，适合作为默认基线
+- `tsc`：通常是精度和性能的较好折中
+- `pcs`：插值阶数最高，但 spread/gather 开销也最大
+
+示例：
+
+```bash
+# periodic + mesh_fft + full Ewald + TSC
+mff-train \
+  --long-range-mode reciprocal-spectral-v1 \
+  --long-range-reciprocal-backend mesh_fft \
+  --long-range-boundary periodic \
+  --long-range-green-mode poisson \
+  --long-range-energy-partition potential \
+  --long-range-mesh-size 16 \
+  --long-range-mesh-fft-full-ewald \
+  --long-range-assignment tsc
+
+# slab + mesh_fft + full Ewald + PCS
+mff-train \
+  --long-range-mode reciprocal-spectral-v1 \
+  --long-range-reciprocal-backend mesh_fft \
+  --long-range-boundary slab \
+  --long-range-slab-padding-factor 2 \
+  --long-range-green-mode poisson \
+  --long-range-energy-partition potential \
+  --long-range-mesh-size 16 \
+  --long-range-mesh-fft-full-ewald \
+  --long-range-assignment pcs
 ```

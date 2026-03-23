@@ -616,6 +616,7 @@ class E3_TransformerLayer_multi(nn.Module):
         long_range_energy_partition: str = "potential",
         long_range_green_mode: str = "poisson",
         long_range_assignment: str = "cic",
+        long_range_mesh_fft_full_ewald: bool = False,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
         long_range_multipole_order: int = 0,
@@ -636,6 +637,7 @@ class E3_TransformerLayer_multi(nn.Module):
         feature_spectral_slab_padding_factor: int = 2,
         feature_spectral_neutralize: bool = True,
         feature_spectral_include_k0: bool = False,
+        feature_spectral_assignment: str = "cic",
         feature_spectral_gate_init: float = 0.0,
         num_fidelity_levels: int = 0,
         multi_fidelity_mode: str = "conditioning",
@@ -670,6 +672,7 @@ class E3_TransformerLayer_multi(nn.Module):
         self.long_range_energy_partition = str(long_range_energy_partition)
         self.long_range_green_mode = str(long_range_green_mode)
         self.long_range_assignment = str(long_range_assignment)
+        self.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
         self.long_range_theta = float(long_range_theta)
         self.long_range_leaf_size = int(long_range_leaf_size)
         self.long_range_multipole_order = int(long_range_multipole_order)
@@ -692,6 +695,7 @@ class E3_TransformerLayer_multi(nn.Module):
         self.feature_spectral_slab_padding_factor = int(feature_spectral_slab_padding_factor)
         self.feature_spectral_neutralize = bool(feature_spectral_neutralize)
         self.feature_spectral_include_k0 = bool(feature_spectral_include_k0)
+        self.feature_spectral_assignment = str(feature_spectral_assignment)
         self.feature_spectral_gate_init = float(feature_spectral_gate_init)
         self.num_fidelity_levels = int(num_fidelity_levels)
         self.multi_fidelity_mode = str(multi_fidelity_mode or "conditioning").strip().lower()
@@ -808,6 +812,7 @@ class E3_TransformerLayer_multi(nn.Module):
             energy_partition=self.long_range_energy_partition,
             green_mode=self.long_range_green_mode,
             assignment=self.long_range_assignment,
+            mesh_fft_full_ewald=self.long_range_mesh_fft_full_ewald,
             theta=self.long_range_theta,
             leaf_size=self.long_range_leaf_size,
             multipole_order=self.long_range_multipole_order,
@@ -833,6 +838,7 @@ class E3_TransformerLayer_multi(nn.Module):
             slab_padding_factor=self.feature_spectral_slab_padding_factor,
             neutralize=self.feature_spectral_neutralize,
             include_k0=self.feature_spectral_include_k0,
+            assignment=self.feature_spectral_assignment,
             gate_init=self.feature_spectral_gate_init,
         )
         self.long_range_runtime_backend = "none"

@@ -529,11 +529,12 @@ mff-train \
 
 **Learning Rate Parameters:**
 - `--learning-rate`: Target learning rate (default 1e-3). This is the learning rate after warmup and the main learning rate during training
-- `--min-learning-rate`: Minimum learning rate (default 2e-5). Learning rate will not go below this value, even after multiple decays
+- `--min-learning-rate`: Minimum learning rate (default 2e-5). Hard floor in step mode; eta_min in cosine mode
+- `--lr-scheduler`: LR schedule mode after warmup (default step). `step`: step-wise exponential decay; `cosine`: cosine annealing
 - `--warmup-batches`: Number of batches for learning rate warmup (default 1000). For the first N batches, learning rate linearly increases from `learning_rate × warmup_start_ratio` to `learning_rate`
 - `--warmup-start-ratio`: Starting ratio of learning rate during warmup (default 0.1). For example, if `--learning-rate 1e-3` and `--warmup-start-ratio 0.1`, learning rate will linearly increase from `1e-4` to `1e-3`
-- `--lr-decay-patience`: Interval in batches for learning rate decay (default 1000). Every N batches, if validation metrics do not improve, learning rate will be multiplied by `--lr-decay-factor`
-- `--lr-decay-factor`: Learning rate decay factor (default 0.98). Learning rate is multiplied by this value each time it decays (0.98 means 2% reduction). Learning rate scheduling: if validation loss does not improve within `lr-decay-patience` batches, learning rate is multiplied by this factor
+- `--lr-decay-patience`: Step size for StepLR (default 1000). Every N batches, learning rate is multiplied by `--lr-decay-factor`. Only used when `--lr-scheduler step`
+- `--lr-decay-factor`: Decay factor (gamma) for StepLR (default 0.98). Learning rate is multiplied by this value each decay. Only used when `--lr-scheduler step`
 
 **Loss Weight Parameters:**
 - `--energy-weight` (or `-a`): Initial weight for energy loss (default 1.0). Total loss = `a × energy loss + b × force loss + c × stress loss`. During training, `a` will automatically increase according to `--weight-a-growth`
@@ -1192,10 +1193,31 @@ mff-init-data --structures water.xyz ethanol.xyz \
 mff-init-data --structures POSCAR.vasp \
     --n-perturb 20 --rattle-std 0.02 --cell-scale-range 0.03 \
     --label-type vasp --vasp-xc PBE --vasp-encut 500 \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp_gam \
+    --vasp-mpi-ranks 8 --vasp-ncore 2 \
     --output-dir data
 ```
 
-Key parameters: `--n-perturb` (perturbation count), `--rattle-std` (displacement σ, Å), `--cell-scale-range` (cell scaling range for periodic systems), `--min-dist` (minimum interatomic distance filter). See [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) for full details.
+By default, `mff-init-data` relaxes each cold-start seed structure before generating perturbations. If you want to perturb the raw input directly, pass `--no-seed-relax`.
+
+Common parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--n-perturb` | `10` | Number of perturbed structures generated from each seed |
+| `--rattle-std` | `0.05` | Random displacement sigma (Å) |
+| `--cell-scale-range` | `0.0` | Random cell scaling range for periodic systems |
+| `--min-dist` | `0.5` | Minimum interatomic-distance filter after perturbation (Å) |
+| `--seed-relax` / `--no-seed-relax` | On by default | Relax cold-start seeds before perturbation generation |
+| `--seed-relax-fmax` | `0.05` | Force threshold for cold-start seed relaxation (eV/Å) |
+| `--seed-relax-steps` | `200` | Maximum optimizer steps for cold-start seed relaxation |
+| `--vasp-mpi-ranks` | `1` | MPI ranks used inside each VASP labeling job |
+| `--vasp-mpi-launcher` | Intel MPI `mpirun` | MPI launcher used when `--vasp-mpi-ranks > 1` |
+| `--vasp-ncore` | None | Optional `NCORE` written into INCAR for single-job VASP tuning |
+| `--cp2k-mpi-ranks` | `1` | MPI ranks used inside each CP2K labeling job |
+| `--cp2k-mpi-launcher` | Intel MPI `mpirun` | MPI launcher used when `--cp2k-mpi-ranks > 1` |
+
+See [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) for full details.
 
 ---
 
@@ -1220,6 +1242,17 @@ Required arguments: `--explore-type` (`ase` or `lammps`), `--label-type` (see ta
 mff-active-learn --explore-type ase --explore-mode md --label-type pyscf \
     --pyscf-method b3lyp --pyscf-basis 6-31g* \
     --md-steps 500 --n-iterations 5
+```
+
+For real DFT labeling runs, it is a good idea to pin both the exploration strength and the per-job resources explicitly, for example:
+
+```bash
+mff-active-learn --explore-type ase --explore-mode md --label-type vasp \
+    --device cuda --epochs 200 \
+    --exploration-aggressiveness 0.2 \
+    --geometry-min-dist 0.5 --geometry-covalent-scale 0.75 \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp_gam \
+    --vasp-mpi-ranks 8 --vasp-ncore 2
 ```
 
 View all options:
@@ -1396,13 +1429,16 @@ For slab active learning, prefer an initial structure with explicit `pbc="T T F"
 | `--explore-type` | Required | Exploration backend: `ase` or `lammps` |
 | `--explore-mode` | `md` | Exploration mode: `md` (molecular dynamics) or `neb` (elastic band) |
 | `--explore-n-workers` | `1` | Parallel workers for multi-structure exploration; `1`=sequential, `>1`=concurrent threads (ThreadPoolExecutor) |
+| `--exploration-aggressiveness` | `1.0` | High-level exploration knob. `1.0` keeps stage/CLI settings unchanged; `<1.0` makes sampling safer by lowering temperature/timestep/steps/trust window and increasing damping; `>1.0` makes exploration more aggressive |
 | `--label-type` | Required | Labeling method, see table below |
 | `--md-temperature` | 300 | MD temperature (K) |
 | `--md-steps` | 10000 | MD steps |
 | `--md-timestep` | 1.0 | MD timestep (fs) |
 | `--md-friction` | 0.01 | Langevin friction |
-| `--md-relax-fmax` | 0.05 | Pre-relax force convergence (eV/Å) |
+| `--md-relax-fmax` | `0.0` | Model-side pre-relax force threshold; disabled by default to preserve PES sampling during active learning |
 | `--md-log-interval` | 10 | Trajectory log interval |
+| `--geometry-min-dist` | `0.5` | Absolute minimum interatomic-distance threshold (Å) used in exploration/candidate geometry safety checks |
+| `--geometry-covalent-scale` | `0.75` | Covalent-radius-based minimum-distance scale; combined with `--geometry-min-dist`, and the stricter threshold wins |
 | `--level-f-lo` / `--level-f-hi` | 0.05 / 0.5 | Force deviation selection thresholds (eV/Å) |
 | `--conv-accuracy` | 0.9 | Convergence criterion ratio |
 | `--epochs` | mff-train default | Training epochs per model per iteration |
@@ -1415,6 +1451,11 @@ For slab active learning, prefer an initial structure with explicit `pbc="T T F"
 | `--resume` | Off | Resume active learning from `work_dir/al_state.json` and existing `iterations/iter_*` artifacts |
 | `--stages` | None | Path to multi-stage JSON file |
 | `--device` | `cuda` | Inference device |
+| `--vasp-mpi-ranks` | `1` | MPI ranks used inside each VASP labeling job |
+| `--vasp-mpi-launcher` | Intel MPI `mpirun` | MPI launcher used when `--vasp-mpi-ranks > 1` |
+| `--vasp-ncore` | None | Optional `NCORE` written into INCAR for single-job VASP tuning |
+| `--cp2k-mpi-ranks` | `1` | MPI ranks used inside each CP2K labeling job |
+| `--cp2k-mpi-launcher` | Intel MPI `mpirun` | MPI launcher used when `--cp2k-mpi-ranks > 1` |
 | `--max-radius` | 5.0 | Neighbor search cutoff (Å) |
 | `--atomic-energy-file` | `data/fitted_E0.csv` | Atomic reference energy CSV |
 | `--neb-initial` / `--neb-final` | None | Initial/final structures for NEB mode |
@@ -3508,10 +3549,9 @@ mff-train \
    - Use slower adjustment rate (`--weight-a-growth 1.005 --weight-b-decay 0.995`)
    - Fix weights (set `--update-param` to a very large value, e.g., 1000000)
 
-8. **Learning Rate Strategy**: Learning rate goes through three stages:
-   - **Warmup stage** (first `--warmup-batches` batches): Linearly increases from `learning_rate × warmup_start_ratio` to `learning_rate`
-   - **Stable stage**: Maintains `learning_rate`
-   - **Decay stage**: If validation metrics don't improve, multiplied by `--lr-decay-factor` after every `--lr-decay-patience` batches
+8. **Learning Rate Strategy**: After **warmup** (first `--warmup-batches` batches: linearly from `learning_rate × warmup_start_ratio` to `learning_rate`), decay is controlled by `--lr-scheduler`:
+   - **step** (default): Every `--lr-decay-patience` batches, multiply by `--lr-decay-factor` (step-wise exponential decay)
+   - **cosine**: Cosine annealing from `learning_rate` down to `--min-learning-rate` (eta_min)
 
 
 
@@ -3834,4 +3874,71 @@ tp_ext = CartesianFullyConnectedTensorProduct(
 )
 weights = weight_network(edge_features)  # shape: (..., tp_ext.weight_numel)
 out = tp_ext(x1, x2, weights)
+```
+
+## Feature-space FFT Assignment Order
+
+When `feature_spectral_mode=fft` is enabled, you can now choose the particle-to-mesh assignment order with:
+
+- `--feature-spectral-assignment cic`
+- `--feature-spectral-assignment tsc`
+- `--feature-spectral-assignment pcs`
+
+Default is `cic`.
+
+Recommendation:
+
+- `cic`: fastest baseline
+- `tsc`: usually the best accuracy/performance tradeoff
+- `pcs`: highest-order interpolation, but also the most expensive spread/gather path
+
+Example:
+
+```bash
+mff-train \
+  --feature-spectral-mode fft \
+  --feature-spectral-assignment tsc
+```
+
+## Mesh FFT + Full Ewald + Assignment Order
+
+When using the reciprocal long-range `mesh_fft` backend, you can explicitly enable the full Ewald summation with `--long-range-mesh-fft-full-ewald` and choose the particle-to-mesh assignment order with:
+
+- `--long-range-assignment cic`
+- `--long-range-assignment tsc`
+- `--long-range-assignment pcs`
+
+Full Ewald is not enabled by default. It is only used when `--long-range-mesh-fft-full-ewald` is passed explicitly.
+
+Recommendation:
+
+- `cic`: fastest baseline
+- `tsc`: usually the best accuracy/performance tradeoff
+- `pcs`: highest-order interpolation, but also the most expensive spread/gather path
+
+Examples:
+
+```bash
+# periodic + mesh_fft + full Ewald + TSC
+mff-train \
+  --long-range-mode reciprocal-spectral-v1 \
+  --long-range-reciprocal-backend mesh_fft \
+  --long-range-boundary periodic \
+  --long-range-green-mode poisson \
+  --long-range-energy-partition potential \
+  --long-range-mesh-size 16 \
+  --long-range-mesh-fft-full-ewald \
+  --long-range-assignment tsc
+
+# slab + mesh_fft + full Ewald + PCS
+mff-train \
+  --long-range-mode reciprocal-spectral-v1 \
+  --long-range-reciprocal-backend mesh_fft \
+  --long-range-boundary slab \
+  --long-range-slab-padding-factor 2 \
+  --long-range-green-mode poisson \
+  --long-range-energy-partition potential \
+  --long-range-mesh-size 16 \
+  --long-range-mesh-fft-full-ewald \
+  --long-range-assignment pcs
 ```

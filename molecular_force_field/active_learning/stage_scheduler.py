@@ -33,7 +33,7 @@ class ExplorationStage:
     friction: float
         Langevin friction coefficient (default: 0.01)
     relax_fmax: float
-        Max force for pre-relaxation; 0 = skip (default: 0.05)
+        Max force for pre-relaxation; 0 = skip (default: 0.0)
     log_interval: int
         Steps between trajectory writes (default: 10)
     level_f_lo: float
@@ -52,7 +52,7 @@ class ExplorationStage:
     timestep: float = 1.0
     nsteps: int = 1000
     friction: float = 0.01
-    relax_fmax: float = 0.05
+    relax_fmax: float = 0.0
     log_interval: int = 10
     level_f_lo: float = 0.05
     level_f_hi: float = 0.50
@@ -138,7 +138,7 @@ def make_single_stage_scheduler(
     timestep: float = 1.0,
     nsteps: int = 1000,
     friction: float = 0.01,
-    relax_fmax: float = 0.05,
+    relax_fmax: float = 0.0,
     log_interval: int = 10,
     level_f_lo: float = 0.05,
     level_f_hi: float = 0.50,

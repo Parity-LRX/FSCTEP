@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import io
+import inspect
 import os
 from typing import List, Optional, Tuple
 
@@ -71,6 +72,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCarte
 from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
+    get_checkpoint_e3_state_dict,
     infer_external_tensor_rank_from_state_dict,
     infer_physical_tensor_outputs_from_state_dict,
 )
@@ -701,6 +703,23 @@ class AtomForcesWrapper(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
+    def _build_forward_kwargs(
+        self,
+        *,
+        edge_vec: torch.Tensor,
+        external_tensor: Optional[torch.Tensor],
+        fidelity_ids: Optional[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        params = inspect.signature(self.model.forward).parameters
+        kwargs: dict[str, torch.Tensor] = {}
+        if "precomputed_edge_vec" in params:
+            kwargs["precomputed_edge_vec"] = edge_vec
+        if external_tensor is not None and "external_tensor" in params:
+            kwargs["external_tensor"] = external_tensor
+        if fidelity_ids is not None and "fidelity_ids" in params:
+            kwargs["fidelity_ids"] = fidelity_ids
+        return kwargs
+
     def forward(
         self,
         rij: torch.Tensor,
@@ -735,12 +754,11 @@ class AtomForcesWrapper(nn.Module):
 
         edge_vec = pos[edge_dst] - pos[edge_src] + rij.detach()
 
-        kwargs = {
-            "precomputed_edge_vec": edge_vec,
-            "external_tensor": external_tensor,
-        }
-        if fidelity_ids is not None:
-            kwargs["fidelity_ids"] = fidelity_ids
+        kwargs = self._build_forward_kwargs(
+            edge_vec=edge_vec,
+            external_tensor=external_tensor,
+            fidelity_ids=fidelity_ids,
+        )
         atom_energies = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
 
         mapped_A = map_tensor_values(
@@ -773,6 +791,23 @@ class EdgeForcesWrapper(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
+    def _build_forward_kwargs(
+        self,
+        *,
+        edge_vec: torch.Tensor,
+        external_tensor: Optional[torch.Tensor],
+        fidelity_ids: Optional[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        params = inspect.signature(self.model.forward).parameters
+        kwargs: dict[str, torch.Tensor] = {}
+        if "precomputed_edge_vec" in params:
+            kwargs["precomputed_edge_vec"] = edge_vec
+        if external_tensor is not None and "external_tensor" in params:
+            kwargs["external_tensor"] = external_tensor
+        if fidelity_ids is not None and "fidelity_ids" in params:
+            kwargs["fidelity_ids"] = fidelity_ids
+        return kwargs
+
     def forward(
         self,
         edge_vec: torch.Tensor,
@@ -789,12 +824,11 @@ class EdgeForcesWrapper(nn.Module):
         """Compute total energy, per-atom energies and per-pair forces."""
         pos = torch.zeros(A.size(0), 3, dtype=edge_vec.dtype, device=edge_vec.device)
 
-        kwargs = {
-            "precomputed_edge_vec": edge_vec,
-            "external_tensor": external_tensor,
-        }
-        if fidelity_ids is not None:
-            kwargs["fidelity_ids"] = fidelity_ids
+        kwargs = self._build_forward_kwargs(
+            edge_vec=edge_vec,
+            external_tensor=external_tensor,
+            fidelity_ids=fidelity_ids,
+        )
         atom_energies = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
 
         mapped_A = map_tensor_values(
@@ -903,6 +937,9 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         - "pure-cartesian-ictd-save": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers)
         """
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        selected_state_dict, state_source = get_checkpoint_e3_state_dict(ckpt)
+        if state_source == "ema":
+            print("[LAMMPS_MLIAP_MFF] Using EMA weights from checkpoint")
 
         arch_meta = ckpt.get("model_hyperparameters", {})
 
@@ -965,7 +1002,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         o3_irrep_preset = str(arch_meta.get("o3_irrep_preset", "auto"))
         o3_active_irreps = arch_meta.get("o3_active_irreps")
         if external_tensor_rank is None:
-            external_tensor_rank = infer_external_tensor_rank_from_state_dict(ckpt.get("e3trans_state_dict", {}))
+            external_tensor_rank = infer_external_tensor_rank_from_state_dict(selected_state_dict)
         external_tensor_specs = normalize_external_tensor_specs(
             external_tensor_specs,
             external_tensor_rank=external_tensor_rank,
@@ -974,7 +1011,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         )
         physical_tensor_outputs = ckpt.get("physical_tensor_outputs", arch_meta.get("physical_tensor_outputs"))
         if physical_tensor_outputs is None:
-            physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(ckpt.get("e3trans_state_dict", {}))
+            physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(selected_state_dict)
         long_range_mode = str(arch_meta.get("long_range_mode", "none"))
         long_range_hidden_dim = int(arch_meta.get("long_range_hidden_dim", 64))
         long_range_boundary = str(arch_meta.get("long_range_boundary", "nonperiodic"))
@@ -1016,6 +1053,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         feature_spectral_slab_padding_factor = int(arch_meta.get("feature_spectral_slab_padding_factor", 2))
         feature_spectral_neutralize = bool(arch_meta.get("feature_spectral_neutralize", True))
         feature_spectral_include_k0 = bool(arch_meta.get("feature_spectral_include_k0", False))
+        feature_spectral_assignment = str(arch_meta.get("feature_spectral_assignment", "cic"))
         feature_spectral_gate_init = float(arch_meta.get("feature_spectral_gate_init", 0.0))
 
         if mode == "pure-cartesian-ictd":
@@ -1080,6 +1118,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         elif mode == "pure-cartesian-ictd-o3":
@@ -1146,6 +1185,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         elif mode == "pure-cartesian-ictd-save":
@@ -1212,6 +1252,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         elif mode in ("pure-cartesian-sparse", "pure-cartesian-sparse-save"):
@@ -1283,6 +1324,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         elif mode == "spherical-save-cue":
@@ -1355,6 +1397,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         elif mode == "spherical-save":
@@ -1416,6 +1459,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         else:
@@ -1477,10 +1521,11 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
                 feature_spectral_neutralize=feature_spectral_neutralize,
                 feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
         if mode == "spherical-save-cue":
-            load_result = model.load_state_dict(ckpt["e3trans_state_dict"], strict=False)
+            load_result = model.load_state_dict(selected_state_dict, strict=False)
             if load_result.unexpected_keys or load_result.missing_keys:
                 import warnings
                 if load_result.unexpected_keys:
@@ -1504,7 +1549,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                             f"{real_missing[:10]}... checkpoint 与模型结构不匹配."
                         )
         else:
-            model.load_state_dict(ckpt["e3trans_state_dict"], strict=True)
+            model.load_state_dict(selected_state_dict, strict=True)
 
         model = maybe_wrap_model_with_zbl(model, arch_meta)
 

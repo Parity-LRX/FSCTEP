@@ -12,6 +12,8 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.optimize import BFGS
 from ase import units
 
+from molecular_force_field.active_learning.geometry_filter import check_geometry
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +31,8 @@ def run_ase_md(
     relax_fmax: float = 0.05,
     log_interval: int = 10,
     external_field: Optional[list] = None,
+    min_dist: float = 0.5,
+    covalent_scale: float = 0.75,
 ) -> str:
     """
     Run MD with ASE + MyE3NNCalculator. Returns path to output trajectory.
@@ -70,8 +74,42 @@ def run_ase_md(
         temperature_K=temperature,
         friction=friction,
     )
-    dyn.attach(lambda: write(output_traj, atoms, append=True), interval=log_interval)
-    dyn.run(nsteps)
+
+    if os.path.exists(output_traj):
+        os.remove(output_traj)
+
+    stats = {"attempted": 0, "kept": 0, "stopped": False}
+
+    class _StopInvalidGeometry(RuntimeError):
+        pass
+
+    def _record_frame():
+        stats["attempted"] += 1
+        frame = atoms.copy()
+        ok, reason = check_geometry(
+            frame,
+            min_dist=min_dist,
+            covalent_scale=covalent_scale,
+        )
+        if not ok:
+            stats["stopped"] = True
+            raise _StopInvalidGeometry(reason)
+        write(output_traj, frame, append=os.path.exists(output_traj))
+        stats["kept"] += 1
+
+    _record_frame()
+    dyn.attach(_record_frame, interval=log_interval)
+    try:
+        dyn.run(nsteps)
+    except _StopInvalidGeometry as exc:
+        logger.warning(
+            "ASE MD stopped early due to invalid geometry: %s "
+            "(attempted=%d kept=%d output=%s)",
+            exc,
+            stats["attempted"],
+            stats["kept"],
+            output_traj,
+        )
     logger.info(f"ASE MD done: {output_traj}")
     return output_traj
 

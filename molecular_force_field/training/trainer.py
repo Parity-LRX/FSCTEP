@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from molecular_force_field.utils.scatter import scatter
-from torch.optim.lr_scheduler import SequentialLR, LambdaLR, StepLR
+from torch.optim.lr_scheduler import SequentialLR, LambdaLR, StepLR, CosineAnnealingLR
 import copy
 
 from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
@@ -87,6 +87,7 @@ class Trainer:
         warmup_batches=1000,
         patience_opim=1000,
         gamma_value=0.98,
+        lr_scheduler_type='step',
         max_vhat_growth_factor=5,
         max_norm_value=0.5,
         gradient_log_interval=100,
@@ -117,7 +118,7 @@ class Trainer:
         val_sampler=None,
         save_val_csv=False,
         use_checkpoint_loss_weights=True,
-        train_eval_sample_ratio=0.2,
+        train_eval_sample_ratio=0.0,
         log_val_batch_energy_to_console=False,
         tensor_product_mode='spherical',
         c=0.0,
@@ -158,8 +159,9 @@ class Trainer:
             dump_frequency: Frequency to dump validation results
             vhat_clamp_interval: Interval to clamp v_hat
             warmup_batches: Number of warmup batches
-            patience_opim: Patience for optimizer
-            gamma_value: Learning rate decay factor
+            patience_opim: Step size for StepLR scheduler
+            gamma_value: Decay factor for StepLR scheduler
+            lr_scheduler_type: 'cosine' for CosineAnnealingLR, 'step' for StepLR
             max_vhat_growth_factor: Maximum v_hat growth factor
             max_norm_value: Maximum gradient norm
             gradient_log_interval: Interval to log gradients
@@ -274,8 +276,8 @@ class Trainer:
         self.swa_applied = False  # Track if SWA has been applied
         self.ema_start_epoch = ema_start_epoch
         self.ema_decay = ema_decay
-        self.use_ema_for_validation = use_ema_for_validation
-        self.save_ema_model = save_ema_model
+        self.use_ema_for_validation = bool(use_ema_for_validation or ema_start_epoch is not None)
+        self.save_ema_model = bool(save_ema_model or ema_start_epoch is not None)
         self.ema_enabled = False
         self.e3trans_ema = None  # will be initialized when EMA starts
         # Create checkpoint directory if it doesn't exist
@@ -349,7 +351,7 @@ class Trainer:
             amsgrad=True
         )
         
-        # Learning rate scheduler
+        # Learning rate scheduler: warmup + decay
         milestones = [warmup_batches]
         
         def warmup_lambda(current_step):
@@ -358,14 +360,25 @@ class Trainer:
             return initial_ratio + (1 - initial_ratio) * progress
         
         warmup_scheduler = LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
-        step_scheduler = StepLR(
-            self.optimizer,
-            step_size=patience_opim,
-            gamma=gamma_value
-        )
+
+        if lr_scheduler_type == 'cosine':
+            total_steps = epoch_numbers * len(train_loader)
+            cosine_steps = max(1, total_steps - warmup_batches)
+            decay_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=cosine_steps,
+                eta_min=min_learning_rate
+            )
+        else:
+            decay_scheduler = StepLR(
+                self.optimizer,
+                step_size=patience_opim,
+                gamma=gamma_value
+            )
+
         self.scheduler = SequentialLR(
             self.optimizer,
-            schedulers=[warmup_scheduler, step_scheduler],
+            schedulers=[warmup_scheduler, decay_scheduler],
             milestones=milestones
         )
         
@@ -395,6 +408,7 @@ class Trainer:
             logging.info(f"  Epochs: {self.epoch_numbers}")
             logging.info(f"  Learning Rate: {self.learning_rate}")
             logging.info(f"  Min Learning Rate: {self.min_learning_rate}")
+            logging.info(f"  LR Scheduler: {lr_scheduler_type}")
             logging.info(f"  Training Samples: {len(self.train_dataset)}")
             logging.info(f"  Validation Samples: {len(self.val_dataset)}")
             logging.info(f"  Energy Loss Weight (a): {self.a}")
@@ -413,7 +427,9 @@ class Trainer:
                 if self.save_ema_model:
                     logging.info("    Will save EMA model in checkpoint")
             logging.info(f"  Validation Frequency: every {self.dump_frequency} batches")
-            if self.train_eval_sample_ratio < 1.0:
+            if self.train_eval_sample_ratio == 0.0:
+                logging.info(f"  Train Evaluation: Disabled (using current batch loss only)")
+            elif self.train_eval_sample_ratio < 1.0:
                 logging.info(f"  Train Evaluation: {self.train_eval_sample_ratio*100:.1f}% sampling (faster validation)")
             else:
                 logging.info(f"  Train Evaluation: Full dataset (100%)")
@@ -629,6 +645,7 @@ class Trainer:
                 "feature_spectral_slab_padding_factor",
                 "feature_spectral_neutralize",
                 "feature_spectral_include_k0",
+                "feature_spectral_assignment",
                 "feature_spectral_gate_init",
                 "zbl_enabled",
                 "zbl_inner_cutoff",
@@ -1430,7 +1447,25 @@ class Trainer:
                     )
             
             if self.batch_count % self.dump_frequency == 0:
-                full_train_metrics = self.compute_full_train_metrics(epoch)
+                if self.train_eval_sample_ratio > 0.0:
+                    full_train_metrics = self.compute_full_train_metrics(epoch)
+                else:
+                    # Use current batch loss directly (no extra forward pass)
+                    full_train_metrics = {
+                        'train_total_loss': total_loss.item(),
+                        'train_energy_loss': energy_loss.item(),
+                        'train_force_loss': force_loss.item(),
+                        'train_stress_loss': stress_loss.item(),
+                        'train_phys_loss': phys_loss.item(),
+                        'train_energy_rmse': energy_rmse.item(),
+                        'train_energy_mae': 0.0,
+                        'train_energy_rmse_avg': energy_rmse_avg.item(),
+                        'train_energy_mae_avg': 0.0,
+                        'train_force_rmse': force_rmse.item(),
+                        'train_force_mae': 0.0,
+                        'train_stress_rmse': stress_rmse.item(),
+                        'train_stress_mae': 0.0,
+                    }
                 self.validate(epoch, full_train_metrics)
         
         # Log epoch summary

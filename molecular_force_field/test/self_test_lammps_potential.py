@@ -85,6 +85,7 @@ def _make_dummy_checkpoint_spherical_save_cue(
     long_range_energy_partition: str = "potential",
     long_range_green_mode: str = "poisson",
     long_range_assignment: str = "cic",
+    long_range_mesh_fft_full_ewald: bool = False,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -105,6 +106,7 @@ def _make_dummy_checkpoint_spherical_save_cue(
     feature_spectral_slab_padding_factor: int = 2,
     feature_spectral_neutralize: bool = True,
     feature_spectral_include_k0: bool = False,
+    feature_spectral_assignment: str = "cic",
     feature_spectral_gate_init: float = 0.0,
 ) -> ModelConfig:
     """创建 spherical-save-cue (cue_layers_channelwise, cuEquivariance) 的 dummy checkpoint。"""
@@ -166,6 +168,7 @@ def _make_dummy_checkpoint_spherical_save_cue(
         long_range_energy_partition=long_range_energy_partition,
         long_range_green_mode=long_range_green_mode,
         long_range_assignment=long_range_assignment,
+        long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_theta=long_range_theta,
         long_range_leaf_size=long_range_leaf_size,
         long_range_multipole_order=long_range_multipole_order,
@@ -186,6 +189,7 @@ def _make_dummy_checkpoint_spherical_save_cue(
         feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
     ).to(device)
 
@@ -211,6 +215,7 @@ def _make_dummy_checkpoint_spherical_save_cue(
         long_range_energy_partition=long_range_energy_partition,
         long_range_green_mode=long_range_green_mode,
         long_range_assignment=long_range_assignment,
+        long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_theta=long_range_theta,
         long_range_leaf_size=long_range_leaf_size,
         long_range_multipole_order=long_range_multipole_order,
@@ -234,6 +239,7 @@ def _make_dummy_checkpoint_spherical_save_cue(
         feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
     )
     torch.save(ckpt, path)
@@ -258,6 +264,7 @@ def _write_long_range_hparams(
     long_range_energy_partition: str = "potential",
     long_range_green_mode: str = "poisson",
     long_range_assignment: str = "cic",
+    long_range_mesh_fft_full_ewald: bool = False,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -289,6 +296,7 @@ def _write_long_range_hparams(
     ckpt["model_hyperparameters"]["long_range_energy_partition"] = str(long_range_energy_partition)
     ckpt["model_hyperparameters"]["long_range_green_mode"] = str(long_range_green_mode)
     ckpt["model_hyperparameters"]["long_range_assignment"] = str(long_range_assignment)
+    ckpt["model_hyperparameters"]["long_range_mesh_fft_full_ewald"] = bool(long_range_mesh_fft_full_ewald)
     ckpt["model_hyperparameters"]["long_range_theta"] = float(long_range_theta)
     ckpt["model_hyperparameters"]["long_range_leaf_size"] = int(long_range_leaf_size)
     ckpt["model_hyperparameters"]["long_range_multipole_order"] = int(long_range_multipole_order)
@@ -319,6 +327,7 @@ def _write_feature_spectral_hparams(
     feature_spectral_slab_padding_factor: int = 2,
     feature_spectral_neutralize: bool = True,
     feature_spectral_include_k0: bool = False,
+    feature_spectral_assignment: str = "cic",
     feature_spectral_gate_init: float = 0.0,
 ) -> None:
     if feature_spectral_mode == "none":
@@ -332,6 +341,7 @@ def _write_feature_spectral_hparams(
     ckpt["model_hyperparameters"]["feature_spectral_slab_padding_factor"] = int(feature_spectral_slab_padding_factor)
     ckpt["model_hyperparameters"]["feature_spectral_neutralize"] = bool(feature_spectral_neutralize)
     ckpt["model_hyperparameters"]["feature_spectral_include_k0"] = bool(feature_spectral_include_k0)
+    ckpt["model_hyperparameters"]["feature_spectral_assignment"] = str(feature_spectral_assignment)
     ckpt["model_hyperparameters"]["feature_spectral_gate_init"] = float(feature_spectral_gate_init)
 
 
@@ -357,6 +367,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
     long_range_energy_partition: str = "potential",
     long_range_green_mode: str = "poisson",
     long_range_assignment: str = "cic",
+    long_range_mesh_fft_full_ewald: bool = False,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -377,6 +388,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
     feature_spectral_slab_padding_factor: int = 2,
     feature_spectral_neutralize: bool = True,
     feature_spectral_include_k0: bool = False,
+    feature_spectral_assignment: str = "cic",
     feature_spectral_gate_init: float = 0.0,
     num_fidelity_levels: int = 0,
     multi_fidelity_mode: str = "conditioning",
@@ -432,6 +444,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         long_range_energy_partition=long_range_energy_partition,
         long_range_green_mode=long_range_green_mode,
         long_range_assignment=long_range_assignment,
+        long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_theta=long_range_theta,
         long_range_leaf_size=long_range_leaf_size,
         long_range_multipole_order=long_range_multipole_order,
@@ -452,6 +465,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
         num_fidelity_levels=num_fidelity_levels,
         multi_fidelity_mode=multi_fidelity_mode,
@@ -490,6 +504,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         long_range_energy_partition=long_range_energy_partition,
         long_range_green_mode=long_range_green_mode,
         long_range_assignment=long_range_assignment,
+        long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
         long_range_theta=long_range_theta,
         long_range_leaf_size=long_range_leaf_size,
         long_range_multipole_order=long_range_multipole_order,
@@ -513,6 +528,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
         feature_spectral_neutralize=feature_spectral_neutralize,
         feature_spectral_include_k0=feature_spectral_include_k0,
+        feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
     )
     torch.save(ckpt, path)

@@ -461,6 +461,7 @@ def export_core(
         "long_range_energy_partition": str(getattr(metadata_model, "long_range_energy_partition", "potential")),
         "long_range_neutralize": bool(getattr(metadata_model, "long_range_neutralize", True)),
         "long_range_green_mode": str(getattr(metadata_model, "long_range_green_mode", "poisson")),
+        "long_range_mesh_fft_full_ewald": bool(getattr(metadata_model, "long_range_mesh_fft_full_ewald", False)),
         "long_range_theta": float(getattr(metadata_model, "long_range_theta", 0.5)),
         "long_range_leaf_size": int(getattr(metadata_model, "long_range_leaf_size", 32)),
         "long_range_multipole_order": int(getattr(metadata_model, "long_range_multipole_order", 0)),
@@ -471,6 +472,7 @@ def export_core(
         "feature_spectral_slab_padding_factor": int(
             getattr(metadata_model, "feature_spectral_slab_padding_factor", 2)
         ),
+        "feature_spectral_assignment": str(getattr(metadata_model, "feature_spectral_assignment", "cic")),
         "notes": [
             "Core model: outputs per-atom energy.",
             "If export_reciprocal_source=true: core tuple includes reciprocal_source as the last tensor.",
