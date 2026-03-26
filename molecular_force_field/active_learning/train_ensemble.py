@@ -12,6 +12,7 @@ Supports:
 import glob
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -250,6 +251,46 @@ def _collect_checkpoint(ckpt_subdir: str, model_idx: int) -> str:
     raise FileNotFoundError(f"Checkpoint not found: {pattern}")
 
 
+def _find_resume_checkpoint(ckpt_subdir: str) -> Optional[str]:
+    """Return the newest resumable training checkpoint in *ckpt_subdir*."""
+    patterns = [
+        os.path.join(ckpt_subdir, "combined_model_epoch*_batch_count*.pth"),
+        os.path.join(ckpt_subdir, "best_model_temp.pth"),
+    ]
+    found: List[str] = []
+    for pattern in patterns:
+        found.extend(glob.glob(pattern))
+    if not found:
+        return None
+    found = sorted(set(found), key=os.path.getmtime, reverse=True)
+    return found[0]
+
+
+def _checkpoint_nonfinite_summary(checkpoint_path: str) -> Optional[str]:
+    """Return a short summary if *checkpoint_path* contains non-finite weights."""
+    import torch
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("e3trans_state_dict") or checkpoint.get("state_dict") or {}
+    bad_names: List[str] = []
+    bad_tensor_count = 0
+    for name, value in state_dict.items():
+        if not torch.is_tensor(value):
+            continue
+        if value.is_floating_point() or value.is_complex():
+            if not torch.isfinite(value).all():
+                bad_tensor_count += 1
+                if len(bad_names) < 5:
+                    bad_names.append(name)
+    if bad_tensor_count == 0:
+        return None
+    preview = ", ".join(bad_names)
+    return (
+        f"checkpoint contains {bad_tensor_count} non-finite tensor(s)"
+        + (f" (e.g. {preview})" if preview else "")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -266,6 +307,7 @@ def train_ensemble(
     master_addr: str = "auto",
     master_port: int = 29500,
     launcher: str = "auto",
+    max_retries_per_model: int = 1,
 ) -> List[str]:
     """Train *n_models* with different random seeds, optionally in parallel.
 
@@ -403,26 +445,70 @@ def train_ensemble(
                 cmd, cwd=work_dir, env=env,
                 stdout=fh, stderr=subprocess.STDOUT,
             )
-            procs.append((j, proc, fh, log_file))
+            procs.append((j, proc, fh, log_file, cmd, env, ckpt_path))
 
         # Wait for all processes in this batch
         errors = []
-        for j, proc, fh, log_file in procs:
+        for j, proc, fh, log_file, cmd, env, ckpt_path in procs:
             ret = proc.wait()
             fh.close()
             if ret != 0:
-                errors.append((j, ret, log_file))
+                recovered = False
+                last_log_ref = log_file
+                if batch_size == 1 and max_retries_per_model > 0:
+                    for retry_idx in range(1, max_retries_per_model + 1):
+                        resume_checkpoint = _find_resume_checkpoint(ckpt_subdir)
+                        if resume_checkpoint is None:
+                            logger.warning(
+                                f"Model {j}: subprocess failed (exit {ret}) and no resumable checkpoint was found; "
+                                f"skipping retry {retry_idx}/{max_retries_per_model}."
+                            )
+                            break
+                        shutil.copy2(resume_checkpoint, ckpt_path)
+                        retry_log = os.path.join(log_dir, f"model_{j}.retry{retry_idx}.log")
+                        retry_env = env.copy()
+                        retry_env["CUDA_LAUNCH_BLOCKING"] = "1"
+                        logger.warning(
+                            f"Model {j}: subprocess failed (exit {ret}); retrying {retry_idx}/{max_retries_per_model} "
+                            f"from {os.path.basename(resume_checkpoint)} with CUDA_LAUNCH_BLOCKING=1 -> {retry_log}"
+                        )
+                        with open(retry_log, "w") as retry_fh:
+                            retry_proc = subprocess.Popen(
+                                cmd, cwd=work_dir, env=retry_env,
+                                stdout=retry_fh, stderr=subprocess.STDOUT,
+                            )
+                            ret = retry_proc.wait()
+                        last_log_ref = retry_log
+                        if ret == 0:
+                            checkpoint_path = _collect_checkpoint(ckpt_subdir, j)
+                            bad_summary = _checkpoint_nonfinite_summary(checkpoint_path)
+                            if bad_summary is not None:
+                                errors.append((j, "nonfinite-checkpoint", f"{retry_log}\n{bad_summary}"))
+                            else:
+                                checkpoint_paths[j] = checkpoint_path
+                                recovered = True
+                            break
+                if not recovered:
+                    errors.append((j, ret, last_log_ref))
             else:
-                checkpoint_paths[j] = _collect_checkpoint(ckpt_subdir, j)
+                checkpoint_path = _collect_checkpoint(ckpt_subdir, j)
+                bad_summary = _checkpoint_nonfinite_summary(checkpoint_path)
+                if bad_summary is not None:
+                    errors.append((j, "nonfinite-checkpoint", f"{log_file}\n{bad_summary}"))
+                else:
+                    checkpoint_paths[j] = checkpoint_path
 
         if errors:
             msgs = []
             for j, rc, lf in errors:
                 tail = ""
                 try:
-                    with open(lf) as f:
-                        lines = f.readlines()
-                        tail = "".join(lines[-20:])
+                    if os.path.exists(lf):
+                        with open(lf) as f:
+                            lines = f.readlines()
+                            tail = "".join(lines[-20:])
+                    else:
+                        tail = lf
                 except Exception:
                     pass
                 msgs.append(

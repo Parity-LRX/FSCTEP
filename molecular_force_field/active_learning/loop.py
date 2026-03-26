@@ -53,6 +53,16 @@ def _converged_done_file(iter_path: str) -> str:
     return os.path.join(iter_path, "converged.done")
 
 
+def _select_exploration_checkpoint(
+    checkpoint_paths: List[str], global_iter: int, slot_idx: int = 0
+) -> tuple[str, int]:
+    """Round-robin exploration checkpoint selection across the ensemble."""
+    if not checkpoint_paths:
+        raise ValueError("No checkpoints available for exploration.")
+    model_idx = (global_iter + slot_idx) % len(checkpoint_paths)
+    return checkpoint_paths[model_idx], model_idx
+
+
 def _collect_existing_checkpoints(iter_path: str, n_models: int) -> Optional[List[str]]:
     ckpt_dir = os.path.join(iter_path, "checkpoint")
     if not os.path.isdir(ckpt_dir):
@@ -136,6 +146,8 @@ def _run_one_stage(
     external_field: Optional[list] = None,
     geometry_min_dist: float = 0.5,
     geometry_covalent_scale: float = 0.75,
+    merge_val_ratio: float = 0.1,
+    merge_val_seed: int = 42,
 ) -> int:
     """Run iterations for one stage until converged or max_iters reached.
 
@@ -213,7 +225,7 @@ def _run_one_stage(
                         fut = pool.submit(
                             explore_fn,
                             global_iter,
-                            checkpoints[0],
+                            _select_exploration_checkpoint(checkpoints, global_iter, s_idx)[0],
                             stage,
                             input_structure=struct_path,
                             output_traj=sub_traj,
@@ -238,8 +250,17 @@ def _run_one_stage(
                 for s_idx, (struct_path, sub_traj) in enumerate(
                     zip(explore_structures, sub_trajs)
                 ):
+                    explore_ckpt, explore_model_idx = _select_exploration_checkpoint(
+                        checkpoints, global_iter, s_idx
+                    )
+                    logger.info(
+                        "  Structure %d uses exploration model %d (%s)",
+                        s_idx,
+                        explore_model_idx,
+                        os.path.basename(explore_ckpt),
+                    )
                     explore_fn(
-                        global_iter, checkpoints[0], stage,
+                        global_iter, explore_ckpt, stage,
                         input_structure=struct_path, output_traj=sub_traj,
                     )
 
@@ -269,7 +290,15 @@ def _run_one_stage(
                 f"{len(explore_structures)} structures"
             )
         else:
-            traj_path = explore_fn(global_iter, checkpoints[0], stage)
+            explore_ckpt, explore_model_idx = _select_exploration_checkpoint(
+                checkpoints, global_iter
+            )
+            logger.info(
+                "Exploration uses ensemble model %d (%s)",
+                explore_model_idx,
+                os.path.basename(explore_ckpt),
+            )
+            traj_path = explore_fn(global_iter, explore_ckpt, stage)
             if not os.path.exists(traj_path):
                 raise FileNotFoundError(f"Exploration failed: {traj_path}")
 
@@ -438,6 +467,8 @@ def _run_one_stage(
                 new_xyz_path=labeled_path,
                 e0_csv_path=e0_path,
                 max_radius=max_radius,
+                val_ratio=merge_val_ratio,
+                random_seed=merge_val_seed + global_iter,
             )
             if external_field is not None:
                 merge_kwargs["external_field"] = external_field
@@ -486,6 +517,8 @@ def run_active_learning_loop(
     external_field: Optional[list] = None,
     geometry_min_dist: float = 0.5,
     geometry_covalent_scale: float = 0.75,
+    merge_val_ratio: float = 0.1,
+    merge_val_seed: int = 42,
 ) -> None:
     """Run DPGen2-style active learning loop with multi-layer filtering.
 
@@ -646,6 +679,8 @@ def run_active_learning_loop(
             external_field=external_field,
             geometry_min_dist=geometry_min_dist,
             geometry_covalent_scale=geometry_covalent_scale,
+            merge_val_ratio=merge_val_ratio,
+            merge_val_seed=merge_val_seed,
         )
 
     logger.info(scheduler.summary())

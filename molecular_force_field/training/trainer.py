@@ -571,6 +571,32 @@ class Trainer:
         if self.c_max is not None:
             self.c = min(self.c, self.c_max)
 
+    def _ensure_finite_tensor(self, tensor, label: str, *, epoch: int, batch_count: int):
+        """Raise early when a key training tensor becomes NaN/Inf."""
+        if torch.is_tensor(tensor) and not torch.isfinite(tensor).all():
+            raise FloatingPointError(
+                f"Non-finite tensor detected: {label} at epoch={epoch}, batch_count={batch_count}"
+            )
+
+    def _ensure_finite_parameters(self, *, epoch: int, batch_count: int):
+        """Fail fast when parameters or gradients become NaN/Inf."""
+        named_modules = (
+            ("e3trans", self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans),
+            ("model", self.model),
+        )
+        for module_name, module in named_modules:
+            for param_name, param in module.named_parameters():
+                if not torch.isfinite(param).all():
+                    raise FloatingPointError(
+                        f"Non-finite parameter detected: {module_name}.{param_name} "
+                        f"at epoch={epoch}, batch_count={batch_count}"
+                    )
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    raise FloatingPointError(
+                        f"Non-finite gradient detected: {module_name}.{param_name} "
+                        f"at epoch={epoch}, batch_count={batch_count}"
+                    )
+
     def _collect_e3_arch_metadata(self):
         """
         Collect minimal architecture metadata required to rebuild optional heads at inference.
@@ -1358,7 +1384,7 @@ class Trainer:
             with torch.no_grad():
                 energy_rmse = torch.sqrt(self.criterion_2(E_mean, target_energies))
                 energy_rmse_avg = torch.sqrt(self.criterion_2(E_avg_pred, target_energy_avg))
-            
+
             # Total loss
             total_loss = self.a * energy_loss + self.b * force_loss + self.c * stress_loss
 
@@ -1371,7 +1397,15 @@ class Trainer:
             delta_reg_loss = self._compute_delta_regularization(base_e3)
             if self.delta_regularization_weight > 0:
                 total_loss = total_loss + self.delta_regularization_weight * delta_reg_loss
+
+            self._ensure_finite_tensor(E_mean, "predicted_energy", epoch=epoch, batch_count=self.batch_count)
+            self._ensure_finite_tensor(f_pred, "predicted_force", epoch=epoch, batch_count=self.batch_count)
+            self._ensure_finite_tensor(energy_loss, "energy_loss", epoch=epoch, batch_count=self.batch_count)
+            self._ensure_finite_tensor(force_loss, "force_loss", epoch=epoch, batch_count=self.batch_count)
+            self._ensure_finite_tensor(total_loss, "total_loss", epoch=epoch, batch_count=self.batch_count)
+
             total_loss.backward()
+            self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
             
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(all_parameters, max_norm=self.max_norm_value, norm_type=2.0)
@@ -1380,6 +1414,7 @@ class Trainer:
                 log_gradient_statistics(all_nets, self.batch_count, logging)
             
             self.optimizer.step()
+            self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
 
             # Update EMA after optimizer step
             if self.ema_enabled and self.e3trans_ema is not None:

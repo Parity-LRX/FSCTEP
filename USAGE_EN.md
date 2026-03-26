@@ -1181,7 +1181,7 @@ pip install ase    # Structure processing and neighbor lists (usually already in
 
 ## Cold Start: Generate Initial Dataset (mff-init-data)
 
-When you only have seed structures and no labeled data, `mff-init-data` generates an initial dataset in one step: **perturb → DFT label → preprocess**:
+When you only have seed structures and no labeled data, `mff-init-data` handles cold start in one command. The default path is **perturb → DFT label → preprocess**, and it now also supports **AIMD sampling → trajectory subsampling → preprocess**:
 
 ```bash
 mff-init-data --structures water.xyz ethanol.xyz \
@@ -1196,9 +1196,22 @@ mff-init-data --structures POSCAR.vasp \
     --vasp-command /home/lrx/vasp.6.4.2/bin/vasp_gam \
     --vasp-mpi-ranks 8 --vasp-ncore 2 \
     --output-dir data
+
+# AIMD cold start: run ab initio MD first, then sample uniformly from the full trajectory
+mff-init-data --structures POSCAR.vasp \
+    --cold-start-mode aimd \
+    --aimd-total-frames 240 \
+    --aimd-sample-count 100 \
+    --aimd-temperature 300 \
+    --aimd-timestep 0.5 \
+    --aimd-covalent-scale 0.80 \
+    --label-type vasp --vasp-xc PBE --vasp-encut 500 \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp \
+    --vasp-mpi-ranks 16 --vasp-ncore 2 \
+    --output-dir data
 ```
 
-By default, `mff-init-data` relaxes each cold-start seed structure before generating perturbations. If you want to perturb the raw input directly, pass `--no-seed-relax`.
+By default, `mff-init-data` relaxes each cold-start seed structure before generating perturbations or launching AIMD. If you want to use the raw input directly, pass `--no-seed-relax`.
 
 Common parameters:
 
@@ -1211,11 +1224,35 @@ Common parameters:
 | `--seed-relax` / `--no-seed-relax` | On by default | Relax cold-start seeds before perturbation generation |
 | `--seed-relax-fmax` | `0.05` | Force threshold for cold-start seed relaxation (eV/Å) |
 | `--seed-relax-steps` | `200` | Maximum optimizer steps for cold-start seed relaxation |
+| `--cold-start-mode` | `perturb` | Cold-start source. `perturb` uses random perturbations; `aimd` runs an AIMD trajectory first and samples from it |
+| `--aimd-total-frames` | `1000` | Minimum number of full AIMD frames generated per seed structure |
+| `--aimd-sample-count` | `100` | Number of uniformly sampled AIMD frames per seed written into `train.xyz` |
+| `--aimd-temperature` | `300` | AIMD temperature in K |
+| `--aimd-timestep` | `0.5` | AIMD time step in fs |
+| `--aimd-friction` | `0.02` | Langevin friction used only by the non-VASP ASE fallback AIMD path; ignored by internal VASP AIMD |
+| `--aimd-covalent-scale` | `0.75` | Geometry-guard scale used with covalent radii to reject overly close AIMD geometries |
 | `--vasp-mpi-ranks` | `1` | MPI ranks used inside each VASP labeling job |
 | `--vasp-mpi-launcher` | Intel MPI `mpirun` | MPI launcher used when `--vasp-mpi-ranks > 1` |
 | `--vasp-ncore` | None | Optional `NCORE` written into INCAR for single-job VASP tuning |
 | `--cp2k-mpi-ranks` | `1` | MPI ranks used inside each CP2K labeling job |
 | `--cp2k-mpi-launcher` | Intel MPI `mpirun` | MPI launcher used when `--cp2k-mpi-ranks > 1` |
+
+Meaning of the AIMD cold-start parameters:
+
+- `--cold-start-mode aimd`
+  Enables AIMD cold start. Instead of creating `n-perturb` random perturbations, the workflow runs an ab initio MD trajectory from the seed structure.
+- `--aimd-total-frames`
+  Sets how many frames the full AIMD trajectory should contain. This controls cold-start coverage and total DFT cost.
+- `--aimd-sample-count`
+  Sets how many frames finally enter the initial dataset. The code samples them uniformly from the whole AIMD trajectory rather than taking only the first part.
+- `--aimd-temperature`
+  Temperature used for AIMD. Higher temperature usually explores more configuration space, but also makes high-energy or unstable structures more likely.
+- `--aimd-timestep`
+  Physical time step per AIMD step. If it is too large, integration becomes less stable; if it is too small, wall-clock cost increases.
+- `--aimd-friction`
+  Langevin damping parameter used only by the ASE fallback AIMD implementation. It does not affect internal VASP AIMD.
+- `--aimd-covalent-scale`
+  Geometry-check parameter for trajectory validation. The code compares interatomic distances against covalent radii scaled by this value to stop obviously bad geometries early.
 
 See [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md) for full details.
 

@@ -6,6 +6,7 @@ import os
 from typing import List, Optional, Tuple
 
 import numpy as np
+from ase import Atoms
 from ase.io import read
 
 logger = logging.getLogger(__name__)
@@ -45,18 +46,52 @@ def _atoms_list_from_xyz(path: str) -> list:
     return read(path, index=":")
 
 
+def _atoms_list_from_processed_h5(path: str) -> list:
+    """Load structures from processed/read H5 data as list of ASE Atoms."""
+    try:
+        import h5py
+    except ImportError as e:
+        raise ImportError(
+            "Loading PES coverage from H5 requires h5py. Install with: pip install h5py"
+        ) from e
+
+    atoms_list = []
+    with h5py.File(path, "r") as f:
+        keys = sorted(f.keys(), key=lambda s: int(str(s).split("_")[-1]))
+        for key in keys:
+            group = f[key]
+            numbers = np.asarray(group["A"], dtype=np.int64)
+            positions = np.asarray(group["pos"], dtype=np.float64)
+            cell = np.asarray(group["cell"], dtype=np.float64) if "cell" in group else None
+            if cell is not None and cell.shape == (3, 3):
+                atoms = Atoms(numbers=numbers, positions=positions, cell=cell)
+            else:
+                atoms = Atoms(numbers=numbers, positions=positions)
+            atoms_list.append(atoms)
+    return atoms_list
+
+
 def _atoms_list_from_h5_or_dir(data_dir: str, prefix: str = "train") -> list:
-    """Load structures from preprocessed H5 data. Falls back to XYZ if available."""
+    """Load structures from the real merged dataset, preferring H5 over stale XYZ."""
+    processed_h5 = os.path.join(data_dir, f"processed_{prefix}.h5")
+    if os.path.exists(processed_h5):
+        return _atoms_list_from_processed_h5(processed_h5)
+
+    read_h5 = os.path.join(data_dir, f"read_{prefix}.h5")
+    if os.path.exists(read_h5):
+        return _atoms_list_from_processed_h5(read_h5)
+
     xyz_path = os.path.join(data_dir, f"{prefix}.xyz")
     if os.path.exists(xyz_path):
         return _atoms_list_from_xyz(xyz_path)
+
     # Try to find any XYZ in data_dir
     for f in os.listdir(data_dir):
         if f.endswith(".xyz"):
             return _atoms_list_from_xyz(os.path.join(data_dir, f))
     raise FileNotFoundError(
-        f"No XYZ file found in {data_dir}. PES coverage requires XYZ format. "
-        "Use mff-preprocess output or provide --dataset-file path to XYZ."
+        f"No processed/read H5 or XYZ file found in {data_dir}. "
+        "Use mff-preprocess output or provide --dataset-file path to H5/XYZ."
     )
 
 
@@ -98,6 +133,8 @@ def evaluate_pes_coverage(
     """
     if os.path.isdir(dataset_path):
         train_atoms = _atoms_list_from_h5_or_dir(dataset_path)
+    elif dataset_path.endswith(".h5"):
+        train_atoms = _atoms_list_from_processed_h5(dataset_path)
     else:
         train_atoms = _atoms_list_from_xyz(dataset_path)
 

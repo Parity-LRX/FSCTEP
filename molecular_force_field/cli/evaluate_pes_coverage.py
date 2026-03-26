@@ -15,7 +15,7 @@ def main():
         "--dataset-file",
         type=str,
         default=None,
-        help="Path to dataset XYZ file. If not set, uses --data-dir/train.xyz or first XYZ in data-dir.",
+        help="Path to dataset H5/XYZ file. If not set, uses the real merged dataset in --data-dir.",
     )
     parser.add_argument(
         "--data-dir",
@@ -87,9 +87,6 @@ def main():
     dataset_path = args.dataset_file
     if dataset_path is None:
         dataset_path = args.data_dir
-        train_xyz = os.path.join(args.data_dir, "train.xyz")
-        if os.path.exists(train_xyz):
-            dataset_path = train_xyz
 
     report = evaluate_pes_coverage(
         dataset_path=dataset_path,

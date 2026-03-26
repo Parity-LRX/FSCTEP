@@ -332,6 +332,23 @@ def _dir_proj_cpu_f64(l: int) -> torch.Tensor:
 
 _dir_proj_cache_by_dev_dtype: Dict[Tuple[str, str, int], torch.Tensor] = {}
 
+
+def _integer_power_table(x: torch.Tensor, max_power: int) -> torch.Tensor:
+    """
+    Build [x^0, x^1, ..., x^max_power] using repeated multiplication.
+
+    This avoids autograd's generic PowBackward path, which can produce NaNs for
+    signed bases even when the exponents are mathematically integers.
+    """
+    if max_power < 0:
+        raise ValueError(f"max_power must be >= 0, got {max_power}")
+    powers = [torch.ones_like(x)]
+    cur = torch.ones_like(x)
+    for _ in range(int(max_power)):
+        cur = cur * x
+        powers.append(cur)
+    return torch.stack(powers, dim=-1)
+
 # Optional CUDA path (Triton fused kernel). PyTorch (N,D)@(D,K) is often faster due to cuBLAS;
 # set ICTD_USE_TRITON=1 to try Triton anyway (e.g. to reduce peak memory by not materializing t).
 def _direction_harmonics_triton_optional(
@@ -370,8 +387,12 @@ def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
     a = exps[:, 0]
     b = exps[:, 1]
     c = exps[:, 2]
-    # (..., Dsym) — GPU: one fused broadcast pow kernel; very fast
-    t = (nx.unsqueeze(-1) ** a) * (ny.unsqueeze(-1) ** b) * (nz.unsqueeze(-1) ** c)
+    max_power = int(l)
+    x_pows = _integer_power_table(nx, max_power)
+    y_pows = _integer_power_table(ny, max_power)
+    z_pows = _integer_power_table(nz, max_power)
+    # (..., Dsym) with integer-power lookup instead of generic pow backward
+    t = x_pows[..., a] * y_pows[..., b] * z_pows[..., c]
     t = t * coefs
     # (..., 2l+1)
     return t @ P

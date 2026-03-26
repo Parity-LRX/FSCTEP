@@ -89,6 +89,14 @@ class ModelDeviCalculator:
         atom_energies = model(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, **fwd_kwargs)
         E_total = atom_energies.sum() + E_offset
         grads = torch.autograd.grad(E_total, pos)[0]
+        if not torch.isfinite(E_total):
+            raise FloatingPointError(
+                f"Non-finite total energy during model deviation for model {model_idx}"
+            )
+        if not torch.isfinite(grads).all():
+            raise FloatingPointError(
+                f"Non-finite force gradients during model deviation for model {model_idx}"
+            )
         forces = -grads.detach().cpu().numpy()
         energy = E_total.item()
         return energy, forces
@@ -106,6 +114,10 @@ class ModelDeviCalculator:
             forces_list.append(f)
         energies = np.array(energies)
         forces = np.stack(forces_list, axis=0)  # [n_models, n_atoms, 3]
+        if not np.isfinite(energies).all():
+            raise FloatingPointError("Non-finite ensemble energies in model deviation")
+        if not np.isfinite(forces).all():
+            raise FloatingPointError("Non-finite ensemble forces in model deviation")
         n_atoms = forces.shape[1]
         if n_atoms == 0:
             return {
@@ -118,6 +130,8 @@ class ModelDeviCalculator:
         f_std_per_atom = np.std(forces, axis=0)  # [n_atoms, 3]
         f_std_mag = np.linalg.norm(f_std_per_atom, axis=1)  # [n_atoms]
         devi_e = np.std(energies) / max(n_atoms, 1)
+        if not np.isfinite(f_std_mag).all() or not np.isfinite(devi_e):
+            raise FloatingPointError("Non-finite deviation statistics")
         return {
             "max_devi_f": float(np.max(f_std_mag)),
             "min_devi_f": float(np.min(f_std_mag)),

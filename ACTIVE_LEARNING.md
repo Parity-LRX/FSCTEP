@@ -8,7 +8,21 @@
 
 ## 冷启动：从零生成初始数据集 (mff-init-data)
 
-当只有一个或几个种子结构、没有已标注数据时，`mff-init-data` 可一键完成：**扰动 → DFT 标注 → 预处理**，输出可直接用于训练或 AL 的完整数据集。
+当只有一个或几个种子结构、没有已标注数据时，`mff-init-data` 用来生成 `iter0` 的初始数据集。现在支持两条冷启动路径：
+
+1. `perturb`：先对种子结构做微扰，再逐帧做 DFT 标注
+2. `aimd`：先从种子结构跑一条 ab initio MD 轨迹，再从整条轨迹中均匀抽样
+
+两条路径最终都会输出可直接用于训练或主动学习的：
+
+- `train.xyz`
+- `processed_train.h5`
+- `processed_val.h5`
+- `fitted_E0.csv`
+
+### 路径一：微扰冷启动
+
+这是默认模式，适合快速生成一个局部邻域的数据集。
 
 ```bash
 # 分子体系（PySCF，无需外部二进制）
@@ -21,26 +35,121 @@ mff-init-data --structures water.xyz ethanol.xyz \
 mff-init-data --structures POSCAR.vasp \
     --n-perturb 20 --rattle-std 0.02 --cell-scale-range 0.03 \
     --label-type vasp --vasp-xc PBE --vasp-encut 500 --vasp-kpts 4 4 4 \
-    --label-n-workers 8 --output-dir data
-
-# 从目录自动收集所有种子结构
-mff-init-data --structures structures/ \
-    --n-perturb 10 --label-type pyscf --output-dir data
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp \
+    --vasp-mpi-ranks 16 --vasp-ncore 2 \
+    --label-n-workers 1 --output-dir data
 ```
 
-### 扰动参数
+### 路径二：AIMD 冷启动
+
+适合表面吸附、反应中间态、强耦合体系这类“随机微扰很容易打出高力坏帧”的场景。流程是：
+
+1. 先对种子结构做一次 DFT 弛豫
+2. 从弛豫后的结构启动一条 AIMD 轨迹
+3. 保存完整轨迹到 `aimd_full.xyz`
+4. 从整条轨迹中均匀抽样，写入 `train.xyz`
+5. 再走预处理，生成 `processed_train.h5 / processed_val.h5`
+
+```bash
+mff-init-data --structures POSCAR.vasp \
+    --cold-start-mode aimd \
+    --aimd-total-frames 240 \
+    --aimd-sample-count 100 \
+    --aimd-temperature 300 \
+    --aimd-timestep 0.5 \
+    --aimd-covalent-scale 0.80 \
+    --min-dist 0.90 \
+    --seed-relax \
+    --seed-relax-fmax 0.05 \
+    --seed-relax-steps 40 \
+    --label-type vasp \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp \
+    --vasp-mpi-ranks 16 \
+    --vasp-ncore 2 \
+    --vasp-xc PBE \
+    --vasp-encut 450 \
+    --vasp-kpts 3 3 1 \
+    --output-dir data
+```
+
+### 冷启动公共参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `--structures` | 必选 | 一个或多个种子结构文件，或包含 .xyz/.cif 文件的目录 |
-| `--n-perturb` | 10 | 每个种子结构生成的扰动数量（不含原始结构本身） |
-| `--rattle-std` | 0.05 | 原子位移高斯分布 σ (Å)。分子用 0.03–0.1，晶体用 0.01–0.03 |
-| `--cell-scale-range` | 0 | 晶胞随机缩放 ±范围（仅周期性体系）。如 0.03 表示 ±3% |
-| `--min-dist` | 0.5 | 最小原子间距过滤 (Å)，丢弃非物理构型 |
-| `--train-ratio` | 0.9 | 训练/验证集比例 |
-| `--skip-preprocess` | False | 仅输出标注后的 XYZ，跳过 H5 预处理 |
+| `--structures` | 必选 | 一个或多个种子结构文件，或包含 `.xyz/.cif/.vasp` 文件的目录 |
+| `--cold-start-mode` | `perturb` | 冷启动来源。`perturb`=随机微扰，`aimd`=先跑 AIMD 再抽样 |
+| `--train-ratio` | `0.9` | 训练/验证集比例 |
+| `--skip-preprocess` | False | 仅输出 `train.xyz`，跳过 H5 预处理 |
+| `--max-force-filter` | 无 | 可选的冷启动高力帧过滤阈值；若设置，会丢弃 `max |F|` 过大的帧 |
 
-> **典型流程**：`mff-init-data` 生成初始数据集 → `mff-active-learn` 迭代扩充。
+### 种子结构预处理参数
+
+默认情况下，`mff-init-data` 会先对每个冷启动种子结构做一次弛豫，再在弛豫后的结构上生成微扰或启动 AIMD。若你明确不想这样做，可传 `--no-seed-relax`。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--seed-relax` / `--no-seed-relax` | 默认开启 | 冷启动时是否先弛豫种子结构 |
+| `--seed-relax-fmax` | `0.05` | 冷启动种子弛豫的力收敛阈值 (eV/Å) |
+| `--seed-relax-steps` | `200` | 冷启动种子弛豫的最大优化步数 |
+
+### 微扰冷启动参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--n-perturb` | `10` | 每个种子结构生成的微扰数量（不含原始结构本身） |
+| `--rattle-std` | `0.05` | 原子位移高斯分布 σ (Å)。分子常用 0.03–0.1，晶体常用 0.01–0.03 |
+| `--cell-scale-range` | `0.0` | 晶胞随机缩放 ±范围（仅周期性体系） |
+| `--min-dist` | `0.5` | 生成微扰后允许的最小原子间距 (Å) |
+
+### AIMD 冷启动参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--cold-start-mode aimd` | 无 | 启用 AIMD 冷启动，不再生成 `n-perturb` 个随机微扰结构 |
+| `--aimd-total-frames` | `1000` | 每个种子结构 AIMD 至少生成多少帧完整轨迹 |
+| `--aimd-sample-count` | `100` | 每个种子结构最终从 AIMD 全轨迹里均匀抽取多少帧写入 `train.xyz` |
+| `--aimd-temperature` | `300` | AIMD 温度，单位 K |
+| `--aimd-timestep` | `0.5` | AIMD 时间步长，单位 fs |
+| `--aimd-friction` | `0.02` | 仅在非 VASP 的 ASE fallback AIMD 路径下使用的 Langevin 摩擦系数；VASP 内部 AIMD 会忽略它 |
+| `--aimd-covalent-scale` | `0.75` | AIMD 轨迹几何守卫参数。程序会用“共价半径 × 该缩放系数”检查原子是否过近 |
+
+### AIMD 参数的具体含义
+
+- `--cold-start-mode aimd`
+  启用 AIMD 冷启动。代码不再先生成 `n-perturb` 个随机结构，而是直接从种子结构跑第一性原理 MD。
+- `--aimd-total-frames`
+  规定完整 AIMD 轨迹长度。这个值越大，PES 覆盖通常越广，但 DFT 成本也越高。
+- `--aimd-sample-count`
+  规定最终真正并入初始数据集的帧数。代码会从整条轨迹中做均匀抽样，而不是只取前面一段。
+- `--aimd-temperature`
+  AIMD 的热浴温度。温度越高，构型波动越大，也更容易采到高能或不稳定构型。
+- `--aimd-timestep`
+  AIMD 每一步对应的物理时间步长。过大可能导致积分不稳定，过小则会显著增加总 wall time。
+- `--aimd-friction`
+  这是 ASE fallback AIMD 用的 Langevin 阻尼参数，只在非 VASP 内部 AIMD 路径下使用。
+- `--aimd-covalent-scale`
+  用来做轨迹几何体检。程序会比较原子间距离和“共价半径阈值”，尽早截断明显不物理的坏几何。
+
+### 冷启动输出文件
+
+`mff-init-data` 常见输出包括：
+
+- `train.xyz`
+  冷启动最终保留下来的标注帧。对 `aimd` 模式来说，这是从整条轨迹中抽样后的子集。
+- `train_unfiltered.xyz`
+  如果启用了 `--max-force-filter`，这里会保留过滤前的完整标注结果。
+- `unlabeled.xyz`
+  对 `perturb` 模式来说，是送去标注前的未标注帧；对 `aimd` 模式来说，是最终抽样子集的结构副本。
+- `aimd_full.xyz`
+  仅 `aimd` 模式会生成，保存完整 AIMD 轨迹。
+- `relaxed_seeds/`
+  冷启动种子弛豫结果。
+- `processed_train.h5`, `processed_val.h5`
+  后续训练和主动学习直接使用的预处理 H5。
+- `fitted_E0.csv`
+  从冷启动训练集拟合得到的原子参考能。
+
+> 典型流程：`mff-init-data` 生成初始数据集 → `mff-active-learn` 迭代扩充。
 
 ---
 
@@ -487,6 +596,628 @@ mff-active-learn --explore-type ase --explore-mode neb \
 
 ---
 
+## ?? CLI ???????????
+
+???????????????????????????
+????????????????? `mff-active-learn --help` ???**?? CLI ??**??????????????????????????? `--help` ?????
+
+```text
+usage: active_learning.py [-h] [--work-dir WORK_DIR] [--data-dir DATA_DIR]
+                          [--init-structure INIT_STRUCTURE [INIT_STRUCTURE ...]]
+                          [--n-models N_MODELS] [--no-pre-eval] --explore-type
+                          {ase,lammps} [--explore-mode {md,neb}]
+                          [--label-type {script,identity,pyscf,vasp,cp2k,espresso,gaussian,orca,local-script,slurm}]
+                          [--label-n-workers LABEL_N_WORKERS]
+                          [--label-error-handling {raise,skip}]
+                          [--label-threads-per-worker T]
+                          [--label-script LABEL_SCRIPT]
+                          [--identity-checkpoint IDENTITY_CHECKPOINT]
+                          [--init-checkpoint INIT_CHECKPOINT [INIT_CHECKPOINT ...]]
+                          [--resume] [--device DEVICE]
+                          [--max-radius MAX_RADIUS]
+                          [--atomic-energy-file ATOMIC_ENERGY_FILE]
+                          [--neb-initial NEB_INITIAL] [--neb-final NEB_FINAL]
+                          [--epochs EPOCHS] [--a A] [--b B]
+                          [--train-batch-size TRAIN_BATCH_SIZE]
+                          [--train-learning-rate TRAIN_LEARNING_RATE]
+                          [--train-min-learning-rate TRAIN_MIN_LEARNING_RATE]
+                          [--train-warmup-batches TRAIN_WARMUP_BATCHES]
+                          [--train-lr-scheduler {cosine,step}]
+                          [--train-lr-decay-patience TRAIN_LR_DECAY_PATIENCE]
+                          [--train-lr-decay-factor TRAIN_LR_DECAY_FACTOR]
+                          [--train-warmup-start-ratio TRAIN_WARMUP_START_RATIO]
+                          [--train-patience TRAIN_PATIENCE]
+                          [--train-max-grad-norm TRAIN_MAX_GRAD_NORM]
+                          [--train-dump-frequency TRAIN_DUMP_FREQUENCY]
+                          [--dtype {float32,float64,float,double}]
+                          [--tensor-product-mode TENSOR_PRODUCT_MODE]
+                          [--long-range-mode {none,latent-coulomb,isolated-far-field-v1,isolated-far-field-v2,reciprocal-spectral-v1}]
+                          [--long-range-boundary {nonperiodic,periodic,slab}]
+                          [--long-range-backend {dense_pairwise,tree_fmm}]
+                          [--long-range-hidden-dim LONG_RANGE_HIDDEN_DIM]
+                          [--long-range-filter-hidden-dim LONG_RANGE_FILTER_HIDDEN_DIM]
+                          [--long-range-kmax LONG_RANGE_KMAX]
+                          [--long-range-mesh-size LONG_RANGE_MESH_SIZE]
+                          [--long-range-slab-padding-factor LONG_RANGE_SLAB_PADDING_FACTOR]
+                          [--long-range-source-channels LONG_RANGE_SOURCE_CHANNELS]
+                          [--long-range-reciprocal-backend {direct_kspace,mesh_fft}]
+                          [--long-range-energy-partition {potential,uniform}]
+                          [--long-range-green-mode {poisson,learned_poisson}]
+                          [--long-range-assignment {cic,tsc,pcs}]
+                          [--long-range-mesh-fft-full-ewald]
+                          [--no-long-range-mesh-fft-full-ewald]
+                          [--long-range-theta LONG_RANGE_THETA]
+                          [--long-range-leaf-size LONG_RANGE_LEAF_SIZE]
+                          [--long-range-multipole-order LONG_RANGE_MULTIPOLE_ORDER]
+                          [--long-range-far-source-dim LONG_RANGE_FAR_SOURCE_DIM]
+                          [--long-range-far-num-shells LONG_RANGE_FAR_NUM_SHELLS]
+                          [--long-range-far-shell-growth LONG_RANGE_FAR_SHELL_GROWTH]
+                          [--long-range-far-tail] [--no-long-range-far-tail]
+                          [--long-range-far-tail-bins LONG_RANGE_FAR_TAIL_BINS]
+                          [--long-range-far-stats LONG_RANGE_FAR_STATS]
+                          [--long-range-far-source-norm]
+                          [--no-long-range-far-source-norm]
+                          [--long-range-far-gate-init LONG_RANGE_FAR_GATE_INIT]
+                          [--long-range-neutralize]
+                          [--no-long-range-neutralize]
+                          [--feature-spectral-assignment {cic,tsc,pcs}]
+                          [--external-tensor-rank EXTERNAL_TENSOR_RANK]
+                          [--external-field-file EXTERNAL_FIELD_FILE]
+                          [--explore-external-field V [V ...]]
+                          [--explore-n-workers EXPLORE_N_WORKERS]
+                          [--merge-val-ratio MERGE_VAL_RATIO]
+                          [--merge-val-seed MERGE_VAL_SEED]
+                          [--exploration-aggressiveness EXPLORATION_AGGRESSIVENESS]
+                          [--train-n-gpu TRAIN_N_GPU]
+                          [--train-max-parallel TRAIN_MAX_PARALLEL]
+                          [--train-nnodes TRAIN_NNODES]
+                          [--train-master-addr TRAIN_MASTER_ADDR]
+                          [--train-master-port TRAIN_MASTER_PORT]
+                          [--train-launcher {auto,local,slurm}] [--verbose]
+                          [--pyscf-method PYSCF_METHOD]
+                          [--pyscf-basis PYSCF_BASIS]
+                          [--pyscf-charge PYSCF_CHARGE]
+                          [--pyscf-spin PYSCF_SPIN]
+                          [--pyscf-max-memory PYSCF_MAX_MEMORY]
+                          [--pyscf-conv-tol PYSCF_CONV_TOL]
+                          [--vasp-xc VASP_XC] [--vasp-encut VASP_ENCUT]
+                          [--vasp-kpts NK1 NK2 NK3] [--vasp-ediff VASP_EDIFF]
+                          [--vasp-ismear VASP_ISMEAR]
+                          [--vasp-sigma VASP_SIGMA]
+                          [--vasp-command VASP_COMMAND]
+                          [--vasp-mpi-ranks VASP_MPI_RANKS]
+                          [--vasp-mpi-launcher VASP_MPI_LAUNCHER]
+                          [--vasp-ncore VASP_NCORE] [--vasp-cleanup]
+                          [--cp2k-xc CP2K_XC]
+                          [--cp2k-basis-set CP2K_BASIS_SET]
+                          [--cp2k-pseudo CP2K_PSEUDO]
+                          [--cp2k-cutoff CP2K_CUTOFF]
+                          [--cp2k-max-scf CP2K_MAX_SCF]
+                          [--cp2k-charge CP2K_CHARGE]
+                          [--cp2k-command CP2K_COMMAND]
+                          [--cp2k-mpi-ranks CP2K_MPI_RANKS]
+                          [--cp2k-mpi-launcher CP2K_MPI_LAUNCHER]
+                          [--cp2k-cleanup] [--qe-pseudo-dir QE_PSEUDO_DIR]
+                          [--qe-pseudopotentials QE_PSEUDOPOTENTIALS]
+                          [--qe-ecutwfc QE_ECUTWFC] [--qe-ecutrho QE_ECUTRHO]
+                          [--qe-kpts NK1 NK2 NK3] [--qe-command QE_COMMAND]
+                          [--qe-cleanup] [--gaussian-method GAUSSIAN_METHOD]
+                          [--gaussian-basis GAUSSIAN_BASIS]
+                          [--gaussian-charge GAUSSIAN_CHARGE]
+                          [--gaussian-mult GAUSSIAN_MULT]
+                          [--gaussian-nproc GAUSSIAN_NPROC]
+                          [--gaussian-mem GAUSSIAN_MEM]
+                          [--gaussian-command GAUSSIAN_COMMAND]
+                          [--gaussian-cleanup]
+                          [--orca-simpleinput ORCA_SIMPLEINPUT]
+                          [--orca-nproc ORCA_NPROC]
+                          [--orca-charge ORCA_CHARGE] [--orca-mult ORCA_MULT]
+                          [--orca-command ORCA_COMMAND] [--orca-cleanup]
+                          [--local-script-template LOCAL_SCRIPT_TEMPLATE]
+                          [--local-script-bash LOCAL_SCRIPT_BASH]
+                          [--local-script-cleanup]
+                          [--slurm-template SLURM_TEMPLATE]
+                          [--slurm-partition SLURM_PARTITION]
+                          [--slurm-nodes SLURM_NODES]
+                          [--slurm-ntasks SLURM_NTASKS]
+                          [--slurm-time SLURM_TIME] [--slurm-mem SLURM_MEM]
+                          [--slurm-max-concurrent SLURM_MAX_CONCURRENT]
+                          [--slurm-poll-interval SLURM_POLL_INTERVAL]
+                          [--slurm-extra [ARG ...]] [--slurm-cleanup]
+                          [--stages STAGES] [--n-iterations N_ITERATIONS]
+                          [--level-f-lo LEVEL_F_LO] [--level-f-hi LEVEL_F_HI]
+                          [--conv-accuracy CONV_ACCURACY]
+                          [--md-temperature MD_TEMPERATURE]
+                          [--md-steps MD_STEPS] [--md-timestep MD_TIMESTEP]
+                          [--md-friction MD_FRICTION]
+                          [--md-relax-fmax MD_RELAX_FMAX]
+                          [--md-log-interval MD_LOG_INTERVAL]
+                          [--geometry-min-dist GEOMETRY_MIN_DIST]
+                          [--geometry-covalent-scale GEOMETRY_COVALENT_SCALE]
+                          [--diversity-metric {soap,devi_hist,none}]
+                          [--max-candidates-per-iter MAX_CANDIDATES_PER_ITER]
+                          [--soap-rcut SOAP_RCUT] [--soap-nmax SOAP_NMAX]
+                          [--soap-lmax SOAP_LMAX] [--soap-sigma SOAP_SIGMA]
+                          [--devi-hist-bins DEVI_HIST_BINS]
+                          [--fail-strategy {discard,sample_topk}]
+                          [--fail-max-select FAIL_MAX_SELECT]
+
+DPGen2-style active learning for molecular force field.
+
+options:
+  -h, --help            show this help message and exit
+  --work-dir WORK_DIR
+  --data-dir DATA_DIR
+  --init-structure INIT_STRUCTURE [INIT_STRUCTURE ...]
+                        One or more initial structure files for MD
+                        exploration, or a directory containing .xyz/.cif
+                        files. When multiple structures are given, each
+                        iteration explores all structures in parallel and
+                        merges the trajectories.
+  --n-models N_MODELS
+  --no-pre-eval
+  --explore-type {ase,lammps}
+  --explore-mode {md,neb}
+  --label-type {script,identity,pyscf,vasp,cp2k,espresso,gaussian,orca,local-script,slurm}
+  --label-n-workers LABEL_N_WORKERS
+                        Number of parallel worker processes for DFT labeling.
+                        Each worker handles one structure independently.
+                        Default: 1 (serial). Set to e.g. 8 to run 8 DFT jobs
+                        concurrently.
+  --label-error-handling {raise,skip}
+                        What to do when a DFT calculation fails. 'raise'
+                        (default): stop immediately. 'skip': log the error and
+                        continue with remaining structures.
+  --label-threads-per-worker T
+                        Number of threads each worker process may use
+                        internally (e.g. PySCF linear algebra, QE OpenMP
+                        threads). Rule of thumb: n_workers × T ≤ total CPU
+                        cores. Default: 1 when n_workers > 1 (avoid over-
+                        subscription), 0 / auto when n_workers = 1.
+  --label-script LABEL_SCRIPT
+  --identity-checkpoint IDENTITY_CHECKPOINT
+  --init-checkpoint INIT_CHECKPOINT [INIT_CHECKPOINT ...]
+                        One or more checkpoints used to bootstrap active
+                        learning. When provided, iteration 0 skips training
+                        and directly explores with these checkpoint(s).
+                        Provide either 1 checkpoint (bootstrap iteration 0
+                        will skip uncertainty gating and promote explored
+                        frames directly), or exactly --n-models checkpoints
+                        (full ensemble deviation is available in iteration 0).
+  --resume              Resume an interrupted active-learning run from
+                        work_dir/al_state.json and reuse existing checkpoints
+                        / trajectories / labeled files under
+                        iterations/iter_*.
+  --device DEVICE
+  --max-radius MAX_RADIUS
+  --atomic-energy-file ATOMIC_ENERGY_FILE
+  --neb-initial NEB_INITIAL
+  --neb-final NEB_FINAL
+  --epochs EPOCHS
+  --a A                 Training energy loss weight forwarded to mff-train.
+  --b B                 Training force loss weight forwarded to mff-train.
+  --train-batch-size TRAIN_BATCH_SIZE
+                        Training batch size forwarded to mff-train.
+  --train-learning-rate TRAIN_LEARNING_RATE
+                        Training learning rate forwarded to mff-train.
+  --train-min-learning-rate TRAIN_MIN_LEARNING_RATE
+                        Training minimum learning rate forwarded to mff-train.
+  --train-warmup-batches TRAIN_WARMUP_BATCHES
+                        Training warmup batches forwarded to mff-train.
+  --train-lr-scheduler {cosine,step}
+                        Training LR scheduler forwarded to mff-train.
+  --train-lr-decay-patience TRAIN_LR_DECAY_PATIENCE
+                        Training StepLR step size forwarded to mff-train.
+  --train-lr-decay-factor TRAIN_LR_DECAY_FACTOR
+                        Training StepLR decay factor forwarded to mff-train.
+  --train-warmup-start-ratio TRAIN_WARMUP_START_RATIO
+                        Training warmup start ratio forwarded to mff-train.
+  --train-patience TRAIN_PATIENCE
+                        Training early-stopping patience forwarded to mff-
+                        train.
+  --train-max-grad-norm TRAIN_MAX_GRAD_NORM
+                        Training gradient clipping norm forwarded to mff-
+                        train.
+  --train-dump-frequency TRAIN_DUMP_FREQUENCY
+                        Training validation/checkpoint frequency forwarded to
+                        mff-train.
+  --dtype {float32,float64,float,double}
+                        Training dtype forwarded to mff-train (e.g. float32).
+  --tensor-product-mode TENSOR_PRODUCT_MODE
+                        Tensor product mode for training (e.g. pure-cartesian-
+                        ictd, spherical). Passed to mff-train. If not set,
+                        mff-train uses its default.
+  --long-range-mode {none,latent-coulomb,isolated-far-field-v1,isolated-far-field-v2,reciprocal-spectral-v1}
+                        Forwarded to mff-train. Use this to keep long-range
+                        architecture stable across AL retrains.
+  --long-range-boundary {nonperiodic,periodic,slab}
+                        Forwarded to mff-train.
+  --long-range-backend {dense_pairwise,tree_fmm}
+                        Forwarded to mff-train for latent-coulomb runs.
+  --long-range-hidden-dim LONG_RANGE_HIDDEN_DIM
+                        Forwarded to mff-train.
+  --long-range-filter-hidden-dim LONG_RANGE_FILTER_HIDDEN_DIM
+                        Forwarded to mff-train.
+  --long-range-kmax LONG_RANGE_KMAX
+                        Forwarded to mff-train.
+  --long-range-mesh-size LONG_RANGE_MESH_SIZE
+                        Forwarded to mff-train.
+  --long-range-slab-padding-factor LONG_RANGE_SLAB_PADDING_FACTOR
+                        Forwarded to mff-train.
+  --long-range-source-channels LONG_RANGE_SOURCE_CHANNELS
+                        Forwarded to mff-train.
+  --long-range-reciprocal-backend {direct_kspace,mesh_fft}
+                        Forwarded to mff-train.
+  --long-range-energy-partition {potential,uniform}
+                        Forwarded to mff-train.
+  --long-range-green-mode {poisson,learned_poisson}
+                        Forwarded to mff-train.
+  --long-range-assignment {cic,tsc,pcs}
+                        Forwarded to mff-train.
+  --long-range-mesh-fft-full-ewald
+                        Forwarded to mff-train. Enables the slower full Ewald
+                        correction path for mesh_fft.
+  --no-long-range-mesh-fft-full-ewald
+                        Forwarded to mff-train. Keeps mesh_fft on the faster
+                        reciprocal-only path.
+  --long-range-theta LONG_RANGE_THETA
+                        Forwarded to mff-train.
+  --long-range-leaf-size LONG_RANGE_LEAF_SIZE
+                        Forwarded to mff-train.
+  --long-range-multipole-order LONG_RANGE_MULTIPOLE_ORDER
+                        Forwarded to mff-train.
+  --long-range-far-source-dim LONG_RANGE_FAR_SOURCE_DIM
+                        Forwarded to mff-train.
+  --long-range-far-num-shells LONG_RANGE_FAR_NUM_SHELLS
+                        Forwarded to mff-train.
+  --long-range-far-shell-growth LONG_RANGE_FAR_SHELL_GROWTH
+                        Forwarded to mff-train.
+  --long-range-far-tail
+                        Forwarded to mff-train.
+  --no-long-range-far-tail
+                        Forwarded to mff-train.
+  --long-range-far-tail-bins LONG_RANGE_FAR_TAIL_BINS
+                        Forwarded to mff-train.
+  --long-range-far-stats LONG_RANGE_FAR_STATS
+                        Forwarded to mff-train.
+  --long-range-far-source-norm
+                        Forwarded to mff-train.
+  --no-long-range-far-source-norm
+                        Forwarded to mff-train.
+  --long-range-far-gate-init LONG_RANGE_FAR_GATE_INIT
+                        Forwarded to mff-train.
+  --long-range-neutralize
+                        Forwarded to mff-train.
+  --no-long-range-neutralize
+                        Forwarded to mff-train.
+  --feature-spectral-assignment {cic,tsc,pcs}
+                        Forwarded to mff-train for feature_spectral_mode=fft.
+  --external-tensor-rank EXTERNAL_TENSOR_RANK
+                        External tensor rank for conv1 injection (e.g. 1 for
+                        electric field). Requires --external-field-file. Only
+                        for pure-cartesian-ictd. Passed to mff-train.
+  --external-field-file EXTERNAL_FIELD_FILE
+                        Per-structure external field file (.npy, shape N×3 for
+                        rank-1). Requires --external-tensor-rank. Passed to
+                        mff-train.
+  --explore-external-field V [V ...]
+                        Uniform external field applied during MD exploration,
+                        model deviation, identity labeling, and auto-injected
+                        into H5 for training. Number of values must equal
+                        3^rank (Cartesian tensor, row-major). Auto-sets
+                        --external-tensor-rank if not given. rank 0 (1 value):
+                        scalar field strength rank 1 (3 values): Fx Fy Fz
+                        (Cartesian x/y/z, e.g. electric field V/Å) rank 2 (9
+                        values): Txx Txy Txz Tyx Tyy Tyz Tzx Tzy Tzz (3×3 row-
+                        major) rank L (3^L values): full rank-L Cartesian
+                        tensor, row-major
+  --explore-n-workers EXPLORE_N_WORKERS
+                        Number of parallel workers for multi-structure
+                        exploration. 1 (default): sequential. >1: launch that
+                        many concurrent threads via ThreadPoolExecutor. Only
+                        has effect when multiple --init-structure paths are
+                        given.
+  --merge-val-ratio MERGE_VAL_RATIO
+                        Fraction of newly labeled structures reserved for
+                        validation when merging AL data. 0 disables validation
+                        updates.
+  --merge-val-seed MERGE_VAL_SEED
+                        Base random seed used when splitting newly labeled AL
+                        data into train/val.
+  --exploration-aggressiveness EXPLORATION_AGGRESSIVENESS
+                        High-level sampling knob for active learning. 1.0 =
+                        keep user/stage settings unchanged. <1.0 = safer
+                        exploration: lowers temperature, timestep, steps, and
+                        trust window while increasing Langevin damping. >1.0 =
+                        more aggressive exploration.
+  --train-n-gpu TRAIN_N_GPU
+                        Number of GPUs for training each ensemble model. 1
+                        (default): single-process training (CPU or single
+                        GPU). >1: launches torchrun --nproc_per_node=N with
+                        --distributed.
+  --train-max-parallel TRAIN_MAX_PARALLEL
+                        Max ensemble models trained simultaneously. 0
+                        (default): auto = available_gpus // train_n_gpu. 1:
+                        sequential (one model at a time). E.g. 8 GPUs +
+                        --train-n-gpu 2 → auto parallel = 4 models.
+  --train-nnodes TRAIN_NNODES
+                        Number of nodes for multi-node DDP training. 1
+                        (default): single-node. >1: multi-node (uses torchrun
+                        rendezvous; auto-detects SLURM).
+  --train-master-addr TRAIN_MASTER_ADDR
+                        Master/rendezvous address for multi-node DDP. 'auto'
+                        (default): resolves from SLURM or local hostname.
+  --train-master-port TRAIN_MASTER_PORT
+                        Base rendezvous port for DDP (default: 29500).
+  --train-launcher {auto,local,slurm}
+                        Launcher for multi-node training. 'auto' (default):
+                        uses 'slurm' if SLURM detected + nnodes>1, else
+                        'local'. 'slurm': wraps torchrun with 'srun --nodes=N
+                        --ntasks-per-node=1'. 'local': torchrun only (user
+                        must start workers on other nodes).
+  --verbose, -v
+  --pyscf-method PYSCF_METHOD
+                        PySCF method: b3lyp, pbe, hf, mp2, etc. (default:
+                        b3lyp)
+  --pyscf-basis PYSCF_BASIS
+                        PySCF basis set: sto-3g, 6-31g*, def2-svp, etc.
+                        (default: sto-3g)
+  --pyscf-charge PYSCF_CHARGE
+  --pyscf-spin PYSCF_SPIN
+                        2S (number of unpaired electrons, default 0)
+  --pyscf-max-memory PYSCF_MAX_MEMORY
+                        Max memory in MB for PySCF (default: 4000)
+  --pyscf-conv-tol PYSCF_CONV_TOL
+  --vasp-xc VASP_XC     VASP XC functional, e.g. PBE, LDA, HSE06 (default:
+                        PBE)
+  --vasp-encut VASP_ENCUT
+                        VASP plane-wave cutoff in eV
+  --vasp-kpts NK1 NK2 NK3
+                        k-point mesh (default: 1 1 1)
+  --vasp-ediff VASP_EDIFF
+                        VASP SCF convergence threshold in eV (default: 1e-6)
+  --vasp-ismear VASP_ISMEAR
+                        VASP smearing type: 0=Gaussian, -5=tetrahedron
+                        (default: 0)
+  --vasp-sigma VASP_SIGMA
+                        VASP smearing width in eV (default: 0.05)
+  --vasp-command VASP_COMMAND
+                        Override ASE_VASP_COMMAND, e.g. 'mpiexec -np 8
+                        vasp_std'
+  --vasp-mpi-ranks VASP_MPI_RANKS
+                        MPI ranks per VASP job. >1 prefixes --vasp-command
+                        with the Intel MPI launcher.
+  --vasp-mpi-launcher VASP_MPI_LAUNCHER
+                        MPI launcher used when --vasp-mpi-ranks > 1 (default:
+                        Intel MPI mpirun).
+  --vasp-ncore VASP_NCORE
+                        Optional INCAR NCORE for VASP performance tuning.
+  --vasp-cleanup        Remove per-structure VASP run directories after
+                        success
+  --cp2k-xc CP2K_XC     CP2K XC functional (default: PBE)
+  --cp2k-basis-set CP2K_BASIS_SET
+                        CP2K Gaussian basis set (default: DZVP-MOLOPT-SR-GTH)
+  --cp2k-pseudo CP2K_PSEUDO
+                        CP2K pseudopotential name (default: auto)
+  --cp2k-cutoff CP2K_CUTOFF
+                        CP2K plane-wave cutoff in Ry (default: 400)
+  --cp2k-max-scf CP2K_MAX_SCF
+                        CP2K max SCF iterations (default: 50)
+  --cp2k-charge CP2K_CHARGE
+                        CP2K total system charge (default: 0)
+  --cp2k-command CP2K_COMMAND
+                        Override ASE_CP2K_COMMAND
+  --cp2k-mpi-ranks CP2K_MPI_RANKS
+                        MPI ranks per CP2K job. >1 prefixes --cp2k-command
+                        with the MPI launcher.
+  --cp2k-mpi-launcher CP2K_MPI_LAUNCHER
+                        MPI launcher used when --cp2k-mpi-ranks > 1 (default:
+                        Intel MPI mpirun).
+  --cp2k-cleanup        Remove per-structure CP2K run directories after
+                        success
+  --qe-pseudo-dir QE_PSEUDO_DIR
+                        Directory containing QE pseudopotential .UPF files
+  --qe-pseudopotentials QE_PSEUDOPOTENTIALS
+                        JSON string mapping element → pseudopotential
+                        filename, e.g. '{"H":"H.pbe.UPF","O":"O.pbe.UPF"}'
+  --qe-ecutwfc QE_ECUTWFC
+                        QE wavefunction kinetic energy cutoff in Ry (default:
+                        60)
+  --qe-ecutrho QE_ECUTRHO
+                        QE charge density cutoff in Ry (default: 4*ecutwfc)
+  --qe-kpts NK1 NK2 NK3
+                        k-point mesh for QE (default: 1 1 1)
+  --qe-command QE_COMMAND
+                        QE pw.x command, e.g. 'mpirun -np 8 pw.x -in
+                        PREFIX.pwi > PREFIX.pwo'
+  --qe-cleanup          Remove per-structure QE run directories after success
+  --gaussian-method GAUSSIAN_METHOD
+                        Gaussian level of theory (default: b3lyp)
+  --gaussian-basis GAUSSIAN_BASIS
+                        Gaussian basis set (default: 6-31+G*)
+  --gaussian-charge GAUSSIAN_CHARGE
+  --gaussian-mult GAUSSIAN_MULT
+                        Gaussian spin multiplicity 2S+1 (default: 1)
+  --gaussian-nproc GAUSSIAN_NPROC
+                        Number of CPU cores for Gaussian %nprocshared
+                        (default: 1)
+  --gaussian-mem GAUSSIAN_MEM
+                        Gaussian memory allocation (default: 4GB)
+  --gaussian-command GAUSSIAN_COMMAND
+                        Override Gaussian command, e.g. 'g16 < PREFIX.com >
+                        PREFIX.log'
+  --gaussian-cleanup    Remove per-structure Gaussian run directories after
+                        success
+  --orca-simpleinput ORCA_SIMPLEINPUT
+                        ORCA simple-input line after '!' (default: 'B3LYP
+                        def2-TZVP TightSCF')
+  --orca-nproc ORCA_NPROC
+                        Number of CPU cores for ORCA %pal (default: 1)
+  --orca-charge ORCA_CHARGE
+  --orca-mult ORCA_MULT
+                        ORCA spin multiplicity 2S+1 (default: 1)
+  --orca-command ORCA_COMMAND
+                        Full path to ORCA executable
+  --orca-cleanup        Remove per-structure ORCA run directories after
+                        success
+  --local-script-template LOCAL_SCRIPT_TEMPLATE
+                        Path to a bash script template for --label-type local-
+                        script. Uses the same placeholder format as --slurm-
+                        template: {run_dir} {input_xyz} {output_xyz}
+                        {job_name}. The script is executed locally (no job
+                        scheduler). Compatible with --label-n-workers for
+                        parallel execution.
+  --local-script-bash LOCAL_SCRIPT_BASH
+                        Bash interpreter to use (default: bash)
+  --local-script-cleanup
+                        Remove per-structure run directories after success
+  --slurm-template SLURM_TEMPLATE
+                        Path to SLURM job script template (required for
+                        --label-type slurm). Placeholders: {run_dir}
+                        {input_xyz} {output_xyz} {job_name} {partition}
+                        {nodes} {ntasks} {time} {mem}. Any other {key} in the
+                        script is left unchanged.
+  --slurm-partition SLURM_PARTITION
+                        SLURM partition / queue (default: cpu)
+  --slurm-nodes SLURM_NODES
+                        Nodes per job (default: 1)
+  --slurm-ntasks SLURM_NTASKS
+                        --ntasks-per-node per job (default: 32)
+  --slurm-time SLURM_TIME
+                        Wall-clock time limit per job (default: 02:00:00)
+  --slurm-mem SLURM_MEM
+                        Memory per job (default: 64G)
+  --slurm-max-concurrent SLURM_MAX_CONCURRENT
+                        Max jobs in SLURM queue at once. Submission is
+                        throttled when this limit is reached (default: 200).
+  --slurm-poll-interval SLURM_POLL_INTERVAL
+                        Seconds between squeue status polls (default: 30)
+  --slurm-extra [ARG ...]
+                        Extra sbatch arguments, e.g. --slurm-extra
+                        --account=myproject --qos=high
+  --slurm-cleanup       Remove per-structure run directories after success
+  --stages STAGES       Path to JSON file defining multiple exploration
+                        stages. When provided, single-stage flags (--md-*,
+                        --n-iterations, etc.) are ignored. See module
+                        docstring for format.
+  --n-iterations N_ITERATIONS
+                        Max iterations (single-stage mode only)
+  --level-f-lo LEVEL_F_LO
+  --level-f-hi LEVEL_F_HI
+  --conv-accuracy CONV_ACCURACY
+  --md-temperature MD_TEMPERATURE
+  --md-steps MD_STEPS
+  --md-timestep MD_TIMESTEP
+  --md-friction MD_FRICTION
+  --md-relax-fmax MD_RELAX_FMAX
+                        Optional model-side pre-relaxation force threshold
+                        before MD. Default: 0.0 (disabled) to preserve PES
+                        sampling.
+  --md-log-interval MD_LOG_INTERVAL
+  --geometry-min-dist GEOMETRY_MIN_DIST
+                        Absolute minimum allowed interatomic distance in
+                        Angstrom during active-learning exploration/candidate
+                        filtering. Set 0 to disable.
+  --geometry-covalent-scale GEOMETRY_COVALENT_SCALE
+                        Chemistry-aware pair-distance threshold as scale *
+                        (r_cov_i + r_cov_j). Applied together with --geometry-
+                        min-dist; larger of the two wins. Set 0 to disable.
+  --diversity-metric {soap,devi_hist,none}
+                        Fingerprint for diversity sub-selection of candidates.
+                        'soap' (default, requires dscribe): SOAP average
+                        descriptor + FPS. 'devi_hist': per-atom force-
+                        deviation histogram + FPS (zero extra inference).
+                        'none': disable diversity filtering.
+  --max-candidates-per-iter MAX_CANDIDATES_PER_ITER
+                        Max candidates to keep per iteration after diversity
+                        selection. Only effective when --diversity-metric is
+                        not 'none'. (default: 50)
+  --soap-rcut SOAP_RCUT
+                        SOAP cutoff radius in Angstrom (default: 5.0)
+  --soap-nmax SOAP_NMAX
+                        SOAP radial basis expansion order (default: 8)
+  --soap-lmax SOAP_LMAX
+                        SOAP angular expansion order (default: 6)
+  --soap-sigma SOAP_SIGMA
+                        SOAP Gaussian smearing width (default: 0.5)
+  --devi-hist-bins DEVI_HIST_BINS
+                        Number of bins for devi_hist fingerprint (default: 32)
+  --fail-strategy {discard,sample_topk}
+                        How to handle fail frames (max_devi_f >= level_f_hi).
+                        'discard' (default): drop all fail frames.
+                        'sample_topk': promote the least extreme fail frames
+                        into candidates.
+  --fail-max-select FAIL_MAX_SELECT
+                        Number of fail frames to promote when --fail-
+                        strategy=sample_topk (default: 10)
+
+CLI for active learning (mff-active-learn).
+
+Single-stage (backward-compatible):
+  mff-active-learn --explore-type ase --explore-mode md --label-type identity \
+      --md-temperature 300 --md-steps 1000 --n-iterations 5
+
+Long-range / slab checkpoint through ASE active learning:
+  mff-active-learn --explore-type ase --explore-mode md --label-type identity \
+      --init-structure slab.xyz --identity-checkpoint model_0.pth \
+      --init-checkpoint model_0.pth model_1.pth \
+      --device cpu --n-models 2 --n-iterations 1 --md-steps 2
+
+Recommended long-range training/export setup:
+  --long-range-mode reciprocal-spectral-v1
+  --long-range-reciprocal-backend mesh_fft
+  --long-range-green-mode poisson
+  --long-range-energy-partition potential
+  --long-range-assignment cic
+  # slab only:
+  --long-range-boundary slab
+  --long-range-slab-padding-factor 2
+
+PySCF labeling:
+  mff-active-learn --explore-type ase --label-type pyscf \
+      --pyscf-method b3lyp --pyscf-basis 6-31g* \
+      --md-steps 500 --n-iterations 3
+
+VASP labeling:
+  mff-active-learn --explore-type ase --label-type vasp \
+      --vasp-xc PBE --vasp-encut 500 --vasp-kpts 4 4 4
+
+CP2K labeling:
+  mff-active-learn --explore-type ase --label-type cp2k \
+      --cp2k-xc PBE --cp2k-cutoff 600
+
+Quantum Espresso labeling:
+  mff-active-learn --explore-type ase --label-type espresso \
+      --qe-pseudo-dir /path/to/pseudos \
+      --qe-pseudopotentials '{"H":"H.pbe.UPF","O":"O.pbe.UPF"}' \
+      --qe-ecutwfc 60
+
+Gaussian labeling:
+  mff-active-learn --explore-type ase --label-type gaussian \
+      --gaussian-method b3lyp --gaussian-basis 6-31+G* --gaussian-nproc 8
+
+ORCA labeling:
+  mff-active-learn --explore-type ase --label-type orca \
+      --orca-simpleinput "B3LYP def2-TZVP TightSCF" --orca-nproc 8
+
+User-script labeling (any DFT code via wrapper script):
+  mff-active-learn --explore-type ase --label-type script --label-script ./my_dft.sh
+
+Multi-stage via JSON:
+  mff-active-learn --explore-type ase --label-type identity --stages stages.json
+
+stages.json example (list of dicts):
+  [
+    {"name":"300K", "temperature":300, "nsteps":500, "max_iters":3,
+     "level_f_lo":0.05, "level_f_hi":0.5, "conv_accuracy":0.9},
+    {"name":"600K", "temperature":600, "nsteps":1000, "max_iters":3,
+     "level_f_lo":0.05, "level_f_hi":0.5, "conv_accuracy":0.9}
+  ]
+```
+
+---
+
+
 ## FAQ
 
 ### Q: 初始结构从哪里来？
@@ -603,4 +1334,3 @@ polar  = pt["polarizability"][2]  # l=2 张量（5 个分量）
 
 > **注意**：只有使用 `--physical-tensors` 训练的 ICTD 检查点才有物理张量输出头。
 > 普通模型传入 `return_physical_tensors=True` 会引发错误。
-

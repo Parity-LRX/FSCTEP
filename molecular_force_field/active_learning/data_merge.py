@@ -55,6 +55,12 @@ def _read_existing_blocks(data_dir: str, prefix: str = "train"):
     return blocks, raw_E, cells, pbcs, stresses
 
 
+def _subset_optional_list(values, indices):
+    if values is None:
+        return None
+    return [values[i] for i in indices]
+
+
 def external_field_tensor_shape(n_values: int) -> tuple:
     """Infer Cartesian tensor shape from the number of flat values.
 
@@ -112,11 +118,14 @@ def merge_training_data(
     data_dir: str,
     new_xyz_path: str,
     train_prefix: str = "train",
+    val_prefix: Optional[str] = "val",
     e0_csv_path: Optional[str] = None,
     max_radius: float = 5.0,
     num_workers: int = 8,
     max_atom: Optional[int] = None,
     external_field: Optional[list] = None,
+    val_ratio: float = 0.1,
+    random_seed: int = 42,
 ) -> int:
     """
     Merge new labeled XYZ data into existing training set.
@@ -162,58 +171,110 @@ def merge_training_data(
         e0_vals = e0_df["E0"].values.astype(np.float64)
     else:
         raise ValueError(f"fitted_E0.csv must have Atom and E0 columns")
-    new_correction = compute_correction(new_blocks, new_raw_energy, e0_keys, e0_vals)
-
-    existing = _read_existing_blocks(data_dir, train_prefix)
-    if existing[0] is None:
-        blocks = new_blocks
-        raw_E = new_raw_energy
-        cells = new_cells
-        pbcs = new_pbcs
-        stresses = new_stresses
-        correction_E = new_correction
-    else:
-        old_blocks, old_raw_E, old_cells, old_pbcs, old_stresses = existing
-        blocks = old_blocks + new_blocks
-        raw_E = old_raw_E + new_raw_energy
-        cells = old_cells + new_cells
-        pbcs = old_pbcs + new_pbcs
-        if old_stresses is not None and new_stresses is not None:
-            stresses = old_stresses + new_stresses
-        elif old_stresses is not None:
-            stresses = old_stresses + [
-                np.zeros((3, 3), dtype=np.float64) for _ in new_blocks
-            ]
-        elif new_stresses is not None:
-            stresses = [
-                np.zeros((3, 3), dtype=np.float64) for _ in old_blocks
-            ] + new_stresses
+    def _append_split(
+        prefix: str,
+        blocks_in,
+        raw_energy_in,
+        cells_in,
+        pbcs_in,
+        stresses_in,
+    ) -> int:
+        if not blocks_in:
+            return 0
+        correction_in = compute_correction(blocks_in, raw_energy_in, e0_keys, e0_vals)
+        existing = _read_existing_blocks(data_dir, prefix)
+        if existing[0] is None:
+            blocks = blocks_in
+            raw_E = raw_energy_in
+            cells = cells_in
+            pbcs = pbcs_in
+            stresses = stresses_in
+            correction_E = correction_in
         else:
-            stresses = None
-        old_correction = compute_correction(
-            old_blocks, old_raw_E, e0_keys, e0_vals
+            old_blocks, old_raw_E, old_cells, old_pbcs, old_stresses = existing
+            blocks = old_blocks + blocks_in
+            raw_E = old_raw_E + raw_energy_in
+            cells = old_cells + cells_in
+            pbcs = old_pbcs + pbcs_in
+            if old_stresses is not None and stresses_in is not None:
+                stresses = old_stresses + stresses_in
+            elif old_stresses is not None:
+                stresses = old_stresses + [
+                    np.zeros((3, 3), dtype=np.float64) for _ in blocks_in
+                ]
+            elif stresses_in is not None:
+                stresses = [
+                    np.zeros((3, 3), dtype=np.float64) for _ in old_blocks
+                ] + stresses_in
+            else:
+                stresses = None
+            old_correction = compute_correction(old_blocks, old_raw_E, e0_keys, e0_vals)
+            correction_E = old_correction + correction_in
+
+        indices = np.arange(len(blocks))
+        save_set(
+            prefix,
+            indices,
+            blocks,
+            raw_E,
+            correction_E,
+            cells,
+            pbc_list=pbcs,
+            stress_list=stresses,
+            max_atom=max_atom,
+            output_dir=data_dir,
         )
-        correction_E = old_correction + new_correction
+        save_to_h5_parallel(prefix, max_radius, num_workers, data_dir=data_dir)
 
-    indices = np.arange(len(blocks))
-    save_set(
+        if external_field is not None:
+            h5_path = os.path.join(data_dir, f"processed_{prefix}.h5")
+            if os.path.exists(h5_path):
+                _inject_external_field_into_h5(h5_path, external_field)
+
+        logger.info(f"Merged {len(blocks_in)} new structures into {prefix}")
+        return len(blocks_in)
+
+    train_indices = list(range(len(new_blocks)))
+    val_indices: list[int] = []
+    if val_prefix and val_ratio > 0.0 and len(new_blocks) > 1:
+        existing_train = _read_existing_blocks(data_dir, train_prefix)[0]
+        existing_val = _read_existing_blocks(data_dir, val_prefix)[0]
+        existing_train_count = len(existing_train) if existing_train is not None else 0
+        existing_val_count = len(existing_val) if existing_val is not None else 0
+        total_after_merge = existing_train_count + existing_val_count + len(new_blocks)
+        desired_val_total = int(round(total_after_merge * val_ratio))
+        new_val_count = max(0, desired_val_total - existing_val_count)
+        new_val_count = min(new_val_count, len(new_blocks) - 1)
+        if new_val_count > 0:
+            rng = np.random.default_rng(random_seed)
+            val_indices = sorted(
+                rng.choice(len(new_blocks), size=new_val_count, replace=False).tolist()
+            )
+            val_index_set = set(val_indices)
+            train_indices = [i for i in range(len(new_blocks)) if i not in val_index_set]
+
+    train_added = _append_split(
         train_prefix,
-        indices,
-        blocks,
-        raw_E,
-        correction_E,
-        cells,
-        pbc_list=pbcs,
-        stress_list=stresses,
-        max_atom=max_atom,
-        output_dir=data_dir,
+        [new_blocks[i] for i in train_indices],
+        [new_raw_energy[i] for i in train_indices],
+        [new_cells[i] for i in train_indices],
+        [new_pbcs[i] for i in train_indices],
+        _subset_optional_list(new_stresses, train_indices),
     )
-    save_to_h5_parallel(train_prefix, max_radius, num_workers, data_dir=data_dir)
+    if val_prefix and val_indices:
+        _append_split(
+            val_prefix,
+            [new_blocks[i] for i in val_indices],
+            [new_raw_energy[i] for i in val_indices],
+            [new_cells[i] for i in val_indices],
+            [new_pbcs[i] for i in val_indices],
+            _subset_optional_list(new_stresses, val_indices),
+        )
 
-    if external_field is not None:
-        h5_path = os.path.join(data_dir, f"processed_{train_prefix}.h5")
-        if os.path.exists(h5_path):
-            _inject_external_field_into_h5(h5_path, external_field)
-
-    logger.info(f"Merged {len(new_blocks)} new structures into {train_prefix}")
+    logger.info(
+        "AL merge split: train_added=%d val_added=%d (val_ratio=%.3f)",
+        train_added,
+        len(val_indices),
+        val_ratio,
+    )
     return len(new_blocks)

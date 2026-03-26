@@ -234,6 +234,67 @@ def main():
     parser.add_argument("--neb-final", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument(
+        "--a", type=float, default=None,
+        help="Training energy loss weight forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--b", type=float, default=None,
+        help="Training force loss weight forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-batch-size", type=int, default=None,
+        help="Training batch size forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-learning-rate", type=float, default=None,
+        help="Training learning rate forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-min-learning-rate", type=float, default=None,
+        help="Training minimum learning rate forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-warmup-batches", type=int, default=None,
+        help="Training warmup batches forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-lr-scheduler", type=str, default=None,
+        choices=["cosine", "step"],
+        help="Training LR scheduler forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-lr-decay-patience", type=int, default=None,
+        help="Training StepLR step size forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-lr-decay-factor", type=float, default=None,
+        help="Training StepLR decay factor forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-warmup-start-ratio", type=float, default=None,
+        help="Training warmup start ratio forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-patience", type=int, default=None,
+        help="Training early-stopping patience forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-ema-start-epoch", type=int, default=None,
+        help="Training EMA start epoch forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-ema-decay", type=float, default=None,
+        help="Training EMA decay forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-max-grad-norm", type=float, default=None,
+        help="Training gradient clipping norm forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-dump-frequency", type=int, default=None,
+        help="Training validation/checkpoint frequency forwarded to mff-train.",
+    )
+    parser.add_argument(
         "--dtype", type=str, default=None,
         choices=["float32", "float64", "float", "double"],
         help="Training dtype forwarded to mff-train (e.g. float32).",
@@ -373,6 +434,17 @@ def main():
             ">1: launch that many concurrent threads via ThreadPoolExecutor. "
             "Only has effect when multiple --init-structure paths are given."
         ),
+    )
+    parser.add_argument(
+        "--merge-val-ratio", type=float, default=0.1,
+        help=(
+            "Fraction of newly labeled structures reserved for validation when "
+            "merging AL data. 0 disables validation updates."
+        ),
+    )
+    parser.add_argument(
+        "--merge-val-seed", type=int, default=42,
+        help="Base random seed used when splitting newly labeled AL data into train/val.",
     )
     parser.add_argument(
         "--exploration-aggressiveness", type=float, default=1.0,
@@ -1053,8 +1125,40 @@ def main():
     train_args = []
     if args.epochs is not None:
         train_args.extend(["--epochs", str(args.epochs)])
+    if args.a is not None:
+        train_args.extend(["--energy-weight", str(args.a)])
+    if args.b is not None:
+        train_args.extend(["--force-weight", str(args.b)])
+    if args.train_batch_size is not None:
+        train_args.extend(["--batch-size", str(args.train_batch_size)])
+    if args.train_learning_rate is not None:
+        train_args.extend(["--learning-rate", str(args.train_learning_rate)])
+    if args.train_min_learning_rate is not None:
+        train_args.extend(["--min-learning-rate", str(args.train_min_learning_rate)])
+    if args.train_warmup_batches is not None:
+        train_args.extend(["--warmup-batches", str(args.train_warmup_batches)])
+    if args.train_lr_scheduler is not None:
+        train_args.extend(["--lr-scheduler", args.train_lr_scheduler])
+    if args.train_lr_decay_patience is not None:
+        train_args.extend(["--lr-decay-patience", str(args.train_lr_decay_patience)])
+    if args.train_lr_decay_factor is not None:
+        train_args.extend(["--lr-decay-factor", str(args.train_lr_decay_factor)])
+    if args.train_warmup_start_ratio is not None:
+        train_args.extend(["--warmup-start-ratio", str(args.train_warmup_start_ratio)])
+    if args.train_patience is not None:
+        train_args.extend(["--patience", str(args.train_patience)])
+    if args.train_ema_start_epoch is not None:
+        train_args.extend(["--ema-start-epoch", str(args.train_ema_start_epoch)])
+    if args.train_ema_decay is not None:
+        train_args.extend(["--ema-decay", str(args.train_ema_decay)])
+    if args.train_max_grad_norm is not None:
+        train_args.extend(["--max-grad-norm", str(args.train_max_grad_norm)])
+    if args.train_dump_frequency is not None:
+        train_args.extend(["--dump-frequency", str(args.train_dump_frequency)])
     if args.device is not None:
         train_args.extend(["--device", args.device])
+    if args.max_radius is not None:
+        train_args.extend(["--max-radius", str(args.max_radius)])
     if args.dtype is not None:
         train_args.extend(["--dtype", args.dtype])
     if args.tensor_product_mode is not None:
@@ -1174,6 +1278,8 @@ def main():
         external_field=efield,
         geometry_min_dist=args.geometry_min_dist,
         geometry_covalent_scale=args.geometry_covalent_scale,
+        merge_val_ratio=args.merge_val_ratio,
+        merge_val_seed=args.merge_val_seed,
     )
 
 

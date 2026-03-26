@@ -13,6 +13,64 @@ from molecular_force_field.data.preprocessing import (
 )
 
 
+def _random_split_indices(data_size: int, train_ratio: float, seed: int):
+    indices = np.arange(data_size)
+    np.random.seed(seed)
+    train_size = int(train_ratio * data_size)
+    val_size = data_size - train_size
+    val_indices = np.random.choice(indices, size=val_size, replace=False) if val_size > 0 else np.array([], dtype=int)
+    train_mask = ~np.isin(indices, val_indices)
+    train_indices = indices[train_mask]
+    return train_indices, val_indices
+
+
+def _source_tail_split_indices(input_file: str, data_size: int, train_ratio: float, seed: int):
+    from ase.io import read as ase_read
+
+    atoms_list = ase_read(input_file, index=":")
+    if len(atoms_list) != data_size or data_size < 2:
+        return None
+
+    source_keys = [atoms.info.get("source") for atoms in atoms_list]
+    if not source_keys or any(key is None for key in source_keys):
+        return None
+
+    train_size = int(train_ratio * data_size)
+    target_val_size = data_size - train_size
+    if target_val_size <= 0:
+        return np.arange(data_size), np.array([], dtype=int)
+
+    anchor_by_source = {}
+    scored_indices = []
+    rng = np.random.default_rng(seed)
+    for idx, (atoms, source_key) in enumerate(zip(atoms_list, source_keys)):
+        source_key = str(source_key)
+        if source_key not in anchor_by_source:
+            anchor_by_source[source_key] = idx
+            continue
+        ref_atoms = atoms_list[anchor_by_source[source_key]]
+        if (
+            len(atoms) != len(ref_atoms)
+            or not np.array_equal(atoms.get_atomic_numbers(), ref_atoms.get_atomic_numbers())
+        ):
+            score = -np.inf
+        else:
+            diff = atoms.get_positions() - ref_atoms.get_positions()
+            score = float(np.sqrt(np.mean(diff * diff)))
+        scored_indices.append((score, float(rng.random()), idx))
+
+    if not scored_indices:
+        return None
+
+    scored_indices.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    target_val_size = min(target_val_size, len(scored_indices))
+    val_indices = np.array(sorted(item[2] for item in scored_indices[:target_val_size]), dtype=int)
+    indices = np.arange(data_size)
+    train_mask = ~np.isin(indices, val_indices)
+    train_indices = indices[train_mask]
+    return train_indices, val_indices
+
+
 def main():
     """Main preprocessing function."""
     parser = argparse.ArgumentParser(description='Preprocess molecular data')
@@ -72,15 +130,13 @@ def main():
     
     # Split train/val
     data_size = len(all_blocks)
-    indices = np.arange(data_size)
-    
-    np.random.seed(args.seed)
-    
-    train_size = int(args.train_ratio * data_size)
-    val_size = data_size - train_size
-    val_indices = np.random.choice(indices, size=val_size, replace=False)
-    train_mask = ~np.isin(indices, val_indices)
-    train_indices = indices[train_mask]
+    split_result = _source_tail_split_indices(args.input_file, data_size, args.train_ratio, args.seed)
+    if split_result is None:
+        train_indices, val_indices = _random_split_indices(data_size, args.train_ratio, args.seed)
+        print("Split mode: random")
+    else:
+        train_indices, val_indices = split_result
+        print("Split mode: source-tail holdout")
     
     print(f"Split: {len(train_indices)} Train, {len(val_indices)} Val")
 

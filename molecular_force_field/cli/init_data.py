@@ -31,12 +31,14 @@ import os
 import subprocess
 import sys
 import shutil
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
 from molecular_force_field.active_learning.init_data import (
     generate_init_dataset,
 )
+from molecular_force_field.active_learning.geometry_filter import check_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +220,292 @@ def _relax_seed_structures(structure_paths, labeler, output_dir, fmax=0.05, step
     return relaxed_paths
 
 
+def _filter_labeled_atoms_by_force(atoms_list, max_force_filter: float):
+    """Drop labeled frames whose max per-atom force norm exceeds the threshold."""
+    if max_force_filter is None or max_force_filter <= 0:
+        return list(atoms_list), []
+
+    kept = []
+    dropped = []
+    for idx, atoms in enumerate(atoms_list):
+        forces = np.asarray(atoms.get_forces(), dtype=np.float64)
+        max_force = float(np.linalg.norm(forces, axis=1).max()) if len(forces) else 0.0
+        if np.isfinite(max_force) and max_force <= max_force_filter:
+            kept.append(atoms)
+        else:
+            dropped.append((idx, max_force))
+    return kept, dropped
+
+
+def _sample_uniform_indices(n_frames: int, sample_count: int) -> List[int]:
+    """Return `sample_count` unique indices spread uniformly across a trajectory."""
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    if n_frames < sample_count:
+        raise ValueError(
+            f"Cannot sample {sample_count} frames from only {n_frames} available frames."
+        )
+
+    raw = np.linspace(0, n_frames - 1, num=sample_count)
+    indices: List[int] = []
+    used = set()
+    for value in raw:
+        idx = int(round(float(value)))
+        if idx not in used:
+            used.add(idx)
+            indices.append(idx)
+            continue
+        for delta in range(1, n_frames):
+            left = idx - delta
+            right = idx + delta
+            if left >= 0 and left not in used:
+                used.add(left)
+                indices.append(left)
+                break
+            if right < n_frames and right not in used:
+                used.add(right)
+                indices.append(right)
+                break
+        else:
+            raise RuntimeError("Failed to construct unique uniform sample indices.")
+    return sorted(indices)
+
+
+def _filter_valid_aimd_frames(
+    frames: Sequence,
+    min_dist: float,
+    covalent_scale: float,
+) -> Tuple[List, int, str]:
+    """Keep the valid AIMD prefix and stop at the first invalid geometry."""
+    valid = []
+    for idx, atoms in enumerate(frames):
+        ok, reason = check_geometry(
+            atoms,
+            min_dist=min_dist,
+            covalent_scale=covalent_scale,
+        )
+        if not ok:
+            return valid, idx, reason
+        valid.append(atoms)
+    return valid, -1, ""
+
+
+def _run_ase_aimd_trajectory(
+    atoms,
+    labeler,
+    run_dir: str,
+    total_frames: int,
+    temperature: float,
+    timestep_fs: float,
+    friction: float,
+    min_dist: float,
+    covalent_scale: float,
+):
+    """Fallback AIMD path using ASE MD with any ASE-backed calculator."""
+    from ase import units
+    from ase.calculators.singlepoint import SinglePointCalculator
+    from ase.md.langevin import Langevin
+    from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+
+    os.makedirs(run_dir, exist_ok=True)
+    work_atoms = atoms.copy()
+    work_atoms.calc = labeler._make_calculator(work_atoms, run_dir)
+    MaxwellBoltzmannDistribution(work_atoms, temperature_K=temperature)
+    dyn = Langevin(
+        work_atoms,
+        timestep_fs * units.fs,
+        temperature_K=temperature,
+        friction=friction,
+    )
+
+    frames = []
+
+    def _record_frame():
+        energy = work_atoms.get_potential_energy()
+        forces = work_atoms.get_forces()
+        frame = work_atoms.copy()
+        frame.calc = SinglePointCalculator(frame, energy=energy, forces=forces)
+        frames.append(frame)
+
+    _record_frame()
+    while len(frames) < total_frames:
+        dyn.run(1)
+        _record_frame()
+
+    valid, invalid_idx, invalid_reason = _filter_valid_aimd_frames(
+        frames,
+        min_dist=min_dist,
+        covalent_scale=covalent_scale,
+    )
+    if invalid_idx >= 0:
+        logger.warning(
+            "AIMD fallback stopped at invalid geometry frame=%d reason=%s kept=%d/%d",
+            invalid_idx,
+            invalid_reason,
+            len(valid),
+            len(frames),
+        )
+    return valid
+
+
+def _run_vasp_aimd_trajectory(
+    atoms,
+    labeler,
+    run_dir: str,
+    total_frames: int,
+    temperature: float,
+    timestep_fs: float,
+    min_dist: float,
+    covalent_scale: float,
+):
+    """Run one internal VASP MD trajectory and parse all ionic frames."""
+    from ase.io import read as ase_read
+
+    os.makedirs(run_dir, exist_ok=True)
+    work_atoms = atoms.copy()
+    calc = labeler._make_calculator(work_atoms, run_dir)
+    calc.set(
+        ibrion=0,
+        nsw=total_frames,
+        potim=timestep_fs,
+        tebeg=temperature,
+        teend=temperature,
+        smass=0,
+        isif=2,
+        isym=0,
+    )
+    work_atoms.calc = calc
+    _ = work_atoms.get_potential_energy()
+
+    vasprun_path = os.path.join(run_dir, "vasprun.xml")
+    if not os.path.exists(vasprun_path):
+        raise FileNotFoundError(f"VASP AIMD did not produce vasprun.xml: {vasprun_path}")
+
+    frames = ase_read(vasprun_path, index=":")
+    valid, invalid_idx, invalid_reason = _filter_valid_aimd_frames(
+        frames,
+        min_dist=min_dist,
+        covalent_scale=covalent_scale,
+    )
+    if invalid_idx >= 0:
+        logger.warning(
+            "VASP AIMD hit invalid geometry frame=%d reason=%s kept=%d/%d",
+            invalid_idx,
+            invalid_reason,
+            len(valid),
+            len(frames),
+        )
+    return valid
+
+
+def _generate_aimd_dataset(
+    structure_paths,
+    labeler,
+    output_dir: str,
+    total_frames: int,
+    sample_count: int,
+    temperature: float,
+    timestep_fs: float,
+    friction: float,
+    min_dist: float,
+    covalent_scale: float,
+):
+    """Generate cold-start data by AIMD, keeping the full trajectory and a sampled subset."""
+    from ase.io import read as ase_read, write as ase_write
+
+    if total_frames < sample_count:
+        raise ValueError("--aimd-total-frames must be >= --aimd-sample-count")
+    if not hasattr(labeler, "_make_calculator"):
+        raise ValueError(
+            f"Cold-start AIMD requires an ASE-backed labeler, got {labeler.__class__.__name__}."
+        )
+
+    aimd_dir = os.path.join(output_dir, "aimd_runs")
+    os.makedirs(aimd_dir, exist_ok=True)
+
+    full_frames = []
+    sampled_frames = []
+
+    for i, path in enumerate(structure_paths):
+        atoms = ase_read(path)
+        run_dir = os.path.join(aimd_dir, f"seed_{i:04d}")
+        logger.info(
+            "Running cold-start AIMD [%d] %s: total_frames=%d sample_count=%d T=%.1fK dt=%.3ffs",
+            i,
+            os.path.basename(path),
+            total_frames,
+            sample_count,
+            temperature,
+            timestep_fs,
+        )
+        if labeler.__class__.__name__ == "VaspLabeler":
+            frames = _run_vasp_aimd_trajectory(
+                atoms,
+                labeler,
+                run_dir,
+                total_frames=total_frames,
+                temperature=temperature,
+                timestep_fs=timestep_fs,
+                min_dist=min_dist,
+                covalent_scale=covalent_scale,
+            )
+        else:
+            frames = _run_ase_aimd_trajectory(
+                atoms,
+                labeler,
+                run_dir,
+                total_frames=total_frames,
+                temperature=temperature,
+                timestep_fs=timestep_fs,
+                friction=friction,
+                min_dist=min_dist,
+                covalent_scale=covalent_scale,
+            )
+
+        if len(frames) < sample_count:
+            raise RuntimeError(
+                f"AIMD for {path} produced only {len(frames)} valid frame(s), "
+                f"but {sample_count} are required."
+            )
+
+        sample_indices = _sample_uniform_indices(len(frames), sample_count)
+        source = os.path.basename(path)
+        for idx, frame in enumerate(frames):
+            frame.info["source"] = source
+            frame.info["aimd_frame"] = idx
+        selected = [frames[idx] for idx in sample_indices]
+        for rank, frame_idx in enumerate(sample_indices):
+            selected[rank].info["aimd_sample_rank"] = rank
+            selected[rank].info["aimd_sample_frame"] = frame_idx
+
+        full_frames.extend(frames)
+        sampled_frames.extend(selected)
+        logger.info(
+            "AIMD [%d] %s: valid_frames=%d sampled=%d first=%d last=%d",
+            i,
+            source,
+            len(frames),
+            len(selected),
+            sample_indices[0],
+            sample_indices[-1],
+        )
+
+    full_path = os.path.join(output_dir, "aimd_full.xyz")
+    sampled_path = os.path.join(output_dir, "train.xyz")
+    unlabeled_path = os.path.join(output_dir, "unlabeled.xyz")
+    ase_write(full_path, full_frames, format="extxyz")
+    ase_write(sampled_path, sampled_frames, format="extxyz")
+    ase_write(unlabeled_path, [atoms.copy() for atoms in sampled_frames], format="extxyz")
+    logger.info(
+        "AIMD cold start ready: full=%d -> %s ; sampled=%d -> %s",
+        len(full_frames),
+        full_path,
+        len(sampled_frames),
+        sampled_path,
+    )
+    return sampled_frames, full_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate initial training data from seed structures.",
@@ -229,6 +517,13 @@ def main():
     parser.add_argument(
         "--structures", type=str, nargs="+", required=True,
         help="One or more seed structure files, or a directory of .xyz/.cif files.",
+    )
+    parser.add_argument(
+        "--cold-start-mode",
+        type=str,
+        default="perturb",
+        choices=["perturb", "aimd"],
+        help="Cold-start source: perturbations or AIMD trajectory sampling (default: perturb).",
     )
     parser.add_argument(
         "--n-perturb", type=int, default=10,
@@ -264,6 +559,30 @@ def main():
         "--seed-relax-steps", type=int, default=200,
         help="Maximum optimizer steps for cold-start seed relaxation (default: 200).",
     )
+    parser.add_argument(
+        "--aimd-total-frames", type=int, default=1000,
+        help="Minimum AIMD frames generated per seed (default: 1000).",
+    )
+    parser.add_argument(
+        "--aimd-sample-count", type=int, default=100,
+        help="Uniformly sampled AIMD frames kept per seed for train.xyz (default: 100).",
+    )
+    parser.add_argument(
+        "--aimd-temperature", type=float, default=300.0,
+        help="AIMD temperature in K (default: 300).",
+    )
+    parser.add_argument(
+        "--aimd-timestep", type=float, default=0.5,
+        help="AIMD timestep in fs (default: 0.5).",
+    )
+    parser.add_argument(
+        "--aimd-friction", type=float, default=0.02,
+        help="ASE fallback AIMD Langevin friction (default: 0.02). Ignored by internal VASP AIMD.",
+    )
+    parser.add_argument(
+        "--aimd-covalent-scale", type=float, default=0.75,
+        help="AIMD geometry guard based on covalent radii (default: 0.75).",
+    )
 
     # ---- output & preprocessing ----
     parser.add_argument(
@@ -273,6 +592,13 @@ def main():
     parser.add_argument(
         "--train-ratio", type=float, default=0.9,
         help="Fraction of data used for training vs validation (default: 0.9)",
+    )
+    parser.add_argument(
+        "--max-force-filter", type=float, default=None,
+        help=(
+            "Optional cold-start filter: discard labeled frames whose max per-atom "
+            "force norm exceeds this threshold in eV/Ang."
+        ),
     )
     parser.add_argument("--max-radius", type=float, default=5.0)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -399,36 +725,78 @@ def main():
             steps=args.seed_relax_steps,
         )
 
-    # ---- 2. Generate perturbations ----
     from ase.io import write as ase_write
-    all_atoms = generate_init_dataset(
-        structure_paths,
-        n_perturb=args.n_perturb,
-        rattle_std=args.rattle_std,
-        cell_scale_range=args.cell_scale_range,
-        min_dist=args.min_dist,
-        seed=args.seed,
-    )
-
-    unlabeled_path = os.path.join(args.output_dir, "unlabeled.xyz")
-    ase_write(unlabeled_path, all_atoms, format="extxyz")
-    logger.info(f"Wrote {len(all_atoms)} unlabeled frames to {unlabeled_path}")
-
-    # ---- 3. DFT labeling ----
     labeled_path = os.path.join(args.output_dir, "train.xyz")
-    work_dir = os.path.join(args.output_dir, "_label_work")
-    os.makedirs(work_dir, exist_ok=True)
+    if args.cold_start_mode == "aimd":
+        labeled_atoms, _ = _generate_aimd_dataset(
+            structure_paths,
+            labeler,
+            output_dir=args.output_dir,
+            total_frames=args.aimd_total_frames,
+            sample_count=args.aimd_sample_count,
+            temperature=args.aimd_temperature,
+            timestep_fs=args.aimd_timestep,
+            friction=args.aimd_friction,
+            min_dist=args.min_dist,
+            covalent_scale=args.aimd_covalent_scale,
+        )
+    else:
+        # ---- 2. Generate perturbations ----
+        all_atoms = generate_init_dataset(
+            structure_paths,
+            n_perturb=args.n_perturb,
+            rattle_std=args.rattle_std,
+            cell_scale_range=args.cell_scale_range,
+            min_dist=args.min_dist,
+            seed=args.seed,
+        )
 
-    logger.info(f"Labeling {len(all_atoms)} structures with {args.label_type}...")
-    labeler.label(unlabeled_path, labeled_path, work_dir)
+        unlabeled_path = os.path.join(args.output_dir, "unlabeled.xyz")
+        ase_write(unlabeled_path, all_atoms, format="extxyz")
+        logger.info(f"Wrote {len(all_atoms)} unlabeled frames to {unlabeled_path}")
 
-    from ase.io import read as ase_read
-    labeled_atoms = ase_read(labeled_path, index=":")
-    logger.info(f"Successfully labeled {len(labeled_atoms)} structures -> {labeled_path}")
+        # ---- 3. DFT labeling ----
+        work_dir = os.path.join(args.output_dir, "_label_work")
+        os.makedirs(work_dir, exist_ok=True)
+
+        logger.info(f"Labeling {len(all_atoms)} structures with {args.label_type}...")
+        labeler.label(unlabeled_path, labeled_path, work_dir)
+
+        from ase.io import read as ase_read
+        labeled_atoms = ase_read(labeled_path, index=":")
+        logger.info(f"Successfully labeled {len(labeled_atoms)} structures -> {labeled_path}")
 
     if len(labeled_atoms) == 0:
         logger.error("No structures were labeled successfully. Aborting.")
         return
+
+    if args.max_force_filter is not None and args.max_force_filter > 0:
+        unfiltered_path = os.path.join(args.output_dir, "train_unfiltered.xyz")
+        ase_write(unfiltered_path, labeled_atoms, format="extxyz")
+        filtered_atoms, dropped = _filter_labeled_atoms_by_force(
+            labeled_atoms,
+            args.max_force_filter,
+        )
+        if not filtered_atoms:
+            raise RuntimeError(
+                "All labeled cold-start structures were removed by --max-force-filter. "
+                "Relax the threshold or reduce perturbation strength."
+            )
+        ase_write(labeled_path, filtered_atoms, format="extxyz")
+        logger.info(
+            "Force filter applied: kept=%d dropped=%d threshold=%.3f eV/Ang "
+            "(unfiltered copy: %s)",
+            len(filtered_atoms),
+            len(dropped),
+            args.max_force_filter,
+            unfiltered_path,
+        )
+        if dropped:
+            preview = ", ".join(
+                f"{idx}:{max_force:.3f}" for idx, max_force in dropped[:10]
+            )
+            logger.info("Dropped frame indices (first 10): %s", preview)
+        labeled_atoms = filtered_atoms
 
     # ---- 4. Preprocess ----
     if args.skip_preprocess:
@@ -462,7 +830,7 @@ def main():
     logger.info(
         f"\nDone! Initial dataset ready in {args.output_dir}/\n"
         f"  Total labeled: {len(labeled_atoms)} structures\n"
-        f"  From {len(structure_paths)} seed structure(s), {args.n_perturb} perturbations each\n"
+        f"  Cold-start mode: {args.cold_start_mode}\n"
         f"\nNext step — start active learning:\n"
         f"  mff-active-learn --data-dir {args.output_dir} "
         f"--init-structure {' '.join(structure_paths)} "

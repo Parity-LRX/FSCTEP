@@ -1399,7 +1399,7 @@ pip install ase    # 结构处理和邻居列表（通常已安装）
 
 ## 冷启动：从零生成初始数据集 (mff-init-data)
 
-只有种子结构、没有已标注数据时，`mff-init-data` 一键完成 **扰动 → DFT 标注 → 预处理**：
+只有种子结构、没有已标注数据时，`mff-init-data` 一键完成冷启动。默认流程是 **扰动 → DFT 标注 → 预处理**，现在也支持 **AIMD 取样 → 抽样 → 预处理**：
 
 ```bash
 mff-init-data --structures water.xyz ethanol.xyz \
@@ -1414,9 +1414,22 @@ mff-init-data --structures POSCAR.vasp \
     --vasp-command /home/lrx/vasp.6.4.2/bin/vasp_gam \
     --vasp-mpi-ranks 8 --vasp-ncore 2 \
     --output-dir data
+
+# AIMD 冷启动：先跑 ab initio MD，再从整条轨迹均匀抽样
+mff-init-data --structures POSCAR.vasp \
+    --cold-start-mode aimd \
+    --aimd-total-frames 240 \
+    --aimd-sample-count 100 \
+    --aimd-temperature 300 \
+    --aimd-timestep 0.5 \
+    --aimd-covalent-scale 0.80 \
+    --label-type vasp --vasp-xc PBE --vasp-encut 500 \
+    --vasp-command /home/lrx/vasp.6.4.2/bin/vasp \
+    --vasp-mpi-ranks 16 --vasp-ncore 2 \
+    --output-dir data
 ```
 
-默认情况下，`mff-init-data` 会先对每个冷启动种子结构做一次弛豫，再在弛豫后的结构上生成微扰；如果你明确不想这样做，可以传 `--no-seed-relax`。
+默认情况下，`mff-init-data` 会先对每个冷启动种子结构做一次弛豫，再在弛豫后的结构上生成微扰或启动 AIMD；如果你明确不想这样做，可以传 `--no-seed-relax`。
 
 常用参数：
 
@@ -1429,11 +1442,35 @@ mff-init-data --structures POSCAR.vasp \
 | `--seed-relax` / `--no-seed-relax` | 默认开启 | 冷启动时先弛豫种子结构，再生成微扰 |
 | `--seed-relax-fmax` | `0.05` | 冷启动种子弛豫的力收敛阈值 (eV/Å) |
 | `--seed-relax-steps` | `200` | 冷启动种子弛豫的最大优化步数 |
+| `--cold-start-mode` | `perturb` | 冷启动来源。`perturb` 表示随机微扰；`aimd` 表示先跑一段 AIMD，再从轨迹中抽样 |
+| `--aimd-total-frames` | `1000` | 每个种子结构 AIMD 至少生成多少帧完整轨迹 |
+| `--aimd-sample-count` | `100` | 每个种子结构最终从 AIMD 全轨迹里均匀抽取多少帧写入 `train.xyz` |
+| `--aimd-temperature` | `300` | AIMD 温度，单位 K |
+| `--aimd-timestep` | `0.5` | AIMD 时间步长，单位 fs |
+| `--aimd-friction` | `0.02` | 仅在非 VASP 的 ASE fallback AIMD 路径下使用的 Langevin 摩擦系数；VASP 内部 AIMD 会忽略它 |
+| `--aimd-covalent-scale` | `0.75` | AIMD 轨迹几何守卫参数。会结合共价半径判定原子是否过近，越大越保守 |
 | `--vasp-mpi-ranks` | `1` | 单个 VASP 标注任务内部使用的 MPI ranks 数 |
 | `--vasp-mpi-launcher` | Intel MPI `mpirun` | 当 `--vasp-mpi-ranks > 1` 时使用的 MPI 启动器 |
 | `--vasp-ncore` | 无 | 透传到 INCAR 的 `NCORE`，用于单个 VASP 作业性能调优 |
 | `--cp2k-mpi-ranks` | `1` | 单个 CP2K 标注任务内部使用的 MPI ranks 数 |
 | `--cp2k-mpi-launcher` | Intel MPI `mpirun` | 当 `--cp2k-mpi-ranks > 1` 时使用的 MPI 启动器 |
+
+`AIMD` 冷启动相关参数含义：
+
+- `--cold-start-mode aimd`
+  启用 AIMD 冷启动，不再先生成 `n-perturb` 个随机微扰结构，而是直接从种子结构跑一条第一性原理 MD 轨迹。
+- `--aimd-total-frames`
+  规定整条 AIMD 轨迹至少要有多少帧。这个值决定冷启动覆盖范围和总 DFT 代价。
+- `--aimd-sample-count`
+  规定最后真正进入初始数据集的帧数。代码会从整条 AIMD 轨迹里做均匀抽样，而不是只取前几帧。
+- `--aimd-temperature`
+  AIMD 的温度设定。温度越高，构型波动通常越大，但也更容易采到高能或不稳定构型。
+- `--aimd-timestep`
+  AIMD 每一步的物理时间步长。过大容易导致积分不稳，过小则总计算时间更长。
+- `--aimd-friction`
+  这是给 ASE fallback AIMD 用的 Langevin 阻尼参数；如果后端是 VASP 内部 AIMD，这个参数不会生效。
+- `--aimd-covalent-scale`
+  用于轨迹几何体检。程序会拿原子间距离和“共价半径 × 这个缩放系数”比较，防止坏几何一路跑下去。
 
 详见 [ACTIVE_LEARNING.md](ACTIVE_LEARNING.md)。
 

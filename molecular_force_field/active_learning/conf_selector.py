@@ -76,6 +76,14 @@ class ConfSelector:
                 f"model_devi.out has {len(max_devi_f)} lines but trajectory "
                 f"has {len(atoms_list)} frames"
             )
+        if not np.isfinite(max_devi_f).all():
+            bad_ids = np.where(~np.isfinite(max_devi_f))[0].tolist()
+            preview = ", ".join(str(i) for i in bad_ids[:10])
+            raise FloatingPointError(
+                "model_devi.out contains non-finite max_devi_f values "
+                f"at frame(s): {preview}"
+                + (" ..." if len(bad_ids) > 10 else "")
+            )
 
         id_candidate = np.where(
             (max_devi_f >= self.level_f_lo) & (max_devi_f < self.level_f_hi)
