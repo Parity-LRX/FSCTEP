@@ -15,7 +15,9 @@ Filtering layers
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import pickle
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -28,7 +30,7 @@ from molecular_force_field.active_learning.diversity_selector import (
     load_per_atom_devi,
     parse_max_devi_f,
 )
-from molecular_force_field.active_learning.geometry_filter import filter_xyz_by_geometry
+from molecular_force_field.active_learning.geometry_filter import filter_atoms_by_geometry
 from molecular_force_field.active_learning.model_devi import ModelDeviCalculator
 from molecular_force_field.active_learning.pes_coverage import evaluate_pes_coverage
 from molecular_force_field.active_learning.stage_scheduler import (
@@ -61,6 +63,27 @@ def _select_exploration_checkpoint(
         raise ValueError("No checkpoints available for exploration.")
     model_idx = (global_iter + slot_idx) % len(checkpoint_paths)
     return checkpoint_paths[model_idx], model_idx
+
+
+def _filter_atoms_to_xyz(
+    atoms_list,
+    output_xyz: str,
+    *,
+    min_dist: float,
+    covalent_scale: float,
+):
+    """Filter in-memory ASE frames and write the kept subset once."""
+    kept, rejected = filter_atoms_by_geometry(
+        atoms_list,
+        min_dist=min_dist,
+        covalent_scale=covalent_scale,
+    )
+    if kept:
+        ase_write(output_xyz, kept, format="extxyz")
+    elif os.path.exists(output_xyz):
+        os.remove(output_xyz)
+    reason_counts = Counter(reason for _, reason in rejected)
+    return kept, len(kept), len(rejected), reason_counts
 
 
 def _collect_existing_checkpoints(iter_path: str, n_models: int) -> Optional[List[str]]:
@@ -146,6 +169,7 @@ def _run_one_stage(
     external_field: Optional[list] = None,
     geometry_min_dist: float = 0.5,
     geometry_covalent_scale: float = 0.75,
+    model_devi_batch_size: int = 8,
     merge_val_ratio: float = 0.1,
     merge_val_seed: int = 42,
 ) -> int:
@@ -217,8 +241,17 @@ def _run_one_stage(
                     f"  Parallel exploration: {len(explore_structures)} structures, "
                     f"{n_workers} workers"
                 )
+                executor_cls = ThreadPoolExecutor
+                try:
+                    pickle.dumps(explore_fn)
+                    executor_cls = ProcessPoolExecutor
+                except Exception:
+                    logger.info(
+                        "  explore_fn is not picklable; using ThreadPoolExecutor"
+                    )
                 futures = {}
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                failures = []
+                with executor_cls(max_workers=n_workers) as pool:
                     for s_idx, (struct_path, sub_traj) in enumerate(
                         zip(explore_structures, sub_trajs)
                     ):
@@ -235,6 +268,7 @@ def _run_one_stage(
                         s_idx, struct_path, sub_traj = futures[fut]
                         exc = fut.exception()
                         if exc:
+                            failures.append((s_idx, struct_path, exc))
                             logger.error(
                                 f"  Structure {s_idx} ({os.path.basename(struct_path)}) "
                                 f"exploration failed: {exc}"
@@ -243,6 +277,15 @@ def _run_one_stage(
                             logger.info(
                                 f"  Structure {s_idx} ({os.path.basename(struct_path)}) done"
                             )
+                if failures:
+                    detail = "\n".join(
+                        f"  structure {s_idx} ({os.path.basename(struct_path)}): {exc}"
+                        for s_idx, struct_path, exc in failures
+                    )
+                    raise RuntimeError(
+                        "Parallel exploration failed for one or more structures:\n"
+                        + detail
+                    )
             else:
                 logger.info(
                     f"  Sequential exploration: {len(explore_structures)} structures"
@@ -303,8 +346,9 @@ def _run_one_stage(
                 raise FileNotFoundError(f"Exploration failed: {traj_path}")
 
         filtered_traj_path = os.path.join(iter_path, "explore_traj.filtered.xyz")
-        n_kept_traj, n_rejected_traj, traj_reason_counts = filter_xyz_by_geometry(
-            traj_path,
+        traj_atoms_raw = ase_read(traj_path, index=":")
+        _, n_kept_traj, n_rejected_traj, traj_reason_counts = _filter_atoms_to_xyz(
+            traj_atoms_raw,
             filtered_traj_path,
             min_dist=geometry_min_dist,
             covalent_scale=geometry_covalent_scale,
@@ -328,6 +372,7 @@ def _run_one_stage(
         model_devi_path = os.path.join(iter_path, "model_devi.out")
         converged = False
         candidate_ids = []
+        candidate_atoms = None
         if bootstrap_single_checkpoint:
             if os.path.exists(candidate_path):
                 candidate_atoms = ase_read(candidate_path, index=":")
@@ -361,7 +406,11 @@ def _run_one_stage(
                 if external_field is not None:
                     calc_kwargs["external_field"] = external_field
                 calc = ModelDeviCalculator(**calc_kwargs)
-                calc.compute_from_trajectory(traj_path, output_path=model_devi_path)
+                calc.compute_from_trajectory(
+                    traj_path,
+                    output_path=model_devi_path,
+                    batch_size=model_devi_batch_size,
+                )
 
             # ---- 4. Layer 0 + 1: uncertainty gate (+ fail recovery) ----
             selector = ConfSelector(
@@ -394,8 +443,10 @@ def _run_one_stage(
 
         # ---- 5. Layer 2: diversity selection ----
         if diversity_selector is not None and diversity_selector.metric != "none":
-            candidate_atoms = ase_read(candidate_path, index=":")
+            if candidate_atoms is None:
+                candidate_atoms = ase_read(candidate_path, index=":")
             if len(candidate_atoms) > diversity_selector.max_select:
+                n_candidate_before_diversity = len(candidate_atoms)
                 candidate_max_devi = None
                 if (not bootstrap_single_checkpoint) and os.path.exists(model_devi_path):
                     all_max_devi = parse_max_devi_f(model_devi_path)
@@ -422,16 +473,18 @@ def _run_one_stage(
                     max_devi_f=candidate_max_devi,
                     per_atom_devi=per_atom_devi_cand,
                 )
-                diverse_atoms = [candidate_atoms[i] for i in diverse_local_ids]
-                ase_write(candidate_path, diverse_atoms, format="extxyz")
+                candidate_atoms = [candidate_atoms[i] for i in diverse_local_ids]
+                ase_write(candidate_path, candidate_atoms, format="extxyz")
                 logger.info(
-                    f"Layer 2 (diversity): {len(candidate_atoms)} -> "
-                    f"{len(diverse_atoms)} candidates"
+                    f"Layer 2 (diversity): {n_candidate_before_diversity} -> "
+                    f"{len(candidate_atoms)} candidates"
                 )
 
         filtered_candidate_path = os.path.join(iter_path, "candidate.filtered.xyz")
-        n_kept_cand, n_rejected_cand, cand_reason_counts = filter_xyz_by_geometry(
-            candidate_path,
+        if candidate_atoms is None:
+            candidate_atoms = ase_read(candidate_path, index=":")
+        _, n_kept_cand, n_rejected_cand, cand_reason_counts = _filter_atoms_to_xyz(
+            candidate_atoms,
             filtered_candidate_path,
             min_dist=geometry_min_dist,
             covalent_scale=geometry_covalent_scale,
@@ -517,6 +570,7 @@ def run_active_learning_loop(
     external_field: Optional[list] = None,
     geometry_min_dist: float = 0.5,
     geometry_covalent_scale: float = 0.75,
+    model_devi_batch_size: int = 8,
     merge_val_ratio: float = 0.1,
     merge_val_seed: int = 42,
 ) -> None:
@@ -533,7 +587,8 @@ def run_active_learning_loop(
         Number of fail frames to promote when ``fail_strategy="sample_topk"``.
     explore_n_workers :
         Number of parallel workers for multi-structure exploration.
-        ``1`` (default) = sequential.  ``>1`` = concurrent threads via
+        ``1`` (default) = sequential.  ``>1`` prefers process-based parallelism
+        when the exploration callable is picklable, otherwise falls back to
         ``ThreadPoolExecutor``.  Has no effect when only one structure is given.
     initial_checkpoint_paths :
         Optional list of checkpoint paths used for iteration 0. When given,
@@ -679,6 +734,7 @@ def run_active_learning_loop(
             external_field=external_field,
             geometry_min_dist=geometry_min_dist,
             geometry_covalent_scale=geometry_covalent_scale,
+            model_devi_batch_size=model_devi_batch_size,
             merge_val_ratio=merge_val_ratio,
             merge_val_seed=merge_val_seed,
         )

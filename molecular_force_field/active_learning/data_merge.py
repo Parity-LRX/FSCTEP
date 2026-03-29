@@ -55,6 +55,15 @@ def _read_existing_blocks(data_dir: str, prefix: str = "train"):
     return blocks, raw_E, cells, pbcs, stresses
 
 
+def _read_existing_correction(data_dir: str, prefix: str = "train"):
+    """Read existing correction energies if present."""
+    corr_file = os.path.join(data_dir, f"correction_energy_{prefix}.h5")
+    if not os.path.exists(corr_file):
+        return None
+    df_corr = pd.read_hdf(corr_file)
+    return df_corr.values.flatten().astype(np.float64).tolist()
+
+
 def _subset_optional_list(values, indices):
     if values is None:
         return None
@@ -208,7 +217,11 @@ def merge_training_data(
                 ] + stresses_in
             else:
                 stresses = None
-            old_correction = compute_correction(old_blocks, old_raw_E, e0_keys, e0_vals)
+            old_correction = _read_existing_correction(data_dir, prefix)
+            if old_correction is None or len(old_correction) != len(old_blocks):
+                old_correction = compute_correction(
+                    old_blocks, old_raw_E, e0_keys, e0_vals
+                )
             correction_E = old_correction + correction_in
 
         indices = np.arange(len(blocks))

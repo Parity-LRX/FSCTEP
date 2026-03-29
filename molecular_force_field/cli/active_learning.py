@@ -66,6 +66,7 @@ import argparse
 import json
 import logging
 import os
+from functools import partial
 
 from molecular_force_field.active_learning.exploration import run_ase_md, run_ase_neb
 from molecular_force_field.active_learning.labeling import (
@@ -86,6 +87,65 @@ from molecular_force_field.active_learning.stage_scheduler import (
     StageScheduler,
     make_single_stage_scheduler,
 )
+
+
+def _dispatch_explore(
+    iter_idx,
+    checkpoint_path,
+    stage,
+    *,
+    explore_type,
+    explore_mode,
+    init_structs,
+    work_dir,
+    device,
+    max_radius,
+    e0_path,
+    efield,
+    neb_initial,
+    neb_final,
+    geometry_min_dist,
+    geometry_covalent_scale,
+    input_structure=None,
+    output_traj=None,
+):
+    struct = input_structure or init_structs[0]
+    out_traj = output_traj or os.path.join(
+        work_dir, "iterations", f"iter_{iter_idx}", "explore_traj.xyz"
+    )
+    os.makedirs(os.path.dirname(out_traj), exist_ok=True)
+    if explore_type == "ase":
+        if explore_mode == "md":
+            return run_ase_md(
+                checkpoint_path=checkpoint_path,
+                input_structure=struct,
+                output_traj=out_traj,
+                device=device,
+                max_radius=max_radius,
+                atomic_energy_file=e0_path,
+                temperature=stage.temperature,
+                nsteps=stage.nsteps,
+                timestep=stage.timestep,
+                friction=stage.friction,
+                relax_fmax=stage.relax_fmax,
+                log_interval=stage.log_interval,
+                external_field=efield,
+                min_dist=geometry_min_dist,
+                covalent_scale=geometry_covalent_scale,
+            )
+        if not neb_initial or not neb_final:
+            raise ValueError("NEB requires --neb-initial and --neb-final")
+        return run_ase_neb(
+            checkpoint_path=checkpoint_path,
+            initial_xyz=neb_initial,
+            final_xyz=neb_final,
+            output_traj=out_traj,
+            device=device,
+            max_radius=max_radius,
+            atomic_energy_file=e0_path,
+            external_field=efield,
+        )
+    raise NotImplementedError("LAMMPS: use run_lammps_md with custom template")
 
 
 def _resolve_init_structs(args):
@@ -276,7 +336,7 @@ def main():
     )
     parser.add_argument(
         "--train-patience", type=int, default=None,
-        help="Training early-stopping patience forwarded to mff-train.",
+        help="Training early-stopping patience in validation checks forwarded to mff-train.",
     )
     parser.add_argument(
         "--train-ema-start-epoch", type=int, default=None,
@@ -293,6 +353,10 @@ def main():
     parser.add_argument(
         "--train-dump-frequency", type=int, default=None,
         help="Training validation/checkpoint frequency forwarded to mff-train.",
+    )
+    parser.add_argument(
+        "--train-update-param", type=int, default=None,
+        help="Training interval (in batches) to update loss weights a/b, forwarded to mff-train.",
     )
     parser.add_argument(
         "--dtype", type=str, default=None,
@@ -454,6 +518,14 @@ def main():
             "<1.0 = safer exploration: lowers temperature, timestep, steps, "
             "and trust window while increasing Langevin damping. "
             ">1.0 = more aggressive exploration."
+        ),
+    )
+    parser.add_argument(
+        "--model-devi-batch-size", type=int, default=8,
+        help=(
+            "Batch size used when computing ensemble model deviation over an "
+            "exploration trajectory. Larger values speed up long trajectories "
+            "at the cost of higher GPU memory use."
         ),
     )
     parser.add_argument(
@@ -854,49 +926,21 @@ def main():
     # ------------------------------------------------------------------ #
     efield = args.explore_external_field  # None or [fx, fy, fz]
 
-    def explore_fn(iter_idx, checkpoint_path, stage, **kwargs):
-        struct = kwargs.get("input_structure", init_structs[0])
-        out_traj = kwargs.get(
-            "output_traj",
-            os.path.join(
-                args.work_dir, "iterations", f"iter_{iter_idx}", "explore_traj.xyz"
-            ),
-        )
-        os.makedirs(os.path.dirname(out_traj), exist_ok=True)
-        if args.explore_type == "ase":
-            if args.explore_mode == "md":
-                return run_ase_md(
-                    checkpoint_path=checkpoint_path,
-                    input_structure=struct,
-                    output_traj=out_traj,
-                    device=args.device,
-                    max_radius=args.max_radius,
-                    atomic_energy_file=e0_path,
-                    temperature=stage.temperature,
-                    nsteps=stage.nsteps,
-                    timestep=stage.timestep,
-                    friction=stage.friction,
-                    relax_fmax=stage.relax_fmax,
-                    log_interval=stage.log_interval,
-                    external_field=efield,
-                    min_dist=args.geometry_min_dist,
-                    covalent_scale=args.geometry_covalent_scale,
-                )
-            else:
-                if not args.neb_initial or not args.neb_final:
-                    raise ValueError("NEB requires --neb-initial and --neb-final")
-                return run_ase_neb(
-                    checkpoint_path=checkpoint_path,
-                    initial_xyz=args.neb_initial,
-                    final_xyz=args.neb_final,
-                    output_traj=out_traj,
-                    device=args.device,
-                    max_radius=args.max_radius,
-                    atomic_energy_file=e0_path,
-                    external_field=efield,
-                )
-        else:
-            raise NotImplementedError("LAMMPS: use run_lammps_md with custom template")
+    explore_fn = partial(
+        _dispatch_explore,
+        explore_type=args.explore_type,
+        explore_mode=args.explore_mode,
+        init_structs=init_structs,
+        work_dir=args.work_dir,
+        device=args.device,
+        max_radius=args.max_radius,
+        e0_path=e0_path,
+        efield=efield,
+        neb_initial=args.neb_initial,
+        neb_final=args.neb_final,
+        geometry_min_dist=args.geometry_min_dist,
+        geometry_covalent_scale=args.geometry_covalent_scale,
+    )
 
     # ------------------------------------------------------------------ #
     # Build label_fn
@@ -1155,6 +1199,8 @@ def main():
         train_args.extend(["--max-grad-norm", str(args.train_max_grad_norm)])
     if args.train_dump_frequency is not None:
         train_args.extend(["--dump-frequency", str(args.train_dump_frequency)])
+    if args.train_update_param is not None:
+        train_args.extend(["--update-param", str(args.train_update_param)])
     if args.device is not None:
         train_args.extend(["--device", args.device])
     if args.max_radius is not None:
@@ -1278,6 +1324,7 @@ def main():
         external_field=efield,
         geometry_min_dist=args.geometry_min_dist,
         geometry_covalent_scale=args.geometry_covalent_scale,
+        model_devi_batch_size=args.model_devi_batch_size,
         merge_val_ratio=args.merge_val_ratio,
         merge_val_seed=args.merge_val_seed,
     )

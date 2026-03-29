@@ -428,6 +428,7 @@ def train_ensemble(
             gpu_tag = slot["tag"]
             log_file = os.path.join(log_dir, f"model_{j}.log")
             fh = open(log_file, "w")
+            proc = None
 
             if batch_size > 1:
                 logger.info(
@@ -441,10 +442,14 @@ def train_ensemble(
                     f"(seed={seed}, {gpu_tag})..."
                 )
 
-            proc = subprocess.Popen(
-                cmd, cwd=work_dir, env=env,
-                stdout=fh, stderr=subprocess.STDOUT,
-            )
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=work_dir, env=env,
+                    stdout=fh, stderr=subprocess.STDOUT,
+                )
+            except Exception:
+                fh.close()
+                raise
             procs.append((j, proc, fh, log_file, cmd, env, ckpt_path))
 
         # Wait for all processes in this batch

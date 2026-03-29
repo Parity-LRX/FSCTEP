@@ -452,7 +452,7 @@ def main():
                         help='Atomic reference energies (E0) in eV corresponding to --atomic-energy-keys. '
                              'Highest priority override. Example: --atomic-energy-values -430.53 -821.03 -1488.19 -2044.35')
     parser.add_argument('--patience', type=int, default=20,
-                        help='Early stopping patience in epochs (default: 20)')
+                        help='Early stopping patience in validation checks (not epochs; default: 20)')
     parser.add_argument('--vhat-clamp-interval', type=int, default=2000,
                         help='Interval (in batches) to clamp v_hat (default: 2000)')
     parser.add_argument('--max-vhat-growth', type=float, default=5.0,

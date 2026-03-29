@@ -15,6 +15,7 @@ Supported metrics
 """
 
 import logging
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -96,7 +97,18 @@ def compute_soap_fingerprints(
         average="outer",
         periodic=periodic,
     )
-    descriptors = soap.create(atoms_list, n_jobs=1)
+    env_n_jobs = os.getenv("MFF_SOAP_N_JOBS")
+    if env_n_jobs is not None:
+        try:
+            n_jobs = max(1, int(env_n_jobs))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid MFF_SOAP_N_JOBS={env_n_jobs!r}; expected positive integer."
+            ) from exc
+    else:
+        n_jobs = max(1, min(len(atoms_list), os.cpu_count() or 1))
+
+    descriptors = soap.create(atoms_list, n_jobs=n_jobs)
     if descriptors.ndim == 1:
         descriptors = descriptors.reshape(1, -1)
 
