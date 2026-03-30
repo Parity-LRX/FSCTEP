@@ -849,8 +849,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         # Packed same-kdim buckets for the custom CUDA backend.
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
-        # 3-D reshaped projection matrices for einsum fusion: U_g reshaped to (m1, m2, K_total)
-        self._proj_group_3d_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -954,30 +953,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         return buckets
 
     @_dynamo_disable
-    def _get_proj_group_3d_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
-        """
-        Returns projection matrices reshaped to (m1, m2, K_total) for einsum fusion.
-
-        This avoids materializing the large (B, i, j, m1, m2) outer-product intermediate
-        by allowing ``torch.einsum("...im,...jn,mnK->...ijK", a, b, U3)``.
-        """
-        compute_dtype = self.internal_compute_dtype
-        key = (str(device), str(compute_dtype))
-        cached = self._proj_group_3d_cache_by_dev_dtype.get(key)
-        if cached is not None:
-            return cached
-        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-        proj_3d: List[torch.Tensor] = []
-        for g_idx, g in enumerate(self._groups):
-            l1 = int(g["l1"])  # type: ignore[arg-type]
-            l2 = int(g["l2"])  # type: ignore[arg-type]
-            m1 = 2 * l1 + 1
-            m2 = 2 * l2 + 1
-            proj_3d.append(proj_list[g_idx].reshape(m1, m2, -1).contiguous())
-        self._proj_group_3d_cache_by_dev_dtype[key] = proj_3d
-        return proj_3d
-
-    @_dynamo_disable
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         """Pre-build internal caches on (device, dtype).
 
@@ -988,7 +963,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         _ = self._get_proj_group_list(device=device, dtype=dtype)
         _ = self._get_proj_sparse_list(device=device, dtype=dtype)
         _ = self._get_proj_bucket_list(device=device, dtype=dtype)
-        _ = self._get_proj_group_3d_list(device=device, dtype=dtype)
 
     def forward(
         self,
@@ -1025,7 +999,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Fast path: internal_weights + per-path scalar gates (this is what our models use).
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-            proj_3d_list = self._get_proj_group_3d_list(device=device, dtype=dtype)
             bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
             # Only fetch sparse list on CUDA (Triton is CUDA-only; avoids extra work on CPU)
             sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
@@ -1130,10 +1103,13 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                                 y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
                 if not used_fused_mix:
                     if y is None:
-                        # PyTorch path: fused outer-product + projection via einsum
-                        # Avoids materializing the large (..., i, j, m1, m2) intermediate tensor.
-                        U3 = proj_3d_list[g_idx]  # (m1, m2, K_total)
-                        y = torch.einsum("...im,...jn,mnK->...ijK", a_comp, b_comp, U3)
+                        # PyTorch fallback: outer product + matmul projection
+                        U = proj_list[g_idx]  # (m1*m2, K_total)
+                        t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                        t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                        if not t_flat.is_contiguous():
+                            t_flat = t_flat.contiguous()
+                        y = torch.matmul(t_flat, U)
 
                     # Per-path channel mixing
                     i, j = self.mul_in1, self.mul_in2
@@ -1155,7 +1131,6 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Still uses the e3nn-like factorization (projection first, then channel mixing).
         elif weights is not None and weights.shape[-1] == self.weight_numel:
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-            proj_3d_list = self._get_proj_group_3d_list(device=device, dtype=dtype)
             sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             # Reshape once:
             #   weights_full: (..., P, o, i, j)
@@ -1196,8 +1171,12 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                         if y_flat is not None:
                             y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
                 if y is None:
-                    U3 = proj_3d_list[g_idx]  # (m1, m2, K_total)
-                    y = torch.einsum("...im,...jn,mnK->...ijK", a_comp, b_comp, U3)
+                    U = proj_list[g_idx]  # (m1*m2, K_total)
+                    t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                    t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                    if not t_flat.is_contiguous():
+                        t_flat = t_flat.contiguous()
+                    y = torch.matmul(t_flat, U)
                 if y.shape[-1] != k_total:
                     raise RuntimeError("ICTD TP projection produced wrong K_total")
 
@@ -1432,7 +1411,6 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
-        self._proj_group_3d_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -1517,31 +1495,11 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         return buckets
 
     @_dynamo_disable
-    def _get_proj_group_3d_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
-        """Projection matrices reshaped to (m1, m2, K_total) for einsum fusion."""
-        compute_dtype = self.internal_compute_dtype
-        key = (str(device), str(compute_dtype))
-        cached = self._proj_group_3d_cache_by_dev_dtype.get(key)
-        if cached is not None:
-            return cached
-        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-        proj_3d: List[torch.Tensor] = []
-        for g_idx, g in enumerate(self._groups):
-            l1 = int(g["l1"])
-            l2 = int(g["l2"])
-            m1 = 2 * l1 + 1
-            m2 = 2 * l2 + 1
-            proj_3d.append(proj_list[g_idx].reshape(m1, m2, -1).contiguous())
-        self._proj_group_3d_cache_by_dev_dtype[key] = proj_3d
-        return proj_3d
-
-    @_dynamo_disable
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         _ = self._get_cg_list(device=device, dtype=dtype)
         _ = self._get_proj_group_list(device=device, dtype=dtype)
         _ = self._get_proj_sparse_list(device=device, dtype=dtype)
         _ = self._get_proj_bucket_list(device=device, dtype=dtype)
-        _ = self._get_proj_group_3d_list(device=device, dtype=dtype)
 
     def forward(
         self,
@@ -1571,7 +1529,6 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
 
         if self.internal_weights and (weights is None or weights.shape[-1] == self.num_paths):
             proj_list = self._get_proj_group_list(device=device, dtype=dtype)
-            proj_3d_list = self._get_proj_group_3d_list(device=device, dtype=dtype)
             bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
             sparse_list = self._get_proj_sparse_list(device=device, dtype=dtype) if device.type == "cuda" else None
             for g_idx, g in enumerate(self._groups):
@@ -1667,8 +1624,12 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                                 y = y_flat.reshape(*batch_shape, self.mul_in1, self.mul_in2, k_total)
                 if not used_fused_mix:
                     if y is None:
-                        U3 = proj_3d_list[g_idx]  # (m1, m2, K_total)
-                        y = torch.einsum("...im,...jn,mnK->...ijK", a_comp, b_comp, U3)
+                        U = proj_list[g_idx]  # (m1*m2, K_total)
+                        t_mn = (a_comp.unsqueeze(-2).unsqueeze(-1) * b_comp.unsqueeze(-3).unsqueeze(-2))
+                        t_flat = t_mn.reshape(*batch_shape, self.mul_in1, self.mul_in2, m1 * m2)
+                        if not t_flat.is_contiguous():
+                            t_flat = t_flat.contiguous()
+                        y = torch.matmul(t_flat, U)
                     ij = self.mul_in1 * self.mul_in2
                     for p_idx, l3, p3, s, e in segments:
                         Wp = w_param[int(p_idx)]
