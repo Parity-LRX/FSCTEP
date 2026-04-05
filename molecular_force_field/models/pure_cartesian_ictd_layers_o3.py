@@ -199,6 +199,10 @@ def _split_irreps_o3(
     return out
 
 
+def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
+    return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
+
+
 def _merge_irreps_o3(
     blocks: dict[tuple[int, int], torch.Tensor],
     channels: int,
@@ -304,7 +308,7 @@ class ICTDO3E3Conv(nn.Module):
         function_type: str = "gaussian",
         path_policy: str = "full",
         max_rank_other: int | None = None,
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
         external_tensor_rank: int | None = None,
         external_tensor_irrep: str | None = None,
@@ -550,7 +554,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
         lmax: int = 2,
         ictd_tp_path_policy: str = "full",
         ictd_tp_max_rank_other: int | None = None,
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
         invariant_channels: int = 32,
         physical_tensor_outputs: dict[str, dict] | None = None,

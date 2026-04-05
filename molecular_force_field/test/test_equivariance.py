@@ -271,7 +271,7 @@ def build_e3trans(mode: str, config: ModelConfig, device: torch.device):
             lmax=config.lmax,
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
-            internal_compute_dtype=config.dtype,
+            internal_compute_dtype=config.internal_compute_dtype,
             device=device,
         ).to(device)
     if mode == "pure-cartesian-ictd-save":
@@ -295,7 +295,7 @@ def build_e3trans(mode: str, config: ModelConfig, device: torch.device):
             lmax=config.lmax,
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
-            internal_compute_dtype=config.dtype,
+            internal_compute_dtype=config.internal_compute_dtype,
             device=device,
         ).to(device)
     raise ValueError(f"Unsupported mode: {mode}")
@@ -507,7 +507,7 @@ def build_e3conv1_l2_module(mode: str, config: ModelConfig, device: torch.device
             function_type=config.function_type_main,
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
-            internal_compute_dtype=config.dtype,
+            internal_compute_dtype=config.internal_compute_dtype,
         )
     else:
         raise ValueError(f"E3Conv1 l2 test: unsupported mode {mode}")

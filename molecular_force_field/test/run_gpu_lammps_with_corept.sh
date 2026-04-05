@@ -283,6 +283,7 @@ Options:
   --e0-csv <path>     fitted_E0.csv (Atom,E0 columns); embed into core.pt if provided
   --dtype float32|float64   core.pt export precision (default: follow pth)
   --cutoff <A>        pair_style cutoff (Angstrom)
+  --neighbor-skin <A> LAMMPS neighbor skin distance (default 1.0)
   --mode <mode>       Model mode for export (e.g. spherical-save-cue); else from checkpoint
   --steps <N>         MD steps (default 200)
   --out-dir <dir>     Output dir (default mktemp)
@@ -292,6 +293,8 @@ Options:
   --n1 <int>          Random type1 atoms (default 2000)
   --n2 <int>          Random type2 atoms (default 1000)
   --box <float>       Box side length (default auto)
+  --min-separation <A> Reject random initial placements closer than this distance
+                      (default 0.80; set 0 to disable)
   --native-ops        spherical-save-cue: keep native cuEquivariance ops (requires MFF_CUSTOM_OPS_LIB)
   --field-values Ex Ey Ez   Enable runtime electric field via pair_style field v_Ex v_Ey v_Ez
   --mfield-values Bx By Bz Enable runtime magnetic field via pair_style mfield v_Bx v_By v_Bz
@@ -476,6 +479,7 @@ ELEMENTS=()
 E0CSV=""
 DTYPE=""
 CUTOFF="5.0"
+NEIGHBOR_SKIN="1.0"
 STEPS="200"
 OUT_DIR=""
 GPU_N="1"
@@ -484,6 +488,7 @@ MPI_CMD="mpirun"
 N1="2000"
 N2="1000"
 BOX=""
+MIN_SEPARATION="0.80"
 FIELD_VALUES=()
 MFIELD_VALUES=()
 FIELD6_VALUES=()
@@ -534,6 +539,7 @@ while [[ $# -gt 0 ]]; do
     --e0-csv) E0CSV="${2:-}"; shift 2;;
     --dtype) DTYPE="${2:-}"; shift 2;;
     --cutoff) CUTOFF="${2:-}"; shift 2;;
+    --neighbor-skin) NEIGHBOR_SKIN="${2:-}"; shift 2;;
     --mode) MODE="${2:-}"; shift 2;;
     --native-ops) NATIVE_OPS=1; shift;;
     --steps) STEPS="${2:-}"; shift 2;;
@@ -544,6 +550,7 @@ while [[ $# -gt 0 ]]; do
     --n1) N1="${2:-}"; shift 2;;
     --n2) N2="${2:-}"; shift 2;;
     --box) BOX="${2:-}"; shift 2;;
+    --min-separation) MIN_SEPARATION="${2:-}"; shift 2;;
     --field-values)
       shift
       FIELD_VALUES=("${1:-}" "${2:-}" "${3:-}")
@@ -1541,7 +1548,7 @@ boundary p p p
 
 read_data $workdir/two_atoms_cross.data
 
-neighbor 1.0 bin
+neighbor $NEIGHBOR_SKIN bin
 neigh_modify every 1 delay 0 check yes
 
 pair_style mff/torch $cutoff cuda
@@ -1561,7 +1568,7 @@ boundary p p p
 
 read_data $workdir/two_atoms_inside.data
 
-neighbor 1.0 bin
+neighbor $NEIGHBOR_SKIN bin
 neigh_modify every 1 delay 0 check yes
 
 pair_style mff/torch $cutoff cuda
@@ -2519,32 +2526,133 @@ for i, sym in enumerate(sys.argv[1:], start=1):
 PY
 )"
 
-ATOM_CREATE_BLOCK="$(python - "$ATOM_TYPE_COUNT" "$N1" "$N2" <<'PY'
+if [[ $OPEN_BOUNDARY_MD -eq 1 || ($TEST_TREE_FMM_LONG_RANGE -eq 1 && $MD_ONLY_MODE -eq 1) ]]; then
+  MD_BOUNDARY="f f f"
+  MD_PERIODIC="0"
+  MD_FIX_BLOCK=$'fix mffwall all wall/reflect xlo EDGE xhi EDGE ylo EDGE yhi EDGE zlo EDGE zhi EDGE\nfix 1 all nve'
+else
+  MD_BOUNDARY="p p p"
+  MD_PERIODIC="1"
+  MD_FIX_BLOCK='fix 1 all nve'
+fi
+
+INITIAL_STATS_FILE="$OUT_DIR/initial_neighbor_stats.txt"
+
+ATOM_CREATE_BLOCK="$(python - "$ATOM_TYPE_COUNT" "$N1" "$N2" "$BOX" "$CUTOFF" "$NEIGHBOR_SKIN" "$MIN_SEPARATION" "$INITIAL_STATS_FILE" "$MD_PERIODIC" <<'PY'
+import math
+import random
 import sys
+from pathlib import Path
 
 n_types = int(sys.argv[1])
 n1 = int(sys.argv[2])
 n2 = int(sys.argv[3])
+box = float(sys.argv[4])
+cutoff = float(sys.argv[5])
+neighbor_skin = float(sys.argv[6])
+min_separation = float(sys.argv[7])
+stats_path = Path(sys.argv[8])
+periodic = bool(int(sys.argv[9]))
 
-lines = []
+if box <= 0.0:
+    raise SystemExit("box must be positive")
+
+types = []
 if n_types == 1:
     total = max(n1, 0) + max(n2, 0)
-    lines.append(f"create_atoms 1 random {total} 12345 box")
+    types = [1] * total
 else:
     if n1 > 0:
-        lines.append(f"create_atoms 1 random {n1} 12345 box")
+        types.extend([1] * n1)
     if n2 > 0:
-        lines.append(f"create_atoms 2 random {n2} 12346 box")
+        types.extend([2] * n2)
+
+rng = random.Random(12345)
+positions = []
+min_sep2 = max(min_separation, 0.0) ** 2
+max_attempts_per_atom = 20000
+
+def displacement(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    dz = a[2] - b[2]
+    if periodic:
+        dx -= round(dx / box) * box
+        dy -= round(dy / box) * box
+        dz -= round(dz / box) * box
+    return dx, dy, dz
+
+for atype in types:
+    placed = False
+    for _attempt in range(max_attempts_per_atom):
+        cand = (rng.random() * box, rng.random() * box, rng.random() * box, atype)
+        if min_sep2 > 0.0:
+            conflict = False
+            for prev in positions:
+                dx, dy, dz = displacement(cand, prev)
+                if dx * dx + dy * dy + dz * dz < min_sep2:
+                    conflict = True
+                    break
+            if conflict:
+                continue
+        positions.append(cand)
+        placed = True
+        break
+    if not placed:
+        raise SystemExit(
+            f"failed to place {len(positions)+1}/{len(types)} atoms with min_separation={min_separation:.3f} A "
+            f"in box={box:.3f} A; reduce min separation or enlarge box"
+        )
+
+cutoff2 = cutoff * cutoff
+list_radius = cutoff + neighbor_skin
+list2 = list_radius * list_radius
+pair_count = 0
+list_pair_count = 0
+min_dist2 = None
+
+for i in range(len(positions)):
+    for j in range(i + 1, len(positions)):
+        dx, dy, dz = displacement(positions[i], positions[j])
+        d2 = dx * dx + dy * dy + dz * dz
+        if min_dist2 is None or d2 < min_dist2:
+            min_dist2 = d2
+        if d2 <= cutoff2:
+            pair_count += 1
+        if d2 <= list2:
+            list_pair_count += 1
+
+n_atoms = len(positions)
+avg_cutoff_neighbors = (2.0 * pair_count / n_atoms) if n_atoms else 0.0
+avg_list_neighbors = (2.0 * list_pair_count / n_atoms) if n_atoms else 0.0
+min_dist = math.sqrt(min_dist2) if min_dist2 is not None else 0.0
+
+stats_lines = [
+    f"box_A={box:.6f}",
+    f"n_atoms={n_atoms}",
+    f"periodic={int(periodic)}",
+    f"pair_cutoff_A={cutoff:.6f}",
+    f"neighbor_skin_A={neighbor_skin:.6f}",
+    f"neighbor_list_radius_A={list_radius:.6f}",
+    f"min_separation_A={max(min_separation, 0.0):.6f}",
+    f"min_observed_distance_A={min_dist:.6f}",
+    f"pairs_within_cutoff={pair_count}",
+    f"avg_neighbors_within_cutoff={avg_cutoff_neighbors:.6f}",
+    f"pairs_within_neighbor_list={list_pair_count}",
+    f"avg_neighbors_within_neighbor_list={avg_list_neighbors:.6f}",
+]
+stats_path.write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
+
+lines = []
+for x, y, z, atype in positions:
+    lines.append(f"create_atoms {atype} single {x:.8f} {y:.8f} {z:.8f} units box")
 print("\n".join(lines))
 PY
 )"
 
-if [[ $OPEN_BOUNDARY_MD -eq 1 || ($TEST_TREE_FMM_LONG_RANGE -eq 1 && $MD_ONLY_MODE -eq 1) ]]; then
-  MD_BOUNDARY="f f f"
-  MD_FIX_BLOCK=$'fix mffwall all wall/reflect xlo EDGE xhi EDGE ylo EDGE yhi EDGE zlo EDGE zhi EDGE\nfix 1 all nve'
-else
-  MD_BOUNDARY="p p p"
-  MD_FIX_BLOCK='fix 1 all nve'
+if [[ -f "$INITIAL_STATS_FILE" ]]; then
+  echo "[2/3] Initial geometry stats"
+  cat "$INITIAL_STATS_FILE"
 fi
 
 cat > "$OUT_DIR/in.corept" <<EOF
@@ -2557,7 +2665,7 @@ create_box $ATOM_TYPE_COUNT box
 $ATOM_CREATE_BLOCK
 $MASS_BLOCK
 
-neighbor 1.0 bin
+neighbor $NEIGHBOR_SKIN bin
 
 $FIELD_LMP
 pair_coeff * * $CORE_PT ${ELEMENTS[*]}

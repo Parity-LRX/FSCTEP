@@ -60,6 +60,10 @@ def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> 
     return torch.cat(parts, dim=-1)
 
 
+def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
+    return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
+
+
 @lru_cache(maxsize=None)
 def _sym_rank_linear_indices_and_coefs(L: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -179,7 +183,7 @@ class PhysicalTensorICTDEmbedding(nn.Module):
         input_repr: str = "cartesian",
         include_trace_chain: bool = True,
         rank2_mode: str = "symmetric",
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.rank = int(rank)
@@ -189,7 +193,7 @@ class PhysicalTensorICTDEmbedding(nn.Module):
         self.input_repr = str(input_repr).strip().lower()
         self.include_trace_chain = bool(include_trace_chain)
         self.rank2_mode = str(rank2_mode).strip().lower()
-        self.internal_compute_dtype = internal_compute_dtype
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
 
         if self.rank < 0:
             raise ValueError(f"rank must be >= 0, got {self.rank}")
@@ -399,7 +403,7 @@ class PhysicalTensorICTDRecovery(nn.Module):
         lmax_in: int | None = None,
         include_trace_chain: bool = True,
         rank2_mode: str = "symmetric",
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.rank = int(rank)
@@ -407,7 +411,7 @@ class PhysicalTensorICTDRecovery(nn.Module):
         self.lmax_in = int(lmax_in) if lmax_in is not None else int(rank)
         self.include_trace_chain = bool(include_trace_chain)
         self.rank2_mode = str(rank2_mode).strip().lower()
-        self.internal_compute_dtype = internal_compute_dtype
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
 
         if self.rank < 0:
             raise ValueError(f"rank must be >= 0, got {self.rank}")
@@ -642,7 +646,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         # Normalize messages by this (default None = use num_edges/num_nodes at runtime)
         avg_num_neighbors: float | None = None,
         # Internal computation dtype for ICTD operations (default: float64 for stability)
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
     ):
         super().__init__()
@@ -764,7 +768,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         max_rank_other: int = 1,
         k_policy: str = "k0",
         # Internal computation dtype for ICTD operations (default: float64 for stability)
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
         # Optional: allow per-l multiplicities for the "product_5-like" scalar invariant vector.
         # If None: keep current behavior (mul_l = channels for all l).
@@ -873,19 +877,17 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             self.fc2_layers.append(fc2)
 
         # Readout invariants:
-        #  - scalars: per-l channel Gram -> 32
-        #  - norms: per-l per-channel L2 over m
+        #  - project each l-block to scalar_channels
+        #  - build 0e invariants with an elementwise product instead of an
+        #    internally weighted tensor product / Gram readout
         combined_channels = self.channels * self.num_interaction
         scalar_channels = (self.num_interaction - 1) * self.invariant_channels
-        self.W_read = nn.ParameterList([
-            nn.Parameter(torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02)
-            for _ in range(self.lmax + 1)
-        ])
-        self.readout_linear = nn.Sequential(
-            nn.Linear(scalar_channels + (self.lmax + 1) * combined_channels, embed_size[0]),
-            nn.SiLU(),
-            nn.Linear(embed_size[0], 17),
-        )
+        self._scalar_readout_adapt = nn.ModuleDict()
+        for l in range(self.lmax + 1):
+            if scalar_channels == combined_channels:
+                self._scalar_readout_adapt[str(l)] = nn.Identity()
+            else:
+                self._scalar_readout_adapt[str(l)] = nn.Linear(combined_channels, scalar_channels, bias=False)
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
         # Match e3nn-style product_5:
         # T = cat([f1..fn, scalars]); ElementwiseTensorProduct(T,T)->0e
@@ -1056,9 +1058,9 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         )
         for l in range(self.lmax + 1):
             t = xb[l]  # (N,nC,2l+1)
+            t = _apply_channel_adapter_per_l(t, self._scalar_readout_adapt[str(l)])
             # e3nn-style component normalization: divide by sqrt(2l+1)
-            gram = torch.einsum("ncm,ndm->ncd", t, t) / ((2 * l + 1) ** 0.5)  # (N,2C,2C)
-            scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[l], gram)
+            scalars = scalars + (t * t).sum(dim=-1) / math.sqrt(2 * l + 1)
 
         # Build T = cat(features, scalars) per l, then product_5(T, T) → 0e.
         # Scalars are appended to the l=0 block so they also go through normalized EWP.

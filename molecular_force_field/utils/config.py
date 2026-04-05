@@ -14,6 +14,7 @@ class ModelConfig:
     """Model hyperparameters configuration."""
     # Data type configuration
     dtype: Union[torch.dtype, str] = torch.float64  # Default dtype for all tensors
+    internal_compute_dtype: Union[torch.dtype, str, None] = None  # Defaults to dtype unless explicitly overridden
     
     # Embedding network e3 layer parameters
     channel_in: int = 64
@@ -68,6 +69,16 @@ class ModelConfig:
                 self.dtype = torch.float64
             else:
                 raise ValueError(f"Unknown dtype: {self.dtype}")
+
+        if isinstance(self.internal_compute_dtype, str):
+            if self.internal_compute_dtype == 'float32' or self.internal_compute_dtype == 'float':
+                self.internal_compute_dtype = torch.float32
+            elif self.internal_compute_dtype == 'float64' or self.internal_compute_dtype == 'double':
+                self.internal_compute_dtype = torch.float64
+            else:
+                raise ValueError(f"Unknown internal_compute_dtype: {self.internal_compute_dtype}")
+        elif self.internal_compute_dtype is None:
+            self.internal_compute_dtype = self.dtype
         
         # Set global default dtype
         torch.set_default_dtype(self.dtype)

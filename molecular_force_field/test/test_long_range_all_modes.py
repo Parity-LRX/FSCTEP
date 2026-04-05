@@ -166,12 +166,12 @@ def _build_model(mode: str, cfg: ModelConfig) -> torch.nn.Module:
         return CartesianTransformerLayerLoose(**cartesian_kwargs).to(dtype=cfg.dtype)
     if mode == "pure-cartesian-ictd":
         return PureCartesianICTDTransformerLayerFull(
-            internal_compute_dtype=cfg.dtype,
+            internal_compute_dtype=cfg.internal_compute_dtype,
             **cartesian_kwargs,
         ).to(dtype=cfg.dtype)
     if mode == "pure-cartesian-ictd-save":
         return PureCartesianICTDTransformerLayer(
-            internal_compute_dtype=cfg.dtype,
+            internal_compute_dtype=cfg.internal_compute_dtype,
             **cartesian_kwargs,
         ).to(dtype=cfg.dtype)
     raise ValueError(f"Unsupported mode: {mode}")

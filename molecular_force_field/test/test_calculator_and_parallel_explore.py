@@ -61,7 +61,7 @@ def _build_ictd_model(device, external_rank=None, physical_tensor_outputs=None):
         num_interaction=2,
         function_type_main=config.function_type,
         lmax=config.lmax,
-        internal_compute_dtype=config.dtype,
+            internal_compute_dtype=config.internal_compute_dtype,
         device=device,
     )
     if external_rank is not None:

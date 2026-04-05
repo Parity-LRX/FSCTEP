@@ -71,6 +71,10 @@ _SPARSE_ZERO_THRESHOLD = 1e-12
 _USE_SPARSE_TP = os.environ.get("ICTD_USE_SPARSE_TP", "1") == "1"
 
 
+def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
+    return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
+
+
 def _segment_offsets_from_segments(segments: List[Tuple[int, ...]]) -> torch.Tensor:
     offsets = [int(seg[-2]) for seg in segments]
     offsets.append(int(segments[-1][-1]) if segments else 0)
@@ -618,12 +622,12 @@ class HarmonicElementwiseProduct(nn.Module):
         mul: int,
         irreps_out: str | None = "0e",
         normalization: str = "component",
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.lmax = int(lmax)
         self.mul = int(mul)
-        self.internal_compute_dtype = internal_compute_dtype
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self._normalization = normalization
         self._irreps_out = irreps_out.strip().lower() if (irreps_out and isinstance(irreps_out, str)) else "full"
         self._output_0e_only = self._irreps_out == "0e"
@@ -754,7 +758,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         #   "none": raw CG tensors
         normalization: str = "component",
         # Internal computation dtype for CG tensors and projections (default: float64 for stability)
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
     ):
         super().__init__()
@@ -764,7 +768,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.lmax = lmax
         self.internal_weights = internal_weights
         self._normalization = normalization
-        self.internal_compute_dtype = internal_compute_dtype
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
 
         # Enumerate all valid (l1,l2,l3) with parity selection (even step)
@@ -1194,12 +1198,16 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                 # Reshape W_stack: (..., P_g, o, i*j)
                 W_reshaped = W_stack_comp.reshape(*batch_shape, num_paths_in_group, self.mul_out, i * j)  # (..., P_g, o, ij)
                 
-                # Batched matmul: (..., ij, K) @ (..., P_g, ij, o) -> (..., P_g, o, K)
-                # We need: (..., 1, ij, K) @ (..., P_g, ij, o) -> (..., P_g, 1, o, K) -> (..., P_g, o, K)
-                y_expanded = y_reshaped.unsqueeze(-3)  # (..., 1, ij, K)
+                # Batched channel mixing over the flattened (i,j) dimension.
+                #   y_reshaped: (..., ij, K)
+                #   W_reshaped: (..., P_g, o, ij)
+                # We need sum_{ij} W[p,o,ij] * y[ij,k] -> (..., P_g, o, K).
+                # Arrange the inputs as (..., 1, K, ij) @ (..., P_g, ij, o) -> (..., P_g, K, o),
+                # then move the last two dims back to (..., P_g, o, K).
+                y_expanded = y_reshaped.transpose(-2, -1).unsqueeze(-3)  # (..., 1, K, ij)
                 W_transposed = W_reshaped.transpose(-2, -1)  # (..., P_g, ij, o)
-                out_group = torch.matmul(y_expanded, W_transposed)  # (..., P_g, 1, o, K) in compute_dtype
-                out_group = out_group.squeeze(-2).permute(*range(len(batch_shape)), 0, 1, 2)  # (..., P_g, o, K_total)
+                out_group = torch.matmul(y_expanded, W_transposed)  # (..., P_g, K, o) in compute_dtype
+                out_group = out_group.movedim(-1, -2)  # (..., P_g, o, K_total)
                 # Convert back to output dtype
                 out_group = out_group.to(dtype=dtype) if out_group.dtype != dtype else out_group
                 
@@ -1271,12 +1279,12 @@ class HarmonicElementwiseProductO3(nn.Module):
         mul: int,
         irreps_out: str | None = "0e",
         normalization: str = "component",
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.active_irreps = [_normalize_irrep_key(l, p) for l, p in active_irreps]
         self.mul = int(mul)
-        self.internal_compute_dtype = internal_compute_dtype
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self._normalization = normalization
         self._irreps_out = irreps_out.strip().lower() if (irreps_out and isinstance(irreps_out, str)) else "full"
         self._output_0e_only = self._irreps_out == "0e"
@@ -1335,7 +1343,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         path_policy: str = "full",
         max_rank_other: int | None = None,
         normalization: str = "component",
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
     ):
         super().__init__()
@@ -1345,7 +1353,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self.lmax = int(lmax)
         self.internal_weights = bool(internal_weights)
         self._normalization = normalization
-        self.internal_compute_dtype = internal_compute_dtype
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
         self.active_irreps = (
             [_normalize_irrep_key(l, p) for l, p in active_irreps]
@@ -1644,5 +1652,44 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                             out_seg = out_seg * weights[..., int(p_idx), None, None]
                         out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + out_seg
         else:
-            raise NotImplementedError("HarmonicFullyConnectedTensorProductO3 currently supports internal_weights + optional scalar gates only")
+            # Fallback path: supports external full per-example weights
+            # (..., weight_numel) as well as the internal-weight case.
+            cg_list = self._get_cg_list(device=device, dtype=dtype)
+            idx = 0
+            for p_idx, (l1, p1, l2, p2, l3, p3) in enumerate(self.paths):
+                if self.internal_weights:
+                    gate = 1.0
+                    if weights is not None and weights.shape[-1] == self.num_paths:
+                        gate = weights[..., p_idx]
+                    elif weights is not None and weights.shape[-1] == self.weight_numel:
+                        block = self.mul_out * self.mul_in1 * self.mul_in2
+                        Wp = weights[..., idx: idx + block].view(
+                            *batch_shape, self.mul_out, self.mul_in1, self.mul_in2
+                        )
+                        idx += block
+                    else:
+                        Wp = w_param[p_idx]
+                else:
+                    assert weights is not None
+                    block = self.mul_out * self.mul_in1 * self.mul_in2
+                    Wp = weights[..., idx: idx + block].view(
+                        *batch_shape, self.mul_out, self.mul_in1, self.mul_in2
+                    )
+                    idx += block
+                    gate = 1.0
+
+                a = x1.get((l1, p1))
+                b = x2.get((l2, p2))
+                if a is None or b is None:
+                    continue
+
+                a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+                b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+                Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                C = cg_list[p_idx]
+                out_l3 = torch.einsum("...im,...jn,mnk,...oij->...ok", a_comp, b_comp, C, Wp_comp)
+                out_l3 = out_l3.to(dtype=dtype) if out_l3.dtype != dtype else out_l3
+                if not isinstance(gate, float):
+                    out_l3 = out_l3 * gate[..., None, None]
+                out[(l3, p3)] = out[(l3, p3)] + out_l3
         return out

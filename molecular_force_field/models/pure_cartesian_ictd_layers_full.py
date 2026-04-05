@@ -74,6 +74,10 @@ def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> 
     return torch.cat(parts, dim=-1)
 
 
+def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
+    return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
+
+
 def _normalize_external_tensor_irrep(
     *,
     rank: int | None,
@@ -225,7 +229,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         ictd_tp_path_policy: str = "full",
         ictd_tp_max_rank_other: int | None = None,
         # Internal computation dtype for ICTD operations (default: float64 for stability)
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         # Optional: external physical tensor input (e.g. uniform electric field).
         # If set, you may pass `external_tensor` to forward() and it will be embedded into ICTD irreps blocks.
         external_tensor_rank: int | None = None,
@@ -506,7 +510,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         max_rank_other: int = 1,
         k_policy: str = "k0",
         # Internal computation dtype for ICTD operations (default: float64 for stability)
-        internal_compute_dtype: torch.dtype = torch.float64,
+        internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "auto",
         # Optional: allow per-l multiplicities for the "product_5-like" scalar invariant vector.
         # If None: keep current behavior (mul_l = channels for all l).

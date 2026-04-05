@@ -61,6 +61,34 @@ def _parse_dtype(s: Optional[str]) -> Optional[torch.dtype]:
     return dt
 
 
+def _set_ictd_internal_compute_dtype_for_export(model: torch.nn.Module, dtype: torch.dtype) -> None:
+    """Force ICTD-family internal TP compute dtype for deployment export only.
+
+    We keep training/eager defaults unchanged and only rewrite the internal
+    compute dtype on the model instance being traced to TorchScript.
+    """
+    cache_attrs = (
+        "_proj_cache",
+        "_recon_cache",
+        "_cg_cache_by_dev_dtype",
+        "_proj_group_cache_by_dev_dtype",
+        "_proj_sparse_cache_by_dev_dtype",
+        "_proj_bucket_cache_by_dev_dtype",
+    )
+    touched = 0
+    for module in model.modules():
+        if hasattr(module, "internal_compute_dtype"):
+            setattr(module, "internal_compute_dtype", dtype)
+            touched += 1
+        for attr in cache_attrs:
+            if hasattr(module, attr):
+                cache = getattr(module, attr)
+                if isinstance(cache, dict):
+                    cache.clear()
+    if touched:
+        print(f"[export_core] forced ICTD internal_compute_dtype={str(dtype).replace('torch.', '')} on {touched} modules")
+
+
 def _e0_lut_from_keys_values(
     keys: torch.Tensor, values: torch.Tensor, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -353,6 +381,9 @@ def export_core(
             model_eager.make_torchscript_portable()
             print("[export_core] Replaced product_3/product_5 with pure PyTorch impl (no cuequivariance custom ops)")
 
+    if mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-save"}:
+        _set_ictd_internal_compute_dtype_for_export(model_eager, torch.float32)
+
     # Optional: embed E0(Z) into per-atom energies before tracing.
     if embed_e0:
         aek = obj.wrapper.atomic_energy_keys.detach().cpu()
@@ -410,6 +441,9 @@ def export_core(
         "max_radius": float(effective_radius),
         "num_interaction": int(num_interaction) if num_interaction is not None else None,
         "dtype": str(actual_dtype).replace("torch.", ""),
+        "internal_compute_dtype_export": (
+            "float32" if mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-save"} else str(actual_dtype).replace("torch.", "")
+        ),
         "embed_e0": bool(embed_e0),
         "export_reciprocal_source": bool(export_reciprocal_source),
         "e0_source": (str(e0_csv) if e0_csv else "from_checkpoint_or_default"),

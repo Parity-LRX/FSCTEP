@@ -427,7 +427,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd(
         external_tensor_rank=external_tensor_rank,
         external_tensor_irrep=external_tensor_irrep,
         external_tensor_specs=external_tensor_specs,
-        internal_compute_dtype=config.dtype,
+        internal_compute_dtype=config.internal_compute_dtype,
         device=device,
         long_range_mode=long_range_mode,
         long_range_hidden_dim=long_range_hidden_dim,
@@ -575,7 +575,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd_o3(
         external_tensor_specs=external_tensor_specs,
         o3_irrep_preset=o3_irrep_preset,
         o3_active_irreps=o3_active_irreps,
-        internal_compute_dtype=config.dtype,
+        internal_compute_dtype=config.internal_compute_dtype,
         device=device,
     ).to(device)
 
@@ -624,7 +624,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd_save(path: str, device: torch.dev
         function_type_main=config.function_type,
         lmax=config.lmax,
         ictd_tp_path_policy="full",
-        internal_compute_dtype=config.dtype,
+        internal_compute_dtype=config.internal_compute_dtype,
         device=device,
     ).to(device)
 

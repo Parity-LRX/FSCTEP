@@ -172,7 +172,7 @@ def _build_model(
             invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            internal_compute_dtype=config.dtype,
+            internal_compute_dtype=config.internal_compute_dtype,
             physical_tensor_outputs=physical_tensor_outputs,
             external_tensor_rank=external_tensor_rank,
             device=device,
@@ -230,7 +230,7 @@ def _build_model(
             invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            internal_compute_dtype=config.dtype,
+            internal_compute_dtype=config.internal_compute_dtype,
             device=device,
         )
     elif tensor_product_mode in {"pure-cartesian-sparse", "pure-cartesian-sparse-save"}:
