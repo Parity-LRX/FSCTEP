@@ -411,6 +411,18 @@ pair_coeff * * /path/to/core.pt H O
 
 **Model support**: `pure-cartesian-ictd` series and `spherical-save-cue` only.
 
+Current USER-MFFTORCH export defaults:
+
+- `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save`: default `hybrid`
+- `spherical-save-cue --native-ops`: default `hybrid`
+- other modes: default `trace`
+
+Practical deployment notes:
+
+- ICTD family now defaults to `hybrid` on the `/kk` path and no longer needs the earlier trace-size workaround in normal use
+- `spherical-save-cue --native-ops` can now run on `/kk` with the native custom-op path; `bundle` is still available as a fallback, but a single `hybrid core.pt` is now the default path
+- to force the older traced path explicitly, pass `--jit-mode trace` during `mff-export-core`
+
 ### ML-IAP Interface
 
 Export ML-IAP format (requires LAMMPS built with ML-IAP):

@@ -20,6 +20,8 @@
 #include "mff_tree_fmm_solver.h"
 
 #include <Kokkos_Core.hpp>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cmath>
 #include <type_traits>
 
@@ -115,6 +117,7 @@ PairMFFTorchKokkos<DeviceType>::PairMFFTorchKokkos(LAMMPS *lmp) : PairMFFTorch(l
 
 template <class DeviceType>
 void PairMFFTorchKokkos<DeviceType>::init_style() {
+  const bool debug_bundle = std::getenv("MFF_DEBUG_BUNDLE") != nullptr;
   if (core_pt_path_.empty()) error->all(FLERR, "pair_coeff for mff/torch must specify core.pt path");
 
   // Request a full neighbor list (same as base class).
@@ -141,7 +144,9 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
     try {
       if (!reciprocal_solver_) reciprocal_solver_ = std::make_unique<mfftorch::MFFReciprocalSolver>();
       if (!tree_fmm_solver_) tree_fmm_solver_ = std::make_unique<mfftorch::MFFTreeFmmSolver>();
+      if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style before load_core\n");
       engine_->load_core(core_pt_path_, dev);
+      if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style after load_core\n");
       if (reciprocal_solver_) {
         auto cfg = reciprocal_solver_->config();
         cfg.slab_padding_factor = static_cast<int>(engine_->reciprocal_source_slab_padding_factor());
@@ -164,6 +169,7 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
         tree_fmm_solver_->set_config(cfg);
       }
       validate_external_field_configuration();
+      if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style after validate\n");
       engine_loaded_ = true;
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("Failed to load TorchScript core: ") + e.what()).c_str());
@@ -171,12 +177,14 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
   }
 
   if (engine_->is_cuda()) {
+    if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style before initial warmup\n");
     auto t = torch::from_blob(type2Z_.data(), {(int64_t)type2Z_.size()},
                               torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU))
                  .clone();
     type2Z_cuda_ = t.to(engine_->device());
 
     engine_->warmup(32, 256);
+    if (debug_bundle) std::fprintf(stderr, "[USER-MFFTORCH] kk init_style after initial warmup\n");
   }
 }
 
@@ -349,17 +357,52 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       KOKKOS_LAMBDA(const int i) { type_idx_v(i) = static_cast<int64_t>(type(i)); });
   Kokkos::fence();
 
-  auto A = type2Z_cuda_.index_select(0, buf_type_idx_);
-  auto external_tensor = current_external_tensor(dev);
-  auto fidelity_ids = current_fidelity_tensor(dev);
-
   const bool need_energy = static_cast<bool>(eflag_global || eflag_atom);
   const bool need_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
   try {
-    out = engine_->compute(nlocal, ntotal, buf_pos_, A, buf_edge_src_, buf_edge_dst_, buf_edge_shifts_, cell_t, external_tensor,
-                           fidelity_ids,
-                           need_energy, need_atom_virial);
+    Kokkos::fence();
+    if (engine_->is_bundle_manifest()) {
+      engine_->prepare_for_shape(nlocal, ntotal, Etotal);
+    }
+    if (engine_->prefers_kokkos_host_staging()) {
+      // Native cue custom CUDA ops are unstable when fed Kokkos-managed device
+      // tensors and an external CUDA stream. Stage inputs through CPU so the
+      // engine follows the same stable transfer path as plain mff/torch.
+      auto pos_cpu = buf_pos_.to(torch::kCPU, torch::kFloat32).contiguous();
+      auto A_cpu = type2Z_cuda_.index_select(0, buf_type_idx_).to(torch::kCPU, torch::kInt64).contiguous();
+      auto edge_src_cpu = buf_edge_src_.to(torch::kCPU, torch::kInt64).contiguous();
+      auto edge_dst_cpu = buf_edge_dst_.to(torch::kCPU, torch::kInt64).contiguous();
+      auto edge_shifts_cpu = buf_edge_shifts_.to(torch::kCPU, torch::kFloat32).contiguous();
+      auto external_tensor = current_external_tensor(torch::kCPU);
+      auto fidelity_ids = current_fidelity_tensor(torch::kCPU);
+      out = engine_->compute(
+          nlocal,
+          ntotal,
+          pos_cpu,
+          A_cpu,
+          edge_src_cpu,
+          edge_dst_cpu,
+          edge_shifts_cpu,
+          cell_t.to(torch::kCPU, torch::kFloat32).contiguous(),
+          external_tensor,
+          fidelity_ids,
+          need_energy,
+          need_atom_virial);
+      if (engine_->is_cuda()) torch::cuda::synchronize();
+    } else {
+      auto kk_stream = Kokkos::Cuda().cuda_stream();
+      auto torch_stream = c10::cuda::getStreamFromExternal(kk_stream, dev.index());
+      c10::cuda::CUDAStreamGuard stream_guard(torch_stream);
+
+      auto A = type2Z_cuda_.index_select(0, buf_type_idx_);
+      auto external_tensor = current_external_tensor(dev);
+      auto fidelity_ids = current_fidelity_tensor(dev);
+      out = engine_->compute(nlocal, ntotal, buf_pos_, A, buf_edge_src_, buf_edge_dst_, buf_edge_shifts_, cell_t, external_tensor,
+                             fidelity_ids,
+                             need_energy, need_atom_virial);
+    }
+    Kokkos::fence();
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
   }

@@ -2264,7 +2264,98 @@ mff-export-core \
   --out core.pt
 ```
 
+For `pure-cartesian-ictd`, `pure-cartesian-ictd-o3`, and `pure-cartesian-ictd-save`, the default export path is now `--jit-mode hybrid`. This is the recommended `/kk` deployment path because it avoids most of the earlier `ntotal`/trace-shape fragility while preserving numerical parity with `trace` in local tests.
+
+If you explicitly force `--jit-mode trace`, TorchScript export can still be sensitive to the representative trace shape. In that case, if your target workload is much larger than the default trace (`32` nodes / `256` edges), export with a more realistic pair of values:
+
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --dtype float32 \
+  --e0-csv fitted_E0.csv \
+  --trace-num-nodes 2048 \
+  --trace-num-edges 32000 \
+  --out core.pt
+```
+
+Practical guidance for the ICTD family:
+
+- `hybrid` is now the default for `pure-cartesian-ictd`, `pure-cartesian-ictd-o3`, and `pure-cartesian-ictd-save`
+- this does **not** change the model mathematically; it only changes the deployment graph strategy
+- if you stay on `trace`, using a representative larger trace can recover historical `/kk` deployment throughput in local tests
+- for small MD systems, using a larger trace did **not** show a meaningful regression in local `/kk` benchmarks
+- you do not need exact production sizes; a small/medium/large bucket is usually sufficient when forcing `trace`
+- `spherical-save-cue` uses a different default rule: native-op export also defaults to `hybrid`
+
 If the checkpoint was trained with ZBL enabled, the exported `core.pt` automatically contains the same ZBL short-range repulsion; you do not need to pass any extra `--zbl-*` flags during export.
+
+**Native cuEquivariance export for `spherical-save-cue`**:
+
+If you want the high-performance native cuEquivariance runtime for `spherical-save-cue`, export native-op TorchScript. There are now two deployment modes:
+
+- single-core export: this is now the default path. For `--native-ops`, if `--jit-mode` is omitted, export defaults to `hybrid`
+- bundle export: multiple `core.pt` files plus `manifest.json`, kept as a more conservative advanced/fallback option
+
+Single-core export:
+
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --dtype float32 \
+  --out core.pt \
+  --native-ops
+```
+
+Optional `/kk` bundle export:
+
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --dtype float32 \
+  --native-ops \
+  --bundle-out cue_native_kk_bundle
+```
+
+Optional explicit bucket override:
+
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --dtype float32 \
+  --native-ops \
+  --bundle-out cue_native_kk_bundle \
+  --trace-buckets small=648:35804,medium=1296:80000,large=4096:262144
+```
+
+`--jit-mode hybrid` is now the default export path for `spherical-save-cue --native-ops`. To force the older traced single-core path, pass `--jit-mode trace` explicitly.
+
+Runtime requirements for native `cue`:
+
+```bash
+export PYTHONHOME=/root/miniconda3/envs/mff
+export PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild
+export MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so
+export MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so
+```
+
+Current runtime guidance:
+
+- plain `pair_style mff/torch` works with native `cue`
+- `/kk` now defaults to a single `hybrid core.pt`
+- bundle/manifest remains supported, but it is no longer the default recommendation
+- `mff-export-core --bundle-out ...` uses the default cue-native bucket profile if `--trace-buckets` is omitted:
+  - `small=648:35804`
+  - `medium=1296:80000`
+  - `large=4096:262144`
+- runtime selects the smallest fitting bucket and can promote to a larger bucket if the workload grows; it never demotes during the same run
 
 **Checkpoint auto-restore notes:**
 
@@ -2303,6 +2394,35 @@ velocity all create 300 42
 fix 1 all nve
 thermo 20
 run 200
+```
+
+For native `spherical-save-cue`, plain runtime remains valid:
+
+```bash
+env \
+  PYTHONHOME=/root/miniconda3/envs/mff \
+  PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild \
+  MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so \
+  MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so \
+  lmp -in in.mfftorch
+```
+
+For native `spherical-save-cue` with `/kk`, point `pair_coeff` to the bundle directory and launch with Kokkos:
+
+```bash
+env \
+  PYTHONHOME=/root/miniconda3/envs/mff \
+  PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild \
+  MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so \
+  MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so \
+  lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+```
+
+`in.mfftorch`:
+
+```lammps
+pair_style mff/torch/kk 5.0 cuda
+pair_coeff * * /path/to/cue_native_kk_bundle H O
 ```
 
 Additional note:

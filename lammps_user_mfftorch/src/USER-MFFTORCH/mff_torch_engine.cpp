@@ -2,9 +2,12 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <fstream>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -76,6 +79,69 @@ bool parse_string_from_metadata(const std::string& content, const std::string& k
   if (end_quote == std::string::npos) return false;
   value = content.substr(quote_pos + 1, end_quote - quote_pos - 1);
   return true;
+}
+
+std::string trim_copy(const std::string& s) {
+  const auto start = s.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) return std::string();
+  const auto end = s.find_last_not_of(" \t\r\n");
+  return s.substr(start, end - start + 1);
+}
+
+bool is_directory_path(const std::string& path) {
+  std::error_code ec;
+  return std::filesystem::is_directory(std::filesystem::path(path), ec);
+}
+
+std::string read_text_file(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("Failed to open file: " + path);
+  }
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+bool extract_json_array_block(const std::string& content, const std::string& key, std::string& array_block) {
+  const auto key_pos = content.find(key);
+  if (key_pos == std::string::npos) return false;
+  const auto colon_pos = content.find(':', key_pos + key.size());
+  if (colon_pos == std::string::npos) return false;
+  const auto bracket_pos = content.find('[', colon_pos + 1);
+  if (bracket_pos == std::string::npos) return false;
+  int depth = 0;
+  for (size_t i = bracket_pos; i < content.size(); ++i) {
+    const char ch = content[i];
+    if (ch == '[') {
+      depth += 1;
+    } else if (ch == ']') {
+      depth -= 1;
+      if (depth == 0) {
+        array_block = content.substr(bracket_pos + 1, i - bracket_pos - 1);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::vector<std::string> split_top_level_object_blocks(const std::string& array_block) {
+  std::vector<std::string> out;
+  int depth = 0;
+  size_t obj_start = std::string::npos;
+  for (size_t i = 0; i < array_block.size(); ++i) {
+    const char ch = array_block[i];
+    if (ch == '{') {
+      if (depth == 0) obj_start = i;
+      depth += 1;
+    } else if (ch == '}') {
+      depth -= 1;
+      if (depth == 0 && obj_start != std::string::npos) {
+        out.push_back(array_block.substr(obj_start, i - obj_start + 1));
+        obj_start = std::string::npos;
+      }
+    }
+  }
+  return out;
 }
 
 bool parse_external_tensor_rank_from_metadata(const std::string& meta_path, bool& requires_external_tensor) {
@@ -156,6 +222,36 @@ bool should_use_flat_external_tensor(
   return true;
 }
 
+void maybe_dump_forward_inputs_once(const std::vector<torch::jit::IValue>& inputs) {
+  static bool done = false;
+  if (done) return;
+  const char* prefix = std::getenv("MFF_DUMP_INPUT_PREFIX");
+  if (!prefix || prefix[0] == '\0') return;
+  if (inputs.size() >= 4 && inputs[0].isTensor() && inputs[3].isTensor()) {
+    const auto n = inputs[0].toTensor().size(0);
+    const auto e = inputs[3].toTensor().size(0);
+    if (n <= 32 && e <= 256) return;
+  }
+  done = true;
+
+  auto dump_tensor = [&](size_t idx, const char* name) {
+    if (idx >= inputs.size() || !inputs[idx].isTensor()) return;
+    torch::Tensor t = inputs[idx].toTensor().detach().cpu();
+    torch::save(t, std::string(prefix) + "_" + name + ".pt");
+  };
+
+  dump_tensor(0, "pos");
+  dump_tensor(1, "A");
+  dump_tensor(2, "batch");
+  dump_tensor(3, "edge_src");
+  dump_tensor(4, "edge_dst");
+  dump_tensor(5, "edge_shifts");
+  dump_tensor(6, "cell");
+  dump_tensor(7, "edge_vec");
+  dump_tensor(8, "external");
+  dump_tensor(9, "fidelity");
+}
+
 }  // namespace
 
 static int detect_local_gpu_index() {
@@ -223,6 +319,82 @@ static void ensure_libpython() {
   }
 }
 
+static void ensure_python_custom_op_registrations() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+
+  const char* env = std::getenv("MFF_CUSTOM_OPS_LIB");
+  if (!env || env[0] == '\0') return;
+
+  ensure_libpython();
+
+  using Py_InitializeEx_Fn = void (*)(int);
+  using Py_IsInitialized_Fn = int (*)();
+  using PyGILState_Ensure_Fn = int (*)();
+  using PyGILState_Release_Fn = void (*)(int);
+  using PyRun_SimpleString_Fn = int (*)(const char*);
+
+  auto py_is_initialized = reinterpret_cast<Py_IsInitialized_Fn>(dlsym(RTLD_DEFAULT, "Py_IsInitialized"));
+  auto py_initialize_ex = reinterpret_cast<Py_InitializeEx_Fn>(dlsym(RTLD_DEFAULT, "Py_InitializeEx"));
+  auto py_gil_ensure = reinterpret_cast<PyGILState_Ensure_Fn>(dlsym(RTLD_DEFAULT, "PyGILState_Ensure"));
+  auto py_gil_release = reinterpret_cast<PyGILState_Release_Fn>(dlsym(RTLD_DEFAULT, "PyGILState_Release"));
+  auto py_run_simple_string =
+      reinterpret_cast<PyRun_SimpleString_Fn>(dlsym(RTLD_DEFAULT, "PyRun_SimpleString"));
+
+  if (!py_is_initialized || !py_initialize_ex || !py_gil_ensure || !py_gil_release ||
+      !py_run_simple_string) {
+    throw std::runtime_error(
+        "Failed to resolve CPython runtime symbols needed for cue custom op registration");
+  }
+
+  if (!py_is_initialized()) {
+    py_initialize_ex(0);
+  }
+
+  const int gil_state = py_gil_ensure();
+  const char* code = "import cuequivariance_ops_torch.tensor_product_uniform_1d_jit\n";
+  const int rc = py_run_simple_string(code);
+  py_gil_release(gil_state);
+
+  if (rc != 0) {
+    throw std::runtime_error(
+        "Failed to import cuequivariance_ops_torch.tensor_product_uniform_1d_jit "
+        "while registering Torch custom ops"
+        "\nFor native cue ops, also set:"
+        "\n  PYTHONHOME=/path/to/python/env"
+        "\n  PYTHONPATH=/path/to/python/env/lib/pythonX.Y/site-packages[:... ]"
+        "\n  MFF_LIBPYTHON=/path/to/libpythonX.Y.so");
+  }
+}
+
+struct OptionalGilRelease {
+  using Py_IsInitialized_Fn = int (*)();
+  using PyGILState_Check_Fn = int (*)();
+  using PyEval_SaveThread_Fn = void* (*)();
+  using PyEval_RestoreThread_Fn = void (*)(void*);
+
+  void* thread_state = nullptr;
+  PyEval_RestoreThread_Fn restore = nullptr;
+
+  OptionalGilRelease() {
+    auto py_is_initialized = reinterpret_cast<Py_IsInitialized_Fn>(dlsym(RTLD_DEFAULT, "Py_IsInitialized"));
+    auto py_gil_check = reinterpret_cast<PyGILState_Check_Fn>(dlsym(RTLD_DEFAULT, "PyGILState_Check"));
+    auto py_eval_save = reinterpret_cast<PyEval_SaveThread_Fn>(dlsym(RTLD_DEFAULT, "PyEval_SaveThread"));
+    auto py_eval_restore =
+        reinterpret_cast<PyEval_RestoreThread_Fn>(dlsym(RTLD_DEFAULT, "PyEval_RestoreThread"));
+    if (!py_is_initialized || !py_gil_check || !py_eval_save || !py_eval_restore) return;
+    if (!py_is_initialized()) return;
+    if (!py_gil_check()) return;
+    thread_state = py_eval_save();
+    restore = py_eval_restore;
+  }
+
+  ~OptionalGilRelease() {
+    if (thread_state && restore) restore(thread_state);
+  }
+};
+
 static void load_custom_op_libs() {
   const char* env = std::getenv("MFF_CUSTOM_OPS_LIB");
   if (!env || env[0] == '\0') return;
@@ -248,9 +420,9 @@ static void load_custom_op_libs() {
   }
 }
 
-void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::string& device_str) {
-  device_ = pick_device(device_str);
+void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
   load_custom_op_libs();
+  ensure_python_custom_op_registrations();
   core_ = torch::jit::load(core_pt_path, device_);
   core_.eval();
 
@@ -316,6 +488,7 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
           content, "\"reciprocal_source_slab_padding_factor\"", reciprocal_source_slab_padding_factor_);
       (void)parse_string_from_metadata(content, "\"long_range_green_mode\"", long_range_green_mode_);
       (void)parse_string_from_metadata(content, "\"long_range_runtime_backend\"", long_range_runtime_backend_);
+      (void)parse_string_from_metadata(content, "\"tensor_product_mode\"", tensor_product_mode_);
       (void)parse_string_from_metadata(content, "\"long_range_source_kind\"", long_range_source_kind_);
       (void)parse_int64_from_metadata(content, "\"long_range_source_channels\"", long_range_source_channels_);
       (void)parse_string_from_metadata(content, "\"long_range_source_layout\"", long_range_source_layout_);
@@ -328,6 +501,8 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
       (void)parse_double_from_metadata(content, "\"long_range_screening\"", long_range_screening_);
       (void)parse_double_from_metadata(content, "\"long_range_softening\"", long_range_softening_);
       (void)parse_double_from_metadata(content, "\"long_range_energy_scale\"", long_range_energy_scale_);
+      (void)parse_int64_from_metadata(content, "\"trace_num_nodes\"", trace_num_nodes_);
+      (void)parse_int64_from_metadata(content, "\"trace_num_edges\"", trace_num_edges_);
       (void)parse_string_from_metadata(content, "\"external_tensor_irrep\"", external_tensor_irrep_);
       (void)parse_int64_from_metadata(content, "\"external_tensor_total_numel\"", external_tensor_total_numel_);
       (void)parse_int64_from_metadata(content, "\"num_fidelity_levels\"", num_fidelity_levels_);
@@ -383,8 +558,148 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
 #endif
 }
 
+void MFFTorchEngine::ensure_core_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges, bool warmup_on_switch) {
+  if (!bundle_mode_) return;
+  if (bundle_buckets_.empty()) {
+    throw std::runtime_error("Manifest bundle has no buckets: " + bundle_manifest_path_);
+  }
+  const bool cue_node_first = (tensor_product_mode_ == "spherical-save-cue");
+  const int64_t node_metric = cue_node_first ? nlocal : ntotal;
+  int selected = -1;
+  if (cue_node_first) {
+    for (int i = 0; i < static_cast<int>(bundle_buckets_.size()); ++i) {
+      const auto& bucket = bundle_buckets_[i];
+      if (node_metric <= bucket.max_nodes) {
+        selected = i;
+        break;
+      }
+    }
+    if (selected > 0) {
+      while (selected < static_cast<int>(bundle_buckets_.size()) - 1 &&
+             nedges > bundle_buckets_[selected].max_edges) {
+        selected += 1;
+      }
+    }
+  } else {
+    for (int i = 0; i < static_cast<int>(bundle_buckets_.size()); ++i) {
+      const auto& bucket = bundle_buckets_[i];
+      if (node_metric <= bucket.max_nodes && nedges <= bucket.max_edges) {
+        selected = i;
+        break;
+      }
+    }
+  }
+  if (selected < 0) {
+    selected = static_cast<int>(bundle_buckets_.size()) - 1;
+    if (!bundle_warned_oversize_) {
+      bundle_warned_oversize_ = true;
+      std::fprintf(stderr,
+                   "[USER-MFFTORCH] workload node_metric=%lld ntotal=%lld nedges=%lld exceeds all bundle buckets; "
+                   "using largest bucket '%s' (%lld,%lld)\n",
+                   static_cast<long long>(node_metric),
+                   static_cast<long long>(ntotal),
+                   static_cast<long long>(nedges),
+                   bundle_buckets_[selected].name.c_str(),
+                   static_cast<long long>(bundle_buckets_[selected].max_nodes),
+                   static_cast<long long>(bundle_buckets_[selected].max_edges));
+    }
+  }
+  if (current_bucket_index_ >= 0) {
+    const auto& current = bundle_buckets_[current_bucket_index_];
+    if (node_metric <= current.max_nodes && nedges <= current.max_edges) {
+      return;
+    }
+    if (selected <= current_bucket_index_) {
+      selected = current_bucket_index_;
+    }
+  }
+  if (selected == current_bucket_index_ && loaded_) return;
+  const bool promoted = current_bucket_index_ >= 0 && selected > current_bucket_index_;
+  load_single_core_file(bundle_buckets_[selected].core_path);
+  current_bucket_index_ = selected;
+  std::fprintf(stderr,
+               "[USER-MFFTORCH] %s bucket '%s' (%lld,%lld) for node_metric=%lld ntotal=%lld nedges=%lld\n",
+               promoted ? "promoted to" : "selected",
+               bundle_buckets_[selected].name.c_str(),
+               static_cast<long long>(bundle_buckets_[selected].max_nodes),
+               static_cast<long long>(bundle_buckets_[selected].max_edges),
+               static_cast<long long>(node_metric),
+               static_cast<long long>(ntotal),
+               static_cast<long long>(nedges));
+  if (warmup_on_switch && !warming_up_) {
+    warmup(0, 0);
+  }
+}
+
+void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::string& device_str) {
+  device_ = pick_device(device_str);
+  const bool debug_bundle = std::getenv("MFF_DEBUG_BUNDLE") != nullptr;
+  if (debug_bundle) {
+    std::fprintf(stderr, "[USER-MFFTORCH] load_core path=%s device=%s\n", core_pt_path.c_str(), device_str.c_str());
+  }
+  bundle_mode_ = false;
+  bundle_manifest_path_.clear();
+  bundle_buckets_.clear();
+  current_bucket_index_ = -1;
+  bundle_warned_oversize_ = false;
+
+  std::string manifest_path;
+  if (is_directory_path(core_pt_path)) {
+    manifest_path = (std::filesystem::path(core_pt_path) / "manifest.json").string();
+  } else if (core_pt_path.size() >= 5 && core_pt_path.substr(core_pt_path.size() - 5) == ".json") {
+    manifest_path = core_pt_path;
+  }
+  if (!manifest_path.empty()) {
+    if (debug_bundle) {
+      std::fprintf(stderr, "[USER-MFFTORCH] manifest path=%s\n", manifest_path.c_str());
+    }
+    const auto manifest_content = read_text_file(manifest_path);
+    std::string mode;
+    (void)parse_string_from_metadata(manifest_content, "\"tensor_product_mode\"", mode);
+    tensor_product_mode_ = mode;
+    bundle_mode_ = true;
+    bundle_manifest_path_ = manifest_path;
+    std::string array_block;
+    if (!extract_json_array_block(manifest_content, "\"buckets\"", array_block)) {
+      throw std::runtime_error("Failed to parse buckets from manifest: " + manifest_path);
+    }
+    const auto base_dir = std::filesystem::path(manifest_path).parent_path();
+    for (const auto& obj : split_top_level_object_blocks(array_block)) {
+      BucketSpec bucket;
+      if (!parse_string_from_metadata(obj, "\"name\"", bucket.name)) continue;
+      if (!parse_string_from_metadata(obj, "\"core_path\"", bucket.core_path)) continue;
+      (void)parse_int64_from_metadata(obj, "\"max_nodes\"", bucket.max_nodes);
+      (void)parse_int64_from_metadata(obj, "\"max_edges\"", bucket.max_edges);
+      (void)parse_int64_from_metadata(obj, "\"trace_num_nodes\"", bucket.trace_num_nodes);
+      (void)parse_int64_from_metadata(obj, "\"trace_num_edges\"", bucket.trace_num_edges);
+      (void)parse_string_from_metadata(obj, "\"dtype\"", bucket.dtype);
+      (void)parse_string_from_metadata(obj, "\"jit_mode\"", bucket.jit_mode);
+      bucket.core_path = (base_dir / bucket.core_path).string();
+      bundle_buckets_.push_back(bucket);
+    }
+    if (bundle_buckets_.empty()) {
+      throw std::runtime_error("No valid buckets found in manifest: " + manifest_path);
+    }
+    if (debug_bundle) {
+      std::fprintf(stderr, "[USER-MFFTORCH] parsed %zu buckets for mode=%s\n",
+                   bundle_buckets_.size(), tensor_product_mode_.c_str());
+    }
+    loaded_ = false;
+    return;
+  }
+  load_single_core_file(core_pt_path);
+}
+
+void MFFTorchEngine::prepare_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges) {
+  if (!bundle_mode_) return;
+  ensure_core_for_shape(nlocal, ntotal, nedges, true);
+}
+
 void MFFTorchEngine::warmup(int64_t N, int64_t E) {
+  if (bundle_mode_ && current_bucket_index_ < 0) return;
   if (!loaded_) return;
+  if (trace_num_nodes_ > 0) N = trace_num_nodes_;
+  if (trace_num_edges_ > 0) E = trace_num_edges_;
 
   // Suspend CUDA Graph during warmup — Kokkos background ops (cudaFreeHost
   // etc.) are incompatible with CUDA stream capture.
@@ -436,6 +751,8 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   }
 
   bool warmed = false;
+  std::string last_error;
+  warming_up_ = true;
   for (const auto& external_tensor : warmup_external_tensors) {
     for (const auto& fidelity_ids : warmup_fidelity_tensors) {
       try {
@@ -444,13 +761,21 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
         }
         warmed = true;
         break;
+      } catch (const std::exception& e) {
+        last_error = e.what();
       } catch (...) {
-        // Try the next candidate tensor shape.
+        last_error = "non-std exception";
       }
     }
     if (warmed) break;
   }
-  if (!warmed) throw std::runtime_error("MFFTorchEngine warmup failed for all supported external tensor shapes");
+  if (!warmed) {
+    warming_up_ = false;
+    if (last_error.empty()) last_error = "no error detail captured";
+    throw std::runtime_error(
+        "MFFTorchEngine warmup failed for all supported external tensor shapes; last error: " + last_error);
+  }
+  warming_up_ = false;
   if (device_.is_cuda()) torch::cuda::synchronize();
   use_cuda_graph_ = saved_cuda_graph;
 }
@@ -467,6 +792,9 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
                                   const torch::Tensor& fidelity_ids_in,
                                   bool need_energy,
                                   bool need_atom_virial) {
+  if (bundle_mode_ && !warming_up_) {
+    ensure_core_for_shape(nlocal, ntotal, edge_src_in.size(0), true);
+  }
   if (!loaded_) throw std::runtime_error("MFFTorchEngine not loaded");
   if (nlocal <= 0 || ntotal <= 0) return {};
 
@@ -744,6 +1072,12 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
     const torch::Tensor& external_tensor, const torch::Tensor& fidelity_ids,
     int64_t nlocal, int64_t ntotal, bool need_energy, bool need_atom_virial) {
 
+  const bool debug_timings = []() {
+    const char* env = std::getenv("MFF_DEBUG_TIMINGS");
+    return env && env[0] != '\0' && env[0] != '0';
+  }();
+  const auto t_start = std::chrono::steady_clock::now();
+
   auto pos = pos0.clone().detach().requires_grad_(true);
   auto edge_batch = buf_batch_.index_select(0, edge_src);
   auto edge_cells = cell.index_select(0, edge_batch);
@@ -757,6 +1091,8 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   }
 
   auto edge_vec = pos.index_select(0, edge_dst) - pos.index_select(0, edge_src) + shift_leaf;
+  if (device_.is_cuda()) torch::cuda::synchronize();
+  const auto t_after_prep = std::chrono::steady_clock::now();
 
   std::vector<torch::jit::IValue> inputs;
   inputs.reserve((core_takes_external_tensor_arg_ ? 1 : 0) + (core_takes_fidelity_arg_ ? 10 : 8));
@@ -771,7 +1107,11 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   if (core_takes_external_tensor_arg_) inputs.push_back(external_tensor);
   if (core_takes_fidelity_arg_) inputs.push_back(fidelity_ids);
 
+  maybe_dump_forward_inputs_once(inputs);
+
   auto core_out = core_.forward(inputs);
+  if (device_.is_cuda()) torch::cuda::synchronize();
+  const auto t_after_forward = std::chrono::steady_clock::now();
   torch::Tensor atom_e;
   torch::Tensor global_phys;
   torch::Tensor atom_phys;
@@ -815,8 +1155,11 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   std::vector<torch::Tensor> grad_inputs = {pos};
   if (need_atom_virial) grad_inputs.push_back(shift_leaf);
 
+  OptionalGilRelease no_gil;
   auto grads = torch::autograd::grad({E_local}, grad_inputs, {}, /*retain_graph=*/false,
                                      /*create_graph=*/false, /*allow_unused=*/true);
+  if (device_.is_cuda()) torch::cuda::synchronize();
+  const auto t_after_grad = std::chrono::steady_clock::now();
   auto forces = -grads[0];
 
   MFFOutputs out;
@@ -859,6 +1202,24 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
 
   if (need_energy) {
     out.energy = E_local.detach().to(torch::kCPU).item<double>();
+  }
+  if (debug_timings) {
+    const auto prep_ms =
+        std::chrono::duration<double, std::milli>(t_after_prep - t_start).count();
+    const auto forward_ms =
+        std::chrono::duration<double, std::milli>(t_after_forward - t_after_prep).count();
+    const auto grad_ms =
+        std::chrono::duration<double, std::milli>(t_after_grad - t_after_forward).count();
+    const auto total_ms =
+        std::chrono::duration<double, std::milli>(t_after_grad - t_start).count();
+    fprintf(stderr,
+            "[MFF_DEBUG_TIMINGS] ntotal=%lld nedges=%lld prep_ms=%.3f forward_ms=%.3f grad_ms=%.3f total_ms=%.3f\n",
+            static_cast<long long>(ntotal),
+            static_cast<long long>(edge_src.size(0)),
+            prep_ms,
+            forward_ms,
+            grad_ms,
+            total_ms);
   }
   return out;
 }

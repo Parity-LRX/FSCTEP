@@ -20,6 +20,14 @@
 - **导出**：`python -m molecular_force_field.cli.export_mliap checkpoint.pth --elements H O --tensor-product-mode spherical-save-cue`
 - **序列化限制**：cuEquivariance 内部模块可能无法 pickle，若 `torch.save` 失败，ML-IAP 无法使用该模型；可改用 `pure-cartesian-ictd` 或 `spherical-save` 作为替代
 
+补充说明：
+
+- 本文档主要针对 ML-IAP，不涉及 `USER-MFFTORCH` 的 `mff/torch` 部署细节
+- 当前 `mff-export-core` / `mff/torch` 默认规则已经更新为：
+  - `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save`：默认 `hybrid`
+  - `spherical-save-cue --native-ops`：默认 `hybrid`
+- 如需 `mff/torch` 的最新使用方式，请以 [LAMMPS_INTERFACE.md](/home/rebuild/LAMMPS_INTERFACE.md) 和 [lammps_user_mfftorch/docs/BUILD_AND_RUN.md](/home/rebuild/lammps_user_mfftorch/docs/BUILD_AND_RUN.md) 为准
+
 ## 1. 模型接口
 
 基于 `PureCartesianICTDTransformerLayer` 与 `inference_ddp.py` 的阅读：

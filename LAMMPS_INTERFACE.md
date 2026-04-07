@@ -32,6 +32,18 @@ FusedEquiTensorPot 提供三种 LAMMPS 集成方式：
      --e0-csv fitted_E0.csv --out core.pt
    ```
 
+   当前默认导出规则：
+   - `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save`：默认 `--jit-mode hybrid`
+   - `spherical-save-cue --native-ops`：默认 `--jit-mode hybrid`
+   - 其他模式：默认 `--jit-mode trace`
+
+   若需强制旧 traced 路径，可显式传：
+   ```bash
+   python -m molecular_force_field.cli.export_libtorch_core \
+     --checkpoint model.pth --elements H O --device cuda \
+     --jit-mode trace --out core.pt
+   ```
+
 2. **编译 LAMMPS**：启用 `PKG_KOKKOS`、`PKG_USER-MFFTORCH`，详见 BUILD_AND_RUN.md。
 
 3. **运行**（纯 LAMMPS，无 Python）：
@@ -94,19 +106,59 @@ pair_coeff * * /path/to/core.pt H O
 
 **模型限制**：目前支持 `pure-cartesian-ictd` 系列和 `spherical-save-cue` 模型。元素顺序、cutoff 需与导出时一致。
 
-**spherical-save-cue 导出说明**（方案 A，便携版）：
-- 默认导出为**纯 PyTorch 实现**（`force_naive`），`core.pt` 不依赖 cuEquivariance 自定义 ops，可在任意 LibTorch 环境运行。
-- 导出命令示例：
+**ICTD 系列导出说明**：
+- `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save` 现在默认导出为 `hybrid`
+- 本地 `/kk` 验证里，`hybrid` 已经可以跨不同 `ntotal` 工作，不再像早期 `trace` 那样强依赖单一 trace shape
+- 如果显式强制 `--jit-mode trace`，仍建议同时给代表性 trace：
   ```bash
   python -m molecular_force_field.cli.export_libtorch_core \
     --checkpoint model.pth --elements H O \
+    --device cuda --dtype float32 \
+    --jit-mode trace \
+    --trace-num-nodes 2048 \
+    --trace-num-edges 32000 \
+    --out core.pt
+  ```
+
+**spherical-save-cue 导出说明**：
+
+方案 A，便携版：
+- 不传 `--native-ops` 时，导出为纯 PyTorch 实现（`force_naive`），`core.pt` 不依赖 cuEquivariance 自定义 ops，可在任意 LibTorch 环境运行
+- 导出命令：
+  ```bash
+  python -m molecular_force_field.cli.export_libtorch_core \
+    --checkpoint model.pth --elements H O \
+    --device cuda --dtype float32 \
     --e0-csv fitted_E0.csv --out core.pt
   ```
-- 一键测试（dummy 模型）：
+
+方案 B，native cuEquivariance：
+- 传 `--native-ops` 后，默认导出为单 `hybrid core.pt`
+- 当前 `/kk` 已可直接使用这条路径；如需更保守的多 bucket 路线，可显式加 `--bundle-out`
+- 导出命令：
   ```bash
-  bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
-    --lmp /path/to/lmp --dummy-cue --elements H O --cutoff 5.0 --steps 200
+  python -m molecular_force_field.cli.export_libtorch_core \
+    --checkpoint model.pth --elements H O \
+    --device cuda --dtype float32 \
+    --native-ops --out core.pt
   ```
+- 运行前需设置：
+  ```bash
+  export PYTHONHOME=/root/miniconda3/envs/mff
+  export PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild
+  export MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so
+  export MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so
+  ```
+- `/kk` 启动示例：
+  ```bash
+  lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+  ```
+
+一键测试（dummy 模型）：
+```bash
+bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
+  --lmp /path/to/lmp --dummy-cue --elements H O --cutoff 5.0 --steps 200
+```
 
 ---
 

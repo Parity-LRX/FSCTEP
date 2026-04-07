@@ -2401,6 +2401,53 @@ mff-export-core \
   --out core.pt
 ```
 
+**`spherical-save-cue` 的 native cuEquivariance 导出**：
+
+如果要使用 `spherical-save-cue` 的高性能 native cuEquivariance runtime，现在有两种部署方式：
+
+- 单 `core.pt` 导出：现在是默认路径。对 `--native-ops`，如果没有显式传 `--jit-mode`，会默认使用 `hybrid`
+- bundle 导出：输出多份 `core.pt` 加 `manifest.json`，作为更保守的高级/兜底方案
+
+单 `core.pt` 导出：
+
+```bash
+mff-export-core   --checkpoint model.pth   --elements H O   --device cuda   --dtype float32   --out core.pt   --native-ops
+```
+
+可选的 `/kk` bundle 导出：
+
+```bash
+mff-export-core   --checkpoint model.pth   --elements H O   --device cuda   --dtype float32   --native-ops   --bundle-out cue_native_kk_bundle
+```
+
+如需显式覆盖 bucket：
+
+```bash
+mff-export-core   --checkpoint model.pth   --elements H O   --device cuda   --dtype float32   --native-ops   --bundle-out cue_native_kk_bundle   --trace-buckets small=648:35804,medium=1296:80000,large=4096:262144
+```
+
+`--jit-mode hybrid` 现在已经是 `spherical-save-cue --native-ops` 的默认导出路径。若要强制回退到旧的 traced 单 core 路径，可显式传 `--jit-mode trace`。
+
+native `cue` 运行时必须提供下面这组环境变量：
+
+```bash
+export PYTHONHOME=/root/miniconda3/envs/mff
+export PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild
+export MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so
+export MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so
+```
+
+当前运行建议：
+
+- plain `pair_style mff/torch` 可以直接配合 native `cue` 使用
+- `/kk` 现在默认优先尝试单 `hybrid core.pt`
+- bundle/manifest 仍然支持，但已经不是默认推荐路径
+- 如果 `mff-export-core --bundle-out ...` 没有显式传 `--trace-buckets`，则会使用默认 cue-native bucket：
+  - `small=648:35804`
+  - `medium=1296:80000`
+  - `large=4096:262144`
+- 运行时会自动选择最小可容纳的 bucket；如果后续步骤超出当前 bucket，会自动提升到更大的 bucket，但不会在同一轮运行中回退
+
 若 checkpoint 训练时已启用 ZBL，则导出的 `core.pt` 会自动包含相同的 ZBL 短程排斥修正；导出命令本身不需要额外再写 `--zbl-*` 参数。
 
 **checkpoint 自动恢复说明**：
@@ -2462,6 +2509,17 @@ velocity all create 300 42
 fix 1 all nve
 thermo 20
 run 200
+```
+
+如果是 native `spherical-save-cue`，请不要开启 Kokkos runtime，启动示例如下：
+
+```bash
+env \
+  PYTHONHOME=/root/miniconda3/envs/mff \
+  PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild \
+  MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so \
+  MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so \
+  lmp -in in.mfftorch
 ```
 
 补充说明：
@@ -3300,6 +3358,33 @@ LAMMPS LibTorch 接口（USER-MFFTORCH）通过 `pair_style mff/torch` 在 C++ �
 3. 运行：`lmp -k on g 1 -sf kk -pk kokkos newton off neigh full -in in.mfftorch`
 
 **支持模型**：`pure-cartesian-ictd` 系列、`spherical-save-cue`。完整说明见 [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md)。
+
+**`pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save` 在 `/kk` 路径下的导出说明**：
+
+这三个 ICTD 模式现在默认使用 `--jit-mode hybrid` 导出。这是推荐的 `/kk` 部署路径，因为它能明显减轻此前的 `ntotal` / trace-shape 敏感性，同时在本地测试里与 `trace` 保持数值一致。
+
+如果你显式强制 `--jit-mode trace`，TorchScript 导出仍然可能对 trace 时使用的代表性图尺寸比较敏感。如果实际部署体系明显大于默认 trace（`32` 个节点 / `256` 条边），建议导出时显式传一个更接近目标 workload 的 `trace-num`：
+
+```bash
+mff-export-core \
+  --checkpoint model.pth \
+  --elements H O \
+  --device cuda \
+  --dtype float32 \
+  --e0-csv fitted_E0.csv \
+  --trace-num-nodes 2048 \
+  --trace-num-edges 32000 \
+  --out core.pt
+```
+
+实际建议：
+
+- `hybrid` 现在是 `pure-cartesian-ictd`、`pure-cartesian-ictd-o3`、`pure-cartesian-ictd-save` 的默认导出路径
+- 这**不会改变模型数学结果**，只会影响部署图的组织方式
+- 如果你仍然使用 `trace`，较大的代表性 trace 可以在本地 `/kk` 测试里恢复 ICTD 的历史最佳部署吞吐
+- 对小体系 MD，本地 `/kk` 基准里没有观察到明显负面影响
+- 不需要精确知道生产体系大小；若强制 `trace`，通常按 `small / medium / large` 估一个代表性 workload 就够了
+- `spherical-save-cue` 走的是另一套规则：native-op 导出也默认使用 `hybrid`
 
 ### Q: 如何导出 ML-IAP 格式？
 

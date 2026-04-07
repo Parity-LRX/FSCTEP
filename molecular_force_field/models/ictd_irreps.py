@@ -1693,3 +1693,273 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                     out_l3 = out_l3 * gate[..., None, None]
                 out[(l3, p3)] = out[(l3, p3)] + out_l3
         return out
+
+
+class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
+    """
+    O(3) parity-aware channel-wise ICTD tensor product specialized for convolution-style usage.
+
+    Differences from HarmonicFullyConnectedTensorProductO3:
+      - only supports internal learnable weights + optional per-path scalar gates
+      - channel mixing is restricted to channel-wise pairing:
+          * mul_in2 == 1: geometry/scalar broadcast over input channels
+          * mul_in2 == mul_in1: elementwise channel pairing
+      - does not support generic external full weights (..., weight_numel)
+    """
+
+    def __init__(
+        self,
+        mul_in1: int,
+        mul_in2: int,
+        mul_out: int,
+        lmax: int,
+        active_irreps: List[Tuple[int, int]] | None = None,
+        internal_weights: bool = True,
+        *,
+        allowed_paths: List[Tuple[int, int, int, int, int, int]] | None = None,
+        path_policy: str = "full",
+        max_rank_other: int | None = None,
+        normalization: str = "component",
+        internal_compute_dtype: torch.dtype | None = None,
+        ictd_tp_backend: str = "auto",
+    ):
+        if not internal_weights:
+            raise ValueError("HarmonicChannelWiseTensorProductO3 only supports internal_weights=True")
+        if mul_in2 not in (1, mul_in1):
+            raise ValueError(
+                f"HarmonicChannelWiseTensorProductO3 requires mul_in2 in {{1, mul_in1={mul_in1}}}, got {mul_in2}"
+            )
+        super().__init__(
+            mul_in1=mul_in1,
+            mul_in2=mul_in2,
+            mul_out=mul_out,
+            lmax=lmax,
+            active_irreps=active_irreps,
+            internal_weights=True,
+            allowed_paths=allowed_paths,
+            path_policy=path_policy,
+            max_rank_other=max_rank_other,
+            normalization=normalization,
+            internal_compute_dtype=internal_compute_dtype,
+            ictd_tp_backend=ictd_tp_backend,
+        )
+        self.channel_mul = int(mul_in1)
+        self.channel_mode = "broadcast_rhs" if int(mul_in2) == 1 else "paired"
+        self.weight_numel = self.num_paths * self.mul_out * self.channel_mul
+        self.weight = nn.Parameter(torch.randn(self.num_paths, self.mul_out, self.channel_mul) * 0.02)
+
+    def forward(
+        self,
+        x1: Dict[Tuple[int, int], torch.Tensor],
+        x2: Dict[Tuple[int, int], torch.Tensor],
+        weights: torch.Tensor | None = None,
+    ) -> Dict[Tuple[int, int], torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+        validate_shapes = not (torch.jit.is_tracing() or torch.jit.is_scripting())
+
+        if weights is not None:
+            if validate_shapes and weights.shape[-1] != self.num_paths:
+                raise ValueError(
+                    f"HarmonicChannelWiseTensorProductO3 only accepts path gates with last-dim num_paths={self.num_paths}, "
+                    f"got {weights.shape[-1]}"
+                )
+            if weights.device != device or weights.dtype != dtype:
+                weights = weights.to(device=device, dtype=dtype)
+
+        out: Dict[Tuple[int, int], torch.Tensor] = {
+            key_ir: torch.zeros(*batch_shape, self.mul_out, 2 * key_ir[0] + 1, device=device, dtype=dtype)
+            for key_ir in self.active_irreps
+        }
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+
+        for g_idx, g in enumerate(self._groups):
+            l1 = int(g["l1"])
+            p1 = int(g["p1"])
+            l2 = int(g["l2"])
+            p2 = int(g["p2"])
+            segments = g["segments"]
+            a = x1.get((l1, p1))
+            b = x2.get((l2, p2))
+            if a is None or b is None:
+                continue
+
+            if validate_shapes and a.shape[-2] != self.channel_mul:
+                raise ValueError(
+                    f"x1[{(l1, p1)}] channel dim must be {self.channel_mul}, got {a.shape[-2]}"
+                )
+            if self.channel_mode == "broadcast_rhs":
+                if validate_shapes and b.shape[-2] != 1:
+                    raise ValueError(
+                        f"x2[{(l2, p2)}] channel dim must be 1 for broadcast_rhs mode, got {b.shape[-2]}"
+                    )
+            else:
+                if validate_shapes and b.shape[-2] != self.channel_mul:
+                    raise ValueError(
+                        f"x2[{(l2, p2)}] channel dim must be {self.channel_mul} for paired mode, got {b.shape[-2]}"
+                    )
+
+            a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+            b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            if self.channel_mode == "broadcast_rhs":
+                b_comp = b_comp[..., 0, :].unsqueeze(-2).unsqueeze(-2)
+            else:
+                b_comp = b_comp.unsqueeze(-2)
+
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = proj_list[g_idx]
+            t_mn = a_comp.unsqueeze(-1) * b_comp
+            t_flat = t_mn.reshape(*batch_shape, self.channel_mul, m1 * m2)
+            if not t_flat.is_contiguous():
+                t_flat = t_flat.contiguous()
+            y = torch.matmul(t_flat, U)
+
+            for p_idx, l3, p3, s, e in segments:
+                Wp = self.weight[int(p_idx)]
+                Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                y_seg = y[..., :, int(s): int(e)]
+                out_seg = torch.matmul(
+                    y_seg.movedim(-1, -2).contiguous(),
+                    Wp_comp.transpose(0, 1),
+                ).movedim(-1, -2)
+                out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                if weights is not None:
+                    out_seg = out_seg * weights[..., int(p_idx), None, None]
+                out[(int(l3), int(p3))] = out[(int(l3), int(p3))] + out_seg
+        return out
+
+
+class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
+    """
+    Channel-wise ICTD tensor product specialized for convolution-style usage.
+
+    Differences from HarmonicFullyConnectedTensorProduct:
+      - only supports internal learnable weights + optional per-path scalar gates
+      - channel mixing is restricted to channel-wise pairing:
+          * mul_in2 == 1: geometry/scalar broadcast over input channels
+          * mul_in2 == mul_in1: elementwise channel pairing
+      - does not support generic external full weights (..., weight_numel)
+    """
+
+    def __init__(
+        self,
+        mul_in1: int,
+        mul_in2: int,
+        mul_out: int,
+        lmax: int,
+        internal_weights: bool = True,
+        *,
+        allowed_paths: List[Tuple[int, int, int]] | None = None,
+        path_policy: str = "full",
+        max_rank_other: int | None = None,
+        normalization: str = "component",
+        internal_compute_dtype: torch.dtype | None = None,
+        ictd_tp_backend: str = "auto",
+    ):
+        if not internal_weights:
+            raise ValueError("HarmonicChannelWiseTensorProduct only supports internal_weights=True")
+        if mul_in2 not in (1, mul_in1):
+            raise ValueError(
+                f"HarmonicChannelWiseTensorProduct requires mul_in2 in {{1, mul_in1={mul_in1}}}, got {mul_in2}"
+            )
+        super().__init__(
+            mul_in1=mul_in1,
+            mul_in2=mul_in2,
+            mul_out=mul_out,
+            lmax=lmax,
+            internal_weights=True,
+            allowed_paths=allowed_paths,
+            path_policy=path_policy,
+            max_rank_other=max_rank_other,
+            normalization=normalization,
+            internal_compute_dtype=internal_compute_dtype,
+            ictd_tp_backend=ictd_tp_backend,
+        )
+        self.channel_mul = int(mul_in1)
+        self.channel_mode = "broadcast_rhs" if int(mul_in2) == 1 else "paired"
+        self.weight_numel = self.num_paths * self.mul_out * self.channel_mul
+        self.weight = nn.Parameter(torch.randn(self.num_paths, self.mul_out, self.channel_mul) * 0.02)
+
+    def forward(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+        weights: torch.Tensor | None = None,
+    ) -> Dict[int, torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+        validate_shapes = not (torch.jit.is_tracing() or torch.jit.is_scripting())
+
+        if weights is not None:
+            if validate_shapes and weights.shape[-1] != self.num_paths:
+                raise ValueError(
+                    f"HarmonicChannelWiseTensorProduct only accepts path gates with last-dim num_paths={self.num_paths}, "
+                    f"got {weights.shape[-1]}"
+                )
+            if weights.device != device or weights.dtype != dtype:
+                weights = weights.to(device=device, dtype=dtype)
+
+        out: Dict[int, torch.Tensor] = {
+            l: torch.zeros(*batch_shape, self.mul_out, 2 * l + 1, device=device, dtype=dtype)
+            for l in range(self.lmax + 1)
+        }
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+
+        for g_idx, g in enumerate(self._groups):
+            l1 = int(g["l1"])  # type: ignore[arg-type]
+            l2 = int(g["l2"])  # type: ignore[arg-type]
+            segments = g["segments"]  # type: ignore[assignment]
+            a = x1.get(l1)
+            b = x2.get(l2)
+            if a is None or b is None:
+                continue
+
+            if validate_shapes and a.shape[-2] != self.channel_mul:
+                raise ValueError(
+                    f"x1[{l1}] channel dim must be {self.channel_mul}, got {a.shape[-2]}"
+                )
+            if self.channel_mode == "broadcast_rhs":
+                if validate_shapes and b.shape[-2] != 1:
+                    raise ValueError(f"x2[{l2}] channel dim must be 1 for broadcast_rhs mode, got {b.shape[-2]}")
+            else:
+                if validate_shapes and b.shape[-2] != self.channel_mul:
+                    raise ValueError(
+                        f"x2[{l2}] channel dim must be {self.channel_mul} for paired mode, got {b.shape[-2]}"
+                    )
+
+            a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+            b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            if self.channel_mode == "broadcast_rhs":
+                b_comp = b_comp[..., 0, :].unsqueeze(-2).unsqueeze(-2)
+            else:
+                b_comp = b_comp.unsqueeze(-2)
+
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = proj_list[g_idx]
+            t_mn = a_comp.unsqueeze(-1) * b_comp
+            t_flat = t_mn.reshape(*batch_shape, self.channel_mul, m1 * m2)
+            if not t_flat.is_contiguous():
+                t_flat = t_flat.contiguous()
+            y = torch.matmul(t_flat, U)
+
+            for p_idx, l3, s, e in segments:  # type: ignore[misc]
+                Wp = self.weight[int(p_idx)]
+                Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                y_seg = y[..., :, int(s): int(e)]
+                out_seg = torch.matmul(
+                    y_seg.movedim(-1, -2).contiguous(),
+                    Wp_comp.transpose(0, 1),
+                ).movedim(-1, -2)
+                out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                if weights is not None:
+                    out_seg = out_seg * weights[..., int(p_idx), None, None]
+                out[int(l3)] = out[int(l3)] + out_seg
+        return out

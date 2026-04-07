@@ -11,6 +11,19 @@ LAMMPS 约慢 **10–15 倍**，主要瓶颈在 **fix external pf/callback** 的
 
 ---
 
+## 当前 `mff/torch` 默认导出规则
+
+- `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save`：默认 `hybrid`
+- `spherical-save-cue --native-ops`：默认 `hybrid`
+- 其他模式：默认 `trace`
+
+说明：
+
+- 对 ICTD 系列，早期的 trace-shape 调优现在主要只在你**显式强制** `--jit-mode trace` 时才需要考虑
+- 对 native `spherical-save-cue`，`/kk` 现在也可以直接使用单 `hybrid core.pt`；`bundle` 仍可作为更保守的 fallback
+
+---
+
 ## ML-IAP 性能“三大刺客”（实测 2000 原子体系）
 
 | 刺客 | 现象 | 缓解措施 |

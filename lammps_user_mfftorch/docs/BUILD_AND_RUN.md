@@ -239,9 +239,41 @@ mff-export-core \
 
 **--mode 参数**：支持 `pure-cartesian-ictd`、`pure-cartesian-ictd-save`、`spherical-save-cue`。不指定时自动从 checkpoint 读取。若 checkpoint 中保存了 `tensor_product_mode`（mff-train 会自动保存），则无需手动指定。
 
+**当前默认导出规则**：
+- `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save`：默认 `--jit-mode hybrid`
+- `spherical-save-cue --native-ops`：默认 `--jit-mode hybrid`
+- 其他模式：默认 `--jit-mode trace`
+
 **spherical-save-cue 导出（方案 A，便携版）**：
-- 默认导出为纯 PyTorch 实现，`core.pt` **无需 cuEquivariance 运行时**，可在任意 LibTorch 环境运行。
-- 导出时使用 `force_naive`，将 cuEquivariance 自定义 ops 替换为纯 PyTorch 等价实现。
+- 不传 `--native-ops` 时，默认导出为纯 PyTorch 实现，`core.pt` **无需 cuEquivariance 运行时**，可在任意 LibTorch 环境运行。
+- 此路径会使用 `force_naive`，将 cuEquivariance 自定义 ops 替换为纯 PyTorch 等价实现。
+
+**spherical-save-cue 导出（方案 B，native cuEquivariance）**：
+- 传 `--native-ops` 后，默认导出为单 `hybrid core.pt`
+- 当前 `/kk` 已可直接使用这条路径
+- 如需更保守的多 bucket 路线，可显式加 `--bundle-out`
+- 运行时必须设置：
+  ```bash
+  export PYTHONHOME=/root/miniconda3/envs/mff
+  export PYTHONPATH=/root/miniconda3/envs/mff/lib/python3.11/site-packages:/home/rebuild
+  export MFF_LIBPYTHON=/root/miniconda3/envs/mff/lib/libpython3.11.so
+  export MFF_CUSTOM_OPS_LIB=/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops/lib/libcue_ops.so:/root/miniconda3/envs/mff/lib/python3.11/site-packages/cuequivariance_ops_torch/_ext/cuequivariance_ops_torch_ext.cpython-311-x86_64-linux-gnu.so
+  ```
+
+**ICTD 系列导出说明**：
+- `pure-cartesian-ictd` / `pure-cartesian-ictd-o3` / `pure-cartesian-ictd-save` 现在默认导出为 `hybrid`
+- 若显式强制 `--jit-mode trace`，仍建议同时给代表性 trace：
+  ```bash
+  mff-export-core \
+    --checkpoint /path/to/model.pth \
+    --elements H O \
+    --device cuda \
+    --dtype float32 \
+    --jit-mode trace \
+    --trace-num-nodes 2048 \
+    --trace-num-edges 32000 \
+    --out core.pt
+  ```
 
 **max-radius 如何确定**：
 - **新训练的 checkpoint**（mff-train 会保存 max_radius）：脚本会自动从 checkpoint 读取，无需手动指定。
@@ -479,6 +511,11 @@ bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
   --cutoff 5.0 \
   --steps 200
 ```
+
+补充说明：
+- `spherical-save-cue --native-ops` 现在默认走单 `hybrid core.pt`
+- `pure-cartesian-ictd` / `pure-cartesian-ictd-save` 现在默认也走 `hybrid`
+- 如需强制旧 traced 路径，可在脚本后追加 `--jit-mode trace`
 
 ### 9.3 Feature-space FFT 训练 smoke（单卡 / 多卡）
 

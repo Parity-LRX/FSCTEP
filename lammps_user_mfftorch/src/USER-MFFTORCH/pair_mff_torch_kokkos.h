@@ -1,6 +1,7 @@
 #include "pair_mff_torch.h"
 
 #ifdef PAIR_CLASS
+#ifdef LMP_KOKKOS
 // clang-format off
 PairStyle(mff/torch/kk,PairMFFTorchKokkos<LMPDeviceType>);
 PairStyle(mff/torch/kk/device,PairMFFTorchKokkos<LMPDeviceType>);
@@ -8,6 +9,7 @@ PairStyle(mff/torch/kk/device,PairMFFTorchKokkos<LMPDeviceType>);
 PairStyle(mff/torch/kk/host,PairMFFTorchKokkos<LMPHostType>);
 #endif
 // clang-format on
+#endif
 #else
 
 #ifndef LMP_PAIR_MFF_TORCH_KOKKOS_H

@@ -357,6 +357,9 @@ class _CueChannelwiseEdgeConv(nn.Module):
         )
 
         self._force_naive = force_naive
+        # During TorchScript export, keep the fast cue kernels but avoid
+        # baking the output node count into the traced scatter path.
+        self._export_dynamic_scatter = True
 
     def forward(
         self,
@@ -379,7 +382,11 @@ class _CueChannelwiseEdgeConv(nn.Module):
 
         x = self.linear_up(node_feats)
 
-        if self._force_naive:
+        use_dynamic_scatter = self._force_naive or (
+            self._export_dynamic_scatter and (torch.jit.is_tracing() or torch.jit.is_scripting())
+        )
+
+        if use_dynamic_scatter:
             # Decompose gather-TP-scatter so that torch.jit.trace keeps
             # the output size dynamic (node_feats.size(0) is symbolic).
             x_src = x[senders]
@@ -395,13 +402,13 @@ class _CueChannelwiseEdgeConv(nn.Module):
             )
         msg = self.linear(msg)
 
-        if self._force_naive:
-            avg = senders.size(0) / max(node_feats.size(0), 1)
+        if use_dynamic_scatter:
+            avg = (msg.new_ones(()) * senders.shape[0]) / node_feats.shape[0]
         elif self.avg_num_neighbors is None:
-            avg = float(senders.numel()) / float(max(int(num_nodes), 1))
+            avg = msg.new_tensor(float(senders.numel()) / float(max(int(num_nodes), 1)))
         else:
-            avg = self.avg_num_neighbors
-        msg = msg / max(avg, 1e-8)
+            avg = msg.new_tensor(float(self.avg_num_neighbors))
+        msg = msg / torch.clamp_min(avg, 1e-8)
         return msg
 
 

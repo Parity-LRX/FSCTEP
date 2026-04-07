@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <torch/script.h>
 #include <torch/torch.h>
@@ -33,6 +34,7 @@ class MFFTorchEngine {
   MFFTorchEngine() = default;
 
   void load_core(const std::string& core_pt_path, const std::string& device_str);
+  void prepare_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges);
 
   // Warmup: run one dummy forward+backward to trigger JIT compilation and CUDA caching.
   void warmup(int64_t N = 32, int64_t E = 256);
@@ -66,6 +68,9 @@ class MFFTorchEngine {
   double long_range_screening() const { return long_range_screening_; }
   double long_range_softening() const { return long_range_softening_; }
   double long_range_energy_scale() const { return long_range_energy_scale_; }
+  const std::string& tensor_product_mode() const { return tensor_product_mode_; }
+  bool prefers_kokkos_host_staging() const { return tensor_product_mode_ == "spherical-save-cue"; }
+  bool is_bundle_manifest() const { return bundle_mode_; }
 
   MFFOutputs compute(int64_t nlocal, int64_t ntotal,
                      const torch::Tensor& pos,
@@ -80,8 +85,28 @@ class MFFTorchEngine {
                      bool need_atom_virial = false);
 
  private:
+  struct BucketSpec {
+    std::string name;
+    std::string core_path;
+    int64_t max_nodes = 0;
+    int64_t max_edges = 0;
+    int64_t trace_num_nodes = 0;
+    int64_t trace_num_edges = 0;
+    std::string dtype;
+    std::string jit_mode;
+  };
+
+  void load_single_core_file(const std::string& core_pt_path);
+  void ensure_core_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges, bool warmup_on_switch);
+
   torch::jit::script::Module core_;
   bool loaded_ = false;
+  bool bundle_mode_ = false;
+  std::string bundle_manifest_path_;
+  std::vector<BucketSpec> bundle_buckets_;
+  int current_bucket_index_ = -1;
+  bool bundle_warned_oversize_ = false;
+  bool warming_up_ = false;
   bool core_takes_external_tensor_arg_ = false;
   bool core_requires_external_tensor_ = false;
   bool core_takes_fidelity_arg_ = false;
@@ -98,6 +123,7 @@ class MFFTorchEngine {
   int64_t reciprocal_source_slab_padding_factor_ = 2;
   std::string long_range_green_mode_ = "poisson";
   std::string long_range_runtime_backend_ = "none";
+  std::string tensor_product_mode_;
   std::string long_range_source_kind_ = "none";
   int64_t long_range_source_channels_ = 0;
   std::string long_range_source_layout_ = "none";
@@ -110,6 +136,8 @@ class MFFTorchEngine {
   double long_range_screening_ = 0.0;
   double long_range_softening_ = 1.0e-6;
   double long_range_energy_scale_ = 1.0;
+  int64_t trace_num_nodes_ = 0;
+  int64_t trace_num_edges_ = 0;
 
   torch::Device device_{torch::kCPU};
 

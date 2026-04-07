@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -104,12 +105,58 @@ def _e0_lut_from_keys_values(
     return lut.to(device=device)
 
 
+_DEFAULT_CUE_NATIVE_TRACE_BUCKETS: list[tuple[str, int, int]] = [
+    ("small", 648, 35804),
+    ("medium", 1296, 80000),
+    ("large", 4096, 262144),
+]
+
+
+def _default_trace_num_nodes_edges(mode: str) -> tuple[int, int]:
+    if mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save"}:
+        return 2048, 32000
+    return 32, 256
+
+
+def _parse_trace_buckets(spec: str | None, *, mode: str, native_ops: bool) -> list[tuple[str, int, int]]:
+    if spec is None or not str(spec).strip():
+        if mode == "spherical-save-cue" and native_ops:
+            return list(_DEFAULT_CUE_NATIVE_TRACE_BUCKETS)
+        return []
+    buckets: list[tuple[str, int, int]] = []
+    raw_parts = [part.strip() for part in str(spec).split(",") if part.strip()]
+    for idx, part in enumerate(raw_parts):
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid trace bucket {part!r}; expected nodes:edges or name=nodes:edges"
+            )
+        name = f"bucket{idx + 1}"
+        sizes = part
+        if "=" in part:
+            left, right = part.split("=", 1)
+            name = left.strip()
+            sizes = right.strip()
+        nodes_s, edges_s = [x.strip() for x in sizes.split(":", 1)]
+        nodes = int(nodes_s)
+        edges = int(edges_s)
+        if nodes <= 0 or edges <= 0:
+            raise ValueError(f"Trace bucket must be positive, got {part!r}")
+        buckets.append((name, nodes, edges))
+    return buckets
+
+
 class _E0WrappedModel(torch.nn.Module):
     """Wrap an eager model to add E0(Z) into per-atom energies before tracing."""
 
     def __init__(self, model: torch.nn.Module, e0_lut: torch.Tensor):
         super().__init__()
         self.model = model
+        self.match_e0_to_output = os.environ.get("MFF_EXPORT_E0_MATCH_OUTPUT", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
         conv = getattr(model, "e3_conv_emb", None)
         ext_rank = getattr(model, "external_tensor_rank", None)
         if ext_rank is None:
@@ -166,9 +213,16 @@ class _E0WrappedModel(torch.nn.Module):
         if fidelity_ids is not None:
             kwargs["fidelity_ids"] = fidelity_ids
         out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
+        atom_energy = out[0] if isinstance(out, tuple) else out
         # E0 lookup: e0_lut[Z]
         e0 = self.e0_lut.index_select(0, A.to(torch.long))
-        atom_energy = out[0] if isinstance(out, tuple) else out
+        # Some exported backends may return per-atom energy only for the leading
+        # physical atoms even when A includes extra ghost entries from the
+        # deployment runtime. Match the E0 lookup length to the actual output
+        # after the dynamic gather, so the source length is not frozen by the
+        # trace-time node count.
+        if self.match_e0_to_output:
+            e0 = e0.narrow(0, 0, atom_energy.size(0))
         # Broadcast e0 to match out (usually (N,1)).
         if atom_energy.dim() == 2:
             e0 = e0.unsqueeze(1)
@@ -246,7 +300,176 @@ class _FixedFidelityWrappedModel(torch.nn.Module):
         return self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, **kwargs)
 
 
-def export_core(
+@torch.jit.interface
+class _ExportOnlyTraceCoreInterface:
+    def forward(
+        self,
+        pos: torch.Tensor,
+        A: torch.Tensor,
+        batch: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_shifts: torch.Tensor,
+        cell: torch.Tensor,
+        edge_vec: torch.Tensor,
+        external_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pass
+
+
+@torch.jit.interface
+class _ExportOnlyTraceCoreInterfaceWithFidelity:
+    def forward(
+        self,
+        pos: torch.Tensor,
+        A: torch.Tensor,
+        batch: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_shifts: torch.Tensor,
+        cell: torch.Tensor,
+        edge_vec: torch.Tensor,
+        external_tensor: torch.Tensor,
+        fidelity_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pass
+
+
+class _ExportOnlyTraceCoreAdapter(torch.nn.Module):
+    """Script-friendly positional export wrapper around a traced numeric core."""
+
+    def __init__(self, core):
+        super().__init__()
+        self.core = torch.jit.Attribute(core, _ExportOnlyTraceCoreInterface)
+
+    def forward(
+        self,
+        pos: torch.Tensor,
+        A: torch.Tensor,
+        batch: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_shifts: torch.Tensor,
+        cell: torch.Tensor,
+        edge_vec: torch.Tensor,
+        external_tensor: torch.Tensor,
+    ):
+        return self.core.forward(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor)
+
+
+class _ExportOnlyTraceCoreAdapterWithFidelity(torch.nn.Module):
+    """Script-friendly positional export wrapper around a traced numeric core."""
+
+    def __init__(self, core):
+        super().__init__()
+        self.core = torch.jit.Attribute(core, _ExportOnlyTraceCoreInterfaceWithFidelity)
+
+    def forward(
+        self,
+        pos: torch.Tensor,
+        A: torch.Tensor,
+        batch: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_shifts: torch.Tensor,
+        cell: torch.Tensor,
+        edge_vec: torch.Tensor,
+        external_tensor: torch.Tensor,
+        fidelity_ids: torch.Tensor,
+    ):
+        return self.core.forward(
+            pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor, fidelity_ids
+        )
+
+
+def _trace_model_for_export(
+    model: torch.nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    export_reciprocal_source: bool = False,
+    trace_num_nodes: int,
+    trace_num_edges: int,
+    jit_mode: str = "trace",
+) -> torch.jit.ScriptModule:
+    from molecular_force_field.interfaces.lammps_mliap import (
+        _TorchScriptEdgeVecCore,
+        _TorchScriptEdgeVecCoreWithFidelity,
+        _resolve_model_external_tensor_total_numel,
+    )
+
+    model.eval()
+    num_fidelity_levels = int(getattr(model, "num_fidelity_levels", 0) or 0)
+    fixed_fidelity_id = getattr(model, "fixed_fidelity_id", None)
+    runtime_fidelity = num_fidelity_levels > 0 and fixed_fidelity_id is None
+    core_cls = _TorchScriptEdgeVecCoreWithFidelity if runtime_fidelity else _TorchScriptEdgeVecCore
+    core = core_cls(model, export_reciprocal_source=export_reciprocal_source).to(device=device)
+
+    ext_total_numel = _resolve_model_external_tensor_total_numel(model)
+    N = max(int(trace_num_nodes), 1)
+    E = max(int(trace_num_edges), 1)
+    pos = torch.zeros(N, 3, device=device, dtype=dtype)
+    A = torch.ones(N, device=device, dtype=torch.long)
+    batch = torch.zeros(N, device=device, dtype=torch.long)
+    edge_src = torch.randint(0, N, (E,), device=device, dtype=torch.long)
+    edge_dst = torch.randint(0, N, (E,), device=device, dtype=torch.long)
+    edge_shifts = torch.zeros(E, 3, device=device, dtype=dtype)
+    cell = (torch.eye(3, device=device, dtype=dtype).unsqueeze(0) * 100.0)
+    edge_vec = torch.randn(E, 3, device=device, dtype=dtype)
+    external_tensor = (
+        torch.empty(0, device=device, dtype=dtype)
+        if ext_total_numel <= 0
+        else torch.zeros(ext_total_numel, device=device, dtype=dtype)
+    )
+    fidelity_ids = torch.zeros(1, device=device, dtype=torch.long)
+
+    try:
+        with torch.no_grad():
+            for m in core.modules():
+                prewarm = getattr(m, "prewarm_caches", None)
+                if callable(prewarm):
+                    prewarm(device=device, dtype=dtype)
+            if runtime_fidelity:
+                _ = core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor, fidelity_ids)
+            else:
+                _ = core(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor)
+    except Exception:
+        pass
+
+    trace_inputs = (
+        (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor, fidelity_ids)
+        if runtime_fidelity
+        else (pos, A, batch, edge_src, edge_dst, edge_shifts, cell, edge_vec, external_tensor)
+    )
+    core_ts = torch.jit.trace(core, trace_inputs, check_trace=False, strict=False)
+    try:
+        core_ts = torch.jit.freeze(core_ts.eval())
+    except Exception:
+        core_ts = core_ts.eval()
+    if jit_mode == "trace":
+        return core_ts
+    if jit_mode != "hybrid":
+        raise ValueError(f"Unsupported jit_mode={jit_mode!r}; expected 'trace' or 'hybrid'")
+    adapter: torch.nn.Module
+    if runtime_fidelity:
+        adapter = _ExportOnlyTraceCoreAdapterWithFidelity(core_ts)
+    else:
+        adapter = _ExportOnlyTraceCoreAdapter(core_ts)
+    try:
+        hybrid_ts = torch.jit.script(adapter)
+    except Exception as exc:
+        raise RuntimeError(
+            "jit_mode=hybrid is still experimental for this model/backend combination; "
+            "TorchScript rejected the export-only wrapper around the traced numeric core."
+        ) from exc
+    try:
+        hybrid_ts = torch.jit.freeze(hybrid_ts.eval())
+    except Exception:
+        hybrid_ts = hybrid_ts.eval()
+    return hybrid_ts
+
+
+def _export_single_core(
     *,
     checkpoint: str,
     elements: List[str],
@@ -261,10 +484,12 @@ def export_core(
     native_ops: bool = False,
     export_reciprocal_source: bool = False,
     export_fidelity_id: int | None = None,
-) -> None:
+    trace_num_nodes: int | None = None,
+    trace_num_edges: int | None = None,
+    jit_mode: str = "trace",
+) -> dict:
     from molecular_force_field.interfaces.lammps_mliap import (
         LAMMPS_MLIAP_MFF,
-        _maybe_torchscript_trace_model,
         _resolve_model_external_tensor_rank,
         _resolve_model_external_tensor_specs,
         _resolve_model_external_tensor_total_numel,
@@ -303,6 +528,11 @@ def export_core(
             f"Mode {mode!r} does not support TorchScript export."
             f"\nSupported modes: {_ts_supported}"
         )
+    default_nodes, default_edges = _default_trace_num_nodes_edges(mode)
+    if trace_num_nodes is None:
+        trace_num_nodes = default_nodes
+    if trace_num_edges is None:
+        trace_num_edges = default_edges
 
     # Load atomic E0 from preprocessing output if requested.
     atomic_energy_keys = None
@@ -392,16 +622,15 @@ def export_core(
         model_eager = _E0WrappedModel(model_eager, lut).to(device=torch.device(trace_device))
 
     # Trace to TorchScript core (edge_vec positional arg) and export its ScriptModule.
-    ts_model = _maybe_torchscript_trace_model(
+    core = _trace_model_for_export(
         model_eager,
         device=torch.device(trace_device),
         dtype=actual_dtype,
-        enable=True,
         export_reciprocal_source=export_reciprocal_source,
+        trace_num_nodes=int(trace_num_nodes),
+        trace_num_edges=int(trace_num_edges),
+        jit_mode=jit_mode,
     )
-    core = getattr(ts_model, "core", None)
-    if core is None or not isinstance(core, torch.jit.ScriptModule):
-        raise RuntimeError("Failed to obtain TorchScript core module (trace failed)")
 
     os.makedirs(os.path.dirname(os.path.abspath(out_pt)), exist_ok=True)
     core.eval()
@@ -445,6 +674,9 @@ def export_core(
             "float32" if mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-save"} else str(actual_dtype).replace("torch.", "")
         ),
         "embed_e0": bool(embed_e0),
+        "trace_num_nodes": int(trace_num_nodes),
+        "trace_num_edges": int(trace_num_edges),
+        "jit_mode": str(jit_mode),
         "export_reciprocal_source": bool(export_reciprocal_source),
         "e0_source": (str(e0_csv) if e0_csv else "from_checkpoint_or_default"),
         "forward_signature": [
@@ -517,12 +749,128 @@ def export_core(
             "Forces: dE/d(pos) computed via autograd on C++ side.",
             "Loadable: C++ torch::jit::load(path).",
             "external_tensor is required at runtime when external_tensor_rank is not null.",
+            "jit_mode=hybrid is experimental and should be benchmarked before production use.",
         ],
     }
     meta_path = out_pt + ".json"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"Wrote metadata: {meta_path}")
+    return meta
+
+
+def export_core(
+    *,
+    checkpoint: str,
+    elements: List[str],
+    device: str,
+    max_radius: Optional[float],
+    num_interaction: Optional[int],
+    out_pt: str,
+    tensor_product_mode: Optional[str] = None,
+    force_dtype: Optional[torch.dtype] = None,
+    embed_e0: bool = True,
+    e0_csv: Optional[str] = None,
+    native_ops: bool = False,
+    export_reciprocal_source: bool = False,
+    export_fidelity_id: int | None = None,
+    trace_num_nodes: int | None = None,
+    trace_num_edges: int | None = None,
+    bundle_out: str | None = None,
+    trace_buckets: str | None = None,
+    jit_mode: str | None = None,
+) -> None:
+    ckpt_peek = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    mode = tensor_product_mode if tensor_product_mode is not None else ckpt_peek.get("tensor_product_mode", None)
+    del ckpt_peek
+    if mode is None:
+        raise ValueError("tensor_product_mode not saved in checkpoint; specify via --mode")
+
+    effective_jit_mode = str(jit_mode) if jit_mode is not None else (
+        "hybrid"
+        if (
+            (mode == "spherical-save-cue" and native_ops)
+            or mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save"}
+        )
+        else "trace"
+    )
+
+    bucket_defs = _parse_trace_buckets(trace_buckets, mode=mode, native_ops=bool(native_ops))
+    if bundle_out is None:
+        _export_single_core(
+            checkpoint=checkpoint,
+            elements=elements,
+            device=device,
+            max_radius=max_radius,
+            num_interaction=num_interaction,
+            out_pt=out_pt,
+            tensor_product_mode=mode,
+            force_dtype=force_dtype,
+            embed_e0=embed_e0,
+            e0_csv=e0_csv,
+            native_ops=native_ops,
+            export_reciprocal_source=export_reciprocal_source,
+            export_fidelity_id=export_fidelity_id,
+            trace_num_nodes=trace_num_nodes,
+            trace_num_edges=trace_num_edges,
+            jit_mode=effective_jit_mode,
+        )
+        return
+
+    bundle_dir = Path(bundle_out).resolve()
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    if not bucket_defs:
+        n_default, e_default = _default_trace_num_nodes_edges(mode)
+        bucket_defs = [("default", int(trace_num_nodes or n_default), int(trace_num_edges or e_default))]
+
+    variant = "cue-native-kk" if mode == "spherical-save-cue" and native_ops else mode
+    bucket_entries: list[dict] = []
+    for name, nodes, edges in bucket_defs:
+        core_name = f"core_{name}.pt"
+        core_path = bundle_dir / core_name
+        meta = _export_single_core(
+            checkpoint=checkpoint,
+            elements=elements,
+            device=device,
+            max_radius=max_radius,
+            num_interaction=num_interaction,
+            out_pt=str(core_path),
+            tensor_product_mode=mode,
+            force_dtype=force_dtype,
+            embed_e0=embed_e0,
+            e0_csv=e0_csv,
+            native_ops=native_ops,
+            export_reciprocal_source=export_reciprocal_source,
+            export_fidelity_id=export_fidelity_id,
+            trace_num_nodes=nodes,
+            trace_num_edges=edges,
+            jit_mode=effective_jit_mode,
+        )
+        bucket_entries.append(
+            {
+                "name": str(name),
+                "core_path": core_name,
+                "max_nodes": int(nodes),
+                "max_edges": int(edges),
+                "dtype": str(meta["dtype"]),
+                "trace_num_nodes": int(meta["trace_num_nodes"]),
+                "trace_num_edges": int(meta["trace_num_edges"]),
+                "jit_mode": str(meta.get("jit_mode", effective_jit_mode)),
+            }
+        )
+
+    manifest = {
+        "version": 1,
+        "tensor_product_mode": mode,
+        "variant": variant,
+        "selector": "smallest-fitting",
+        "jit_mode": str(effective_jit_mode),
+        "buckets": bucket_entries,
+    }
+    manifest_path = bundle_dir / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f"Wrote bundle manifest: {manifest_path}")
 
 
 def main() -> None:
@@ -561,6 +909,21 @@ def main() -> None:
     p.add_argument("--export-fidelity-id", type=int, default=None,
                    help="For multi-fidelity checkpoints, freeze a single graph-level fidelity id into the exported core.pt. "
                         "If omitted, core.pt keeps a runtime fidelity_ids input.")
+    p.add_argument("--trace-num-nodes", type=int, default=None,
+                   help="Representative node count used during TorchScript tracing. "
+                        "Default: 2048 for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save, else 32.")
+    p.add_argument("--trace-num-edges", type=int, default=None,
+                   help="Representative edge count used during TorchScript tracing. "
+                        "Default: 32000 for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save, else 256.")
+    p.add_argument("--bundle-out", type=str, default=None,
+                   help="Export a multi-core bundle directory instead of a single core.pt. "
+                        "Writes per-bucket cores plus manifest.json.")
+    p.add_argument("--trace-buckets", type=str, default=None,
+                   help="Comma-separated bucket list for --bundle-out. Format: nodes:edges or name=nodes:edges. "
+                        "Default for spherical-save-cue --native-ops: small=648:35804,medium=1296:80000,large=4096:262144.")
+    p.add_argument("--jit-mode", type=str, default=None, choices=["trace", "hybrid"],
+                   help="Export mode. Default: hybrid for spherical-save-cue with --native-ops and for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save; else trace. "
+                        "hybrid scripts an export-only wrapper around the traced numeric core.")
     p.add_argument("--out", type=str, default="core.pt", help="Output TorchScript file path")
     args = p.parse_args()
 
@@ -581,6 +944,11 @@ def main() -> None:
         native_ops=bool(args.native_ops),
         export_reciprocal_source=bool(args.export_reciprocal_source),
         export_fidelity_id=(int(args.export_fidelity_id) if args.export_fidelity_id is not None else None),
+        trace_num_nodes=(int(args.trace_num_nodes) if args.trace_num_nodes is not None else None),
+        trace_num_edges=(int(args.trace_num_edges) if args.trace_num_edges is not None else None),
+        bundle_out=args.bundle_out,
+        trace_buckets=args.trace_buckets,
+        jit_mode=(str(args.jit_mode) if args.jit_mode is not None else None),
     )
 
 

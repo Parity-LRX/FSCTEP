@@ -29,8 +29,8 @@ import math
 from molecular_force_field.models.pure_cartesian_ictd_layers import PhysicalTensorICTDEmbedding
 from molecular_force_field.models.long_range import build_feature_spectral_module, build_long_range_module
 from molecular_force_field.models.ictd_irreps import (
+    HarmonicChannelWiseTensorProduct,
     HarmonicElementwiseProduct,
-    HarmonicFullyConnectedTensorProduct,
     canonical_irrep_parity_sign,
     direction_harmonics,
     direction_harmonics_all,
@@ -263,7 +263,7 @@ class ICTDIrrepsE3Conv(nn.Module):
             nn.Embedding(self.num_fidelity_levels, output_size) if self.num_fidelity_levels > 0 else None
         )
 
-        self.tp2 = HarmonicFullyConnectedTensorProduct(
+        self.tp2 = HarmonicChannelWiseTensorProduct(
             mul_in1=output_size,
             mul_in2=output_size,
             mul_out=channels_out,
@@ -679,7 +679,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.tp2_layers = nn.ModuleList()
         self.fc2_layers = nn.ModuleList()
         for _ in range(self.num_interaction - 1):
-            tp2 = HarmonicFullyConnectedTensorProduct(
+            tp2 = HarmonicChannelWiseTensorProduct(
                 mul_in1=self.channels,
                 mul_in2=1,
                 mul_out=self.channels,

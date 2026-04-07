@@ -17,8 +17,8 @@ from e3nn.math import soft_one_hot_linspace
 
 from molecular_force_field.models.long_range import build_feature_spectral_module, build_long_range_module
 from molecular_force_field.models.ictd_irreps import (
+    HarmonicChannelWiseTensorProductO3,
     HarmonicElementwiseProductO3,
-    HarmonicFullyConnectedTensorProductO3,
     canonical_irrep_parity_sign,
     parity_letter_to_sign,
     parity_sign_to_letter,
@@ -341,7 +341,7 @@ class ICTDO3E3Conv(nn.Module):
         self.fidelity_embedding = (
             nn.Embedding(self.num_fidelity_levels, output_size) if self.num_fidelity_levels > 0 else None
         )
-        self.tp2 = HarmonicFullyConnectedTensorProductO3(
+        self.tp2 = HarmonicChannelWiseTensorProductO3(
             mul_in1=output_size,
             mul_in2=output_size,
             mul_out=channels_out,
@@ -727,7 +727,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
         self.tp2_layers = nn.ModuleList()
         self.fc2_layers = nn.ModuleList()
         for _ in range(self.num_interaction - 1):
-            tp2 = HarmonicFullyConnectedTensorProductO3(
+            tp2 = HarmonicChannelWiseTensorProductO3(
                 mul_in1=self.channels,
                 mul_in2=1,
                 mul_out=self.channels,

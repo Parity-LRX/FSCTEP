@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+else
+  echo "python/python3 not found in PATH" >&2
+  exit 1
+fi
+
 usage() {
   cat <<'EOF'
 One-click GPU test:
@@ -282,6 +291,14 @@ Options:
   --elements ...      Element order (LAMMPS type order)
   --e0-csv <path>     fitted_E0.csv (Atom,E0 columns); embed into core.pt if provided
   --dtype float32|float64   core.pt export precision (default: follow pth)
+  --trace-num-nodes <N>     Representative node count used during TorchScript export trace
+                            (default for --dummy-ictd / --dummy-ictd-o3 and pure-cartesian-ictd / -o3 / -save: 2048)
+  --trace-num-edges <E>     Representative edge count used during TorchScript export trace
+                            (default for --dummy-ictd / --dummy-ictd-o3 and pure-cartesian-ictd / -o3 / -save: 32000)
+  --bundle-out <dir>        Export a multi-core bundle directory with manifest.json
+  --trace-buckets <spec>    Bundle buckets: nodes:edges or name=nodes:edges,...
+  --jit-mode <mode>         Export mode override. Default: hybrid for native spherical-save-cue and
+                            pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save, else trace
   --cutoff <A>        pair_style cutoff (Angstrom)
   --neighbor-skin <A> LAMMPS neighbor skin distance (default 1.0)
   --mode <mode>       Model mode for export (e.g. spherical-save-cue); else from checkpoint
@@ -520,6 +537,11 @@ TREE_FMM_ASSUME_GPU_AWARE_MPI=0
 TREE_FMM_DEVICE_LOCAL_EVAL=0
 TREE_FMM_REUSE_POSITION_TOL=""
 TREE_FMM_THROUGHPUT_AUTO_TUNED=0
+TRACE_NUM_NODES=""
+TRACE_NUM_EDGES=""
+BUNDLE_OUT=""
+TRACE_BUCKETS=""
+JIT_MODE="trace"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -538,6 +560,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --e0-csv) E0CSV="${2:-}"; shift 2;;
     --dtype) DTYPE="${2:-}"; shift 2;;
+    --trace-num-nodes) TRACE_NUM_NODES="${2:-}"; shift 2;;
+    --trace-num-edges) TRACE_NUM_EDGES="${2:-}"; shift 2;;
+    --bundle-out) BUNDLE_OUT="${2:-}"; shift 2;;
+    --trace-buckets) TRACE_BUCKETS="${2:-}"; shift 2;;
+    --jit-mode) JIT_MODE="${2:-}"; shift 2;;
     --cutoff) CUTOFF="${2:-}"; shift 2;;
     --neighbor-skin) NEIGHBOR_SKIN="${2:-}"; shift 2;;
     --mode) MODE="${2:-}"; shift 2;;
@@ -729,6 +756,29 @@ fi
 if [[ $DUMMY_ICTD_O3 -eq 1 && ($TEST_LONG_RANGE -eq 1 || $TEST_RECIPROCAL_LONG_RANGE -eq 1 || $TEST_TREE_FMM_LONG_RANGE -eq 1 || $TEST_ISOLATED_FAR_FIELD -eq 1 || $TEST_ISOLATED_FAR_FIELD_V2 -eq 1 || $TEST_FEATURE_SPECTRAL_FFT -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_SLAB -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_SLAB_Z_OPEN -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_TRICLINIC -eq 1 || $TEST_FEATURE_SPECTRAL_FFT_MPI_CONSISTENCY -eq 1 || $COMPARE_THROUGHPUT -eq 1) ]]; then
   echo "--dummy-ictd-o3 currently supports the core field/phys smoke paths only; long-range and throughput modes still use --dummy-ictd"
   exit 2
+fi
+EFFECTIVE_TRACE_MODE="$MODE"
+if [[ -z "$EFFECTIVE_TRACE_MODE" && -n "$PTH" && -f "$PTH" ]]; then
+  EFFECTIVE_TRACE_MODE="$("$PYTHON_BIN" - "$PTH" <<'PY'
+import sys
+import torch
+
+pth = sys.argv[1]
+try:
+    ckpt = torch.load(pth, map_location="cpu", weights_only=False)
+except Exception:
+    print("")
+    raise SystemExit(0)
+mode = ckpt.get("tensor_product_mode", "")
+print(mode if isinstance(mode, str) else "")
+PY
+)"
+fi
+if [[ -z "$TRACE_NUM_NODES" && ("$EFFECTIVE_TRACE_MODE" == "pure-cartesian-ictd" || "$EFFECTIVE_TRACE_MODE" == "pure-cartesian-ictd-o3" || "$EFFECTIVE_TRACE_MODE" == "pure-cartesian-ictd-save" || $DUMMY_ICTD -eq 1 || $DUMMY_ICTD_O3 -eq 1) ]]; then
+  TRACE_NUM_NODES="2048"
+fi
+if [[ -z "$TRACE_NUM_EDGES" && ("$EFFECTIVE_TRACE_MODE" == "pure-cartesian-ictd" || "$EFFECTIVE_TRACE_MODE" == "pure-cartesian-ictd-o3" || "$EFFECTIVE_TRACE_MODE" == "pure-cartesian-ictd-save" || $DUMMY_ICTD -eq 1 || $DUMMY_ICTD_O3 -eq 1) ]]; then
+  TRACE_NUM_EDGES="32000"
 fi
 MD_ONLY_MODE=0
 if [[ $FORCE_MD_RUN -eq 1 || $COMPARE_THROUGHPUT -eq 1 ]]; then
@@ -954,8 +1004,9 @@ if [[ $FINAL_PBC_TEST_COUNT -gt 1 ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 if [[ -z "$OUT_DIR" ]]; then
-  OUT_DIR="$(python - <<'PY'
+  OUT_DIR="$($PYTHON_BIN - <<'PY'
 import tempfile
 print(tempfile.mkdtemp(prefix="mff-corept-lmp-"))
 PY
@@ -966,7 +1017,7 @@ mkdir -p "$OUT_DIR"
 CORE_PT="$OUT_DIR/core.pt"
 
 if [[ -n "$TREE_FMM_REUSE_POSITION_TOL" ]]; then
-  python - <<'PY' "$TREE_FMM_REUSE_POSITION_TOL"
+  "$PYTHON_BIN" - <<'PY' "$TREE_FMM_REUSE_POSITION_TOL"
 import sys
 value = float(sys.argv[1])
 if value < 0.0:
@@ -1089,7 +1140,7 @@ run_throughput_compare() {
     return 1
   fi
 
-  python - <<'PY' "$base_log" "$enabled_log"
+  "$PYTHON_BIN" - <<'PY' "$base_log" "$enabled_log"
 import re
 import sys
 from pathlib import Path
@@ -1221,7 +1272,7 @@ if [[ -z "$PTH" && $DUMMY_ICTD -eq 1 ]]; then
   elif [[ ${#FIELD_VALUES[@]} -eq 3 ]]; then
     EXTERNAL_IRREP_PY="'1o'"
   fi
-  python - <<PY
+  "$PYTHON_BIN" - <<PY
 import torch
 from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd
 out = r"$PTH"
@@ -1345,7 +1396,7 @@ if [[ -z "$PTH" && $DUMMY_ICTD_O3 -eq 1 ]]; then
     EXTERNAL_IRREP_PY="'1o'"
     O3_ACTIVE_IRREPS_PY="'0e,1o,2e'"
   fi
-  python - <<PY
+  "$PYTHON_BIN" - <<PY
 import torch
 from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_pure_cartesian_ictd_o3
 out = r"$PTH"
@@ -1393,7 +1444,7 @@ if [[ -z "$PTH" && $DUMMY_CUE -eq 1 ]]; then
     echo "[0/3] Generating spherical-save-cue dummy checkpoint"
   fi
   PTH="$OUT_DIR/dummy_cue.pth"
-  python - <<PY
+  "$PYTHON_BIN" - <<PY
 import torch
 from molecular_force_field.test.self_test_lammps_potential import _make_dummy_checkpoint_spherical_save_cue
 out = r"$PTH"
@@ -1442,12 +1493,16 @@ PY
 fi
 
 echo "[1/3] Exporting core.pt (TorchScript, embed E0 optional)"
+if [[ -n "$BUNDLE_OUT" ]]; then
+  CORE_PT="$BUNDLE_OUT"
+fi
+
 if [[ ($DUMMY_ICTD -eq 1 || $DUMMY_CUE -eq 1) && -z "$E0CSV" && $DUMMY_E0 -eq 1 ]]; then
   # Generate simple fitted_E0.csv (Atom,E0) for embed E0 test
   E0CSV="$OUT_DIR/fitted_E0.csv"
   echo "Atom,E0" > "$E0CSV"
   # For H/O etc. integration test; unknown elements skipped (E0=0).
-  python - "${ELEMENTS[@]}" <<'PY' >> "$E0CSV"
+  "$PYTHON_BIN" - "${ELEMENTS[@]}" <<'PY' >> "$E0CSV"
 import sys
 
 sym2Z = {
@@ -1474,15 +1529,20 @@ EXPORT_ARGS=(--checkpoint "$PTH" --elements "${ELEMENTS[@]}" --device cuda --max
 if [[ -n "$MODE" ]]; then EXPORT_ARGS+=(--mode "$MODE"); fi
 if [[ $NATIVE_OPS -eq 1 ]]; then EXPORT_ARGS+=(--native-ops); fi
 if [[ -n "$DTYPE" ]]; then EXPORT_ARGS+=(--dtype "$DTYPE"); fi
+if [[ -n "$TRACE_NUM_NODES" ]]; then EXPORT_ARGS+=(--trace-num-nodes "$TRACE_NUM_NODES"); fi
+if [[ -n "$TRACE_NUM_EDGES" ]]; then EXPORT_ARGS+=(--trace-num-edges "$TRACE_NUM_EDGES"); fi
+if [[ -n "$BUNDLE_OUT" ]]; then EXPORT_ARGS+=(--bundle-out "$BUNDLE_OUT"); fi
+if [[ -n "$TRACE_BUCKETS" ]]; then EXPORT_ARGS+=(--trace-buckets "$TRACE_BUCKETS"); fi
+if [[ -n "$JIT_MODE" ]]; then EXPORT_ARGS+=(--jit-mode "$JIT_MODE"); fi
 if [[ -n "$E0CSV" ]]; then EXPORT_ARGS+=(--e0-csv "$E0CSV"); fi
 if [[ -n "$EXPORT_FIDELITY_ID" ]]; then EXPORT_ARGS+=(--export-fidelity-id "$EXPORT_FIDELITY_ID"); fi
 if [[ $FEATURE_SPECTRAL_EXPORT -eq 1 || $TEST_RECIPROCAL_LONG_RANGE -eq 1 || $TEST_TREE_FMM_LONG_RANGE -eq 1 ]]; then EXPORT_ARGS+=(--export-reciprocal-source); fi
 # Export always on cuda:0 to avoid MPI env interference
-CUDA_VISIBLE_DEVICES=0 python "$REPO_ROOT/molecular_force_field/cli/export_libtorch_core.py" "${EXPORT_ARGS[@]}"
+CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" "$REPO_ROOT/molecular_force_field/cli/export_libtorch_core.py" "${EXPORT_ARGS[@]}"
 
 echo "[2/3] Writing LAMMPS input file"
 if [[ -z "$BOX" ]]; then
-  BOX="$(python - <<PY
+  BOX="$($PYTHON_BIN - <<PY
 import math
 n = int("$N1")+int("$N2")
 box = max(60.0, 3.0*(n**(1.0/3.0))*2.5)
@@ -1594,7 +1654,7 @@ EOF
     "$lmp_bin" "${lmp_args_inside[@]}" > "$workdir/inside.log" 2>&1
   fi
 
-  python - <<'PY' "$workdir/cross.log" "$workdir/inside.log" "$workdir/cross.dump" "$workdir/inside.dump"
+  "$PYTHON_BIN" - <<'PY' "$workdir/cross.log" "$workdir/inside.log" "$workdir/cross.dump" "$workdir/inside.dump"
 import sys
 from pathlib import Path
 
@@ -1749,7 +1809,7 @@ EOF
     "$lmp_bin" "${lmp_args_inside[@]}" > "$workdir/slab_inside.log" 2>&1
   fi
 
-  python - <<'PY' "$workdir/slab_cross.log" "$workdir/slab_inside.log" "$workdir/slab_cross.dump" "$workdir/slab_inside.dump"
+  "$PYTHON_BIN" - <<'PY' "$workdir/slab_cross.log" "$workdir/slab_inside.log" "$workdir/slab_cross.dump" "$workdir/slab_inside.dump"
 import sys
 from pathlib import Path
 
@@ -1904,7 +1964,7 @@ EOF
     "$lmp_bin" "${lmp_args_near[@]}" > "$workdir/slab_znear.log" 2>&1
   fi
 
-  python - <<'PY' "$workdir/slab_zfar.log" "$workdir/slab_znear.log" "$workdir/slab_zfar.dump" "$workdir/slab_znear.dump"
+  "$PYTHON_BIN" - <<'PY' "$workdir/slab_zfar.log" "$workdir/slab_znear.log" "$workdir/slab_zfar.dump" "$workdir/slab_znear.dump"
 import sys
 from pathlib import Path
 
@@ -2027,7 +2087,7 @@ EOF
     "$lmp_bin" "${lmp_args_inside[@]}" > "$workdir/triclinic_inside.log" 2>&1
   fi
 
-  python - <<'PY' "$workdir/triclinic_cross.log" "$workdir/triclinic_inside.log" "$workdir/triclinic_cross.dump" "$workdir/triclinic_inside.dump"
+  "$PYTHON_BIN" - <<'PY' "$workdir/triclinic_cross.log" "$workdir/triclinic_inside.log" "$workdir/triclinic_cross.dump" "$workdir/triclinic_inside.dump"
 import sys
 from pathlib import Path
 
@@ -2098,7 +2158,7 @@ run_pbc_minimum_image_mpi_consistency_test() {
   echo "[3/3] Feature FFT MPI consistency: running MPI case ($mpi_np ranks)"
   run_pbc_minimum_image_test "$multi_dir" "$lmp_bin" "$core_pt" "$element" "$cutoff" "$gpu_n" "$mpi_np" "$mpi_cmd"
 
-  python - <<'PY' "$single_dir" "$multi_dir"
+  "$PYTHON_BIN" - <<'PY' "$single_dir" "$multi_dir"
 import sys
 from pathlib import Path
 
@@ -2242,7 +2302,7 @@ run_nonperiodic_python_reference_test() {
   echo "[3/3] $banner"
   run_nonperiodic_tree_fmm_case "$workdir" "$lmp_bin" "$core_pt" "$element" "$cutoff" "1" "1" "mpirun" "$case_name"
 
-  python - <<'PY' "$workdir/${case_name}.log" "$workdir/${case_name}.dump" "$workdir" "$checkpoint_pt" "$cutoff" "$element" "$e0_csv" "$case_name"
+  "$PYTHON_BIN" - <<'PY' "$workdir/${case_name}.log" "$workdir/${case_name}.dump" "$workdir" "$checkpoint_pt" "$cutoff" "$element" "$e0_csv" "$case_name"
 import sys
 from pathlib import Path
 import csv
@@ -2367,7 +2427,7 @@ run_nonperiodic_tree_fmm_mpi_consistency_test() {
   echo "[3/3] Tree FMM MPI consistency: running MPI case ($mpi_np ranks)"
   run_nonperiodic_tree_fmm_case "$multi_dir" "$lmp_bin" "$core_pt" "$element" "$cutoff" "$gpu_n" "$mpi_np" "$mpi_cmd" "tree_fmm"
 
-  python - <<'PY' "$single_dir" "$multi_dir"
+  "$PYTHON_BIN" - <<'PY' "$single_dir" "$multi_dir"
 import sys
 from pathlib import Path
 
@@ -2511,7 +2571,7 @@ if [[ $ATOM_TYPE_COUNT -le 0 ]]; then
   exit 2
 fi
 
-MASS_BLOCK="$(python - "${ELEMENTS[@]}" <<'PY'
+MASS_BLOCK="$($PYTHON_BIN - "${ELEMENTS[@]}" <<'PY'
 import sys
 
 masses = {
@@ -2538,7 +2598,7 @@ fi
 
 INITIAL_STATS_FILE="$OUT_DIR/initial_neighbor_stats.txt"
 
-ATOM_CREATE_BLOCK="$(python - "$ATOM_TYPE_COUNT" "$N1" "$N2" "$BOX" "$CUTOFF" "$NEIGHBOR_SKIN" "$MIN_SEPARATION" "$INITIAL_STATS_FILE" "$MD_PERIODIC" <<'PY'
+ATOM_CREATE_BLOCK="$($PYTHON_BIN - "$ATOM_TYPE_COUNT" "$N1" "$N2" "$BOX" "$CUTOFF" "$NEIGHBOR_SKIN" "$MIN_SEPARATION" "$INITIAL_STATS_FILE" "$MD_PERIODIC" <<'PY'
 import math
 import random
 import sys
@@ -2678,7 +2738,7 @@ run $STEPS
 EOF
 
 echo "[3/3] Running LAMMPS (Kokkos+CUDA)"
-export LD_LIBRARY_PATH="$(python - <<'PY'
+export LD_LIBRARY_PATH="$($PYTHON_BIN - <<'PY'
 import os, torch
 print(os.path.join(os.path.dirname(torch.__file__), "lib"))
 PY
@@ -2686,7 +2746,7 @@ PY
 
 if [[ $NATIVE_OPS -eq 1 && -z "${MFF_CUSTOM_OPS_LIB:-}" ]]; then
   echo "[3/3] --native-ops: auto-detect cuEquivariance ops and libpython path"
-  eval "$(python - <<'PY'
+  eval "$($PYTHON_BIN - <<'PY'
 import pathlib, sys, sysconfig
 
 extra_ld = []

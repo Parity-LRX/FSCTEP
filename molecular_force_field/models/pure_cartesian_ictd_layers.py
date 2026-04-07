@@ -24,8 +24,8 @@ import math
 from functools import lru_cache
 
 from molecular_force_field.models.ictd_irreps import (
+    HarmonicChannelWiseTensorProduct,
     HarmonicElementwiseProduct,
-    HarmonicFullyConnectedTensorProduct,
     direction_harmonics,
     direction_harmonics_all,
     build_harmonic_projectors,
@@ -666,7 +666,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         )
 
         # Channelwise: (node ⊗ edge_Y) only; second input has mul=1 (edge geometry)
-        self.tp2 = HarmonicFullyConnectedTensorProduct(
+        self.tp2 = HarmonicChannelWiseTensorProduct(
             mul_in1=output_size,
             mul_in2=1,
             mul_out=channels_out,
@@ -712,11 +712,16 @@ class ICTDIrrepsE3Conv(nn.Module):
             Y_list = direction_harmonics_all(n, self.lmax)
         else:
             Y_list = precomputed_Y_list
-        Y = {l: Y_list[l] for l in range(self.lmax + 1)}  # (E, 2l+1)
 
-        f_in = {l: Ai[edge_src].unsqueeze(-1) * Y[l].unsqueeze(-2) for l in range(self.lmax + 1)}  # (E, output_size, 2l+1)
+        f_in = {
+            l: Ai[edge_src].unsqueeze(-1) * Y_list[l].unsqueeze(-2)
+            for l in range(self.lmax + 1)
+        }  # (E, output_size, 2l+1)
         # Second operand: edge geometry only (mul=1), no neighbor
-        x2 = {l: Y_list[l].unsqueeze(-2) for l in range(self.lmax + 1)}  # (E, 1, 2l+1)
+        x2 = {
+            l: Y_list[l].unsqueeze(-2)
+            for l in range(self.lmax + 1)
+        }  # (E, 1, 2l+1)
 
         emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
         emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=Ai.dtype)
@@ -855,7 +860,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.tp2_layers = nn.ModuleList()
         self.fc2_layers = nn.ModuleList()
         for _ in range(self.num_interaction - 1):
-            tp2 = HarmonicFullyConnectedTensorProduct(
+            tp2 = HarmonicChannelWiseTensorProduct(
                 mul_in1=self.channels,
                 mul_in2=1,
                 mul_out=self.channels,
@@ -913,7 +918,6 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 else:
                     layer_adapt[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
             self._p5_adapt.append(layer_adapt)
-
         # HarmonicElementwiseProduct replaces manual _irreps_elementwise_tensor_product_0e.
         self.product_5 = HarmonicElementwiseProduct(
             lmax=self.lmax,
@@ -1032,14 +1036,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         ).mul(self.number_of_basis ** 0.5)
         for tp2, fc2 in zip(self.tp2_layers, self.fc2_layers):
             f_prev = features[-1]
-            n = n.to(dtype=f_prev.dtype)
-            edge_length = edge_length.to(dtype=f_prev.dtype)
-            Y = {l: Y_list[l].to(dtype=f_prev.dtype).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
             emb = emb_base.to(dtype=f_prev.dtype)
             gates = fc2(emb)
 
+            Y = {l: Y_list[l].to(dtype=f_prev.dtype).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
             x1 = _split_irreps(f_prev, self.channels, self.lmax)
-            x1e = {l: x1[l][edge_src] for l in range(self.lmax + 1)}
+            x1e = {l: x1[l].index_select(0, edge_src) for l in range(self.lmax + 1)}
             edge_blocks = tp2(x1e, Y, gates)  # dict l -> (E, C, 2l+1)
             edge_flat = _merge_irreps(edge_blocks, self.channels, self.lmax)
             f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes, reduce="sum") / max(avg_num_neighbors, 1e-8)
