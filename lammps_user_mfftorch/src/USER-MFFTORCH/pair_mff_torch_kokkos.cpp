@@ -20,9 +20,11 @@
 #include "mff_tree_fmm_solver.h"
 
 #include <Kokkos_Core.hpp>
+#include <chrono>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cmath>
+#include <cstdio>
 #include <type_traits>
 
 using namespace LAMMPS_NS;
@@ -190,6 +192,29 @@ void PairMFFTorchKokkos<DeviceType>::init_style() {
 
 template <class DeviceType>
 void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
+  const bool debug_kk_timings = []() {
+    const char* env = std::getenv("MFF_DEBUG_KK_TIMINGS");
+    return env && env[0] != '\0' && env[0] != '0';
+  }();
+  const auto t_total_start = std::chrono::steady_clock::now();
+  auto t_last = t_total_start;
+  double edge_count_ms = 0.0;
+  double offset_scan_ms = 0.0;
+  double fill_ms = 0.0;
+  double prepare_ms = 0.0;
+  double compute_ms = 0.0;
+  double reciprocal_ms = 0.0;
+  double force_ms = 0.0;
+  double atom_output_ms = 0.0;
+  double virial_ms = 0.0;
+  auto finish_segment = [&](double& bucket) {
+    if (!debug_kk_timings) return;
+    Kokkos::fence();
+    const auto now = std::chrono::steady_clock::now();
+    bucket += std::chrono::duration<double, std::milli>(now - t_last).count();
+    t_last = now;
+  };
+
   if (!engine_loaded_) init_style();
   if (!engine_ || !engine_->is_cuda()) {
     PairMFFTorch::compute(eflag_in, vflag_in);
@@ -223,15 +248,24 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   const int inum = list->inum;
   auto dev = engine_->device();
   const CellGeom geom = build_cell_geom(domain);
-  auto cell_t = torch::tensor(
-      {
-          {geom.cell[0][0], geom.cell[0][1], geom.cell[0][2]},
-          {geom.cell[1][0], geom.cell[1][1], geom.cell[1][2]},
-          {geom.cell[2][0], geom.cell[2][1], geom.cell[2][2]},
-      },
-      torch::TensorOptions().dtype(torch::kFloat32).device(dev))
-                    .unsqueeze(0);
   if (nlocal == 0) {
+    const std::array<float, 9> cell_values = {
+        geom.cell[0][0], geom.cell[0][1], geom.cell[0][2],
+        geom.cell[1][0], geom.cell[1][1], geom.cell[1][2],
+        geom.cell[2][0], geom.cell[2][1], geom.cell[2][2],
+    };
+    if (!cached_cell_valid_ || cached_cell_values_ != cell_values || !cached_cell_t_.defined() ||
+        cached_cell_t_.device() != dev) {
+      cached_cell_values_ = cell_values;
+      cached_cell_t_ = torch::from_blob(
+                           cached_cell_values_.data(),
+                           {1, 3, 3},
+                           torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                           .clone()
+                           .to(dev);
+      cached_cell_valid_ = true;
+    }
+    auto cell_t = cached_cell_t_;
     const bool use_tree_fmm =
         tree_fmm_solver_ && engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0 &&
         engine_->long_range_runtime_backend() == "tree_fmm";
@@ -273,7 +307,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
         acc += static_cast<int64_t>(d_numneigh[d_ilist[ii]]);
       },
       Etotal);
-  Kokkos::fence();
+  finish_segment(edge_count_ms);
   if (Etotal <= 1) return;
 
   // Exclusive-scan offsets on device; reuse cached view when inum unchanged.
@@ -288,7 +322,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
         if (is_final) d_offsets(ii) = update;
         update += static_cast<int64_t>(d_numneigh[d_ilist[ii]]);
       });
-  Kokkos::fence();
+  finish_segment(offset_scan_ms);
 
   // Reuse CUDA tensor buffers when edge count / atom count unchanged.
   using Unmanaged = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
@@ -307,6 +341,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 
   Kokkos::View<int64_t *, DeviceType, Unmanaged> edge_src_v(buf_edge_src_.data_ptr<int64_t>(), Etotal);
   Kokkos::View<int64_t *, DeviceType, Unmanaged> edge_dst_v(buf_edge_dst_.data_ptr<int64_t>(), Etotal);
+  Kokkos::View<int64_t *, DeviceType, Unmanaged> type_idx_v(buf_type_idx_.data_ptr<int64_t>(), ntotal);
   Kokkos::View<float **, Kokkos::LayoutRight, DeviceType, Unmanaged> edge_shifts_v(buf_edge_shifts_.data_ptr<float>(), Etotal, 3);
   Kokkos::View<float **, Kokkos::LayoutRight, DeviceType, Unmanaged> pos_v(buf_pos_.data_ptr<float>(), ntotal, 3);
 
@@ -314,15 +349,19 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   const float i10 = geom.inv[1][0], i11 = geom.inv[1][1], i12 = geom.inv[1][2];
   const float i20 = geom.inv[2][0], i21 = geom.inv[2][1], i22 = geom.inv[2][2];
   const int px = geom.pbc[0], py = geom.pbc[1], pz = geom.pbc[2];
+  const float c00 = geom.cell[0][0], c01 = geom.cell[0][1], c02 = geom.cell[0][2];
+  const float c10 = geom.cell[1][0], c11 = geom.cell[1][1], c12 = geom.cell[1][2];
+  const float c20 = geom.cell[2][0], c21 = geom.cell[2][1], c22 = geom.cell[2][2];
+  const float cutsq = static_cast<float>(cutsq_global_);
 
   Kokkos::parallel_for(
-      "mfftorch::fill_pos", ntotal,
+      "mfftorch::fill_pos_and_type", ntotal,
       KOKKOS_LAMBDA(const int i) {
         pos_v(i, 0) = static_cast<float>(x(i, 0));
         pos_v(i, 1) = static_cast<float>(x(i, 1));
         pos_v(i, 2) = static_cast<float>(x(i, 2));
+        type_idx_v(i) = static_cast<int64_t>(type(i));
       });
-  Kokkos::fence();
 
   Kokkos::parallel_for(
       "mfftorch::fill_edges", inum, KOKKOS_LAMBDA(const int ii) {
@@ -341,6 +380,21 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
           const int sx = px ? -nearest_int_device(fracx) : 0;
           const int sy = py ? -nearest_int_device(fracy) : 0;
           const int sz = pz ? -nearest_int_device(fracz) : 0;
+          const float shiftx = sx * c00 + sy * c10 + sz * c20;
+          const float shifty = sx * c01 + sy * c11 + sz * c21;
+          const float shiftz = sx * c02 + sy * c12 + sz * c22;
+          const float delx = rawx + shiftx;
+          const float dely = rawy + shifty;
+          const float delz = rawz + shiftz;
+          const float rsq = delx * delx + dely * dely + delz * delz;
+          if (rsq > cutsq) {
+            edge_src_v(idx) = static_cast<int64_t>(-1);
+            edge_dst_v(idx) = static_cast<int64_t>(-1);
+            edge_shifts_v(idx, 0) = 0.0f;
+            edge_shifts_v(idx, 1) = 0.0f;
+            edge_shifts_v(idx, 2) = 0.0f;
+            continue;
+          }
           edge_src_v(idx) = static_cast<int64_t>(i);
           edge_dst_v(idx) = static_cast<int64_t>(j);
           edge_shifts_v(idx, 0) = static_cast<float>(sx);
@@ -348,23 +402,52 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
           edge_shifts_v(idx, 2) = static_cast<float>(sz);
         }
       });
-  Kokkos::fence();
+  finish_segment(fill_ms);
 
-  // Type -> Z mapping on device.
-  Kokkos::View<int64_t *, DeviceType, Unmanaged> type_idx_v(buf_type_idx_.data_ptr<int64_t>(), ntotal);
-  Kokkos::parallel_for(
-      "mfftorch::fill_type_idx", ntotal,
-      KOKKOS_LAMBDA(const int i) { type_idx_v(i) = static_cast<int64_t>(type(i)); });
-  Kokkos::fence();
+  auto valid_mask = buf_edge_src_.ge(0);
+  const int64_t Efiltered = valid_mask.sum().item<int64_t>();
+  if (Efiltered <= 1) return;
+  if (Efiltered != Etotal) {
+    auto valid_idx = torch::nonzero(valid_mask).view({-1});
+    buf_edge_src_ = buf_edge_src_.index_select(0, valid_idx);
+    buf_edge_dst_ = buf_edge_dst_.index_select(0, valid_idx);
+    buf_edge_shifts_ = buf_edge_shifts_.index_select(0, valid_idx);
+    cached_Etotal_ = Efiltered;
+    Etotal = Efiltered;
+  }
 
   const bool need_energy = static_cast<bool>(eflag_global || eflag_atom);
   const bool need_atom_virial = static_cast<bool>(vflag_atom);
   mfftorch::MFFOutputs out;
+
+  const std::array<float, 9> cell_values = {
+      geom.cell[0][0], geom.cell[0][1], geom.cell[0][2],
+      geom.cell[1][0], geom.cell[1][1], geom.cell[1][2],
+      geom.cell[2][0], geom.cell[2][1], geom.cell[2][2],
+  };
+  if (!cached_cell_valid_ || cached_cell_values_ != cell_values || !cached_cell_t_.defined() ||
+      cached_cell_t_.device() != dev) {
+    cached_cell_values_ = cell_values;
+    cached_cell_t_ = torch::from_blob(
+                         cached_cell_values_.data(),
+                         {1, 3, 3},
+                         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                         .clone()
+                         .to(dev);
+    cached_cell_valid_ = true;
+  }
+  auto cell_t = cached_cell_t_;
+
   try {
     Kokkos::fence();
-    if (engine_->is_bundle_manifest()) {
+    if (engine_->is_bundle_manifest() &&
+        (prepared_nlocal_ != nlocal || prepared_ntotal_ != ntotal || prepared_nedges_ != Etotal)) {
       engine_->prepare_for_shape(nlocal, ntotal, Etotal);
+      prepared_nlocal_ = nlocal;
+      prepared_ntotal_ = ntotal;
+      prepared_nedges_ = Etotal;
     }
+    finish_segment(prepare_ms);
     if (engine_->prefers_kokkos_host_staging()) {
       // Native cue custom CUDA ops are unstable when fed Kokkos-managed device
       // tensors and an external CUDA stream. Stage inputs through CPU so the
@@ -402,7 +485,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
                              fidelity_ids,
                              need_energy, need_atom_virial);
     }
-    Kokkos::fence();
+    finish_segment(compute_ms);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch/kk engine compute failed: ") + e.what()).c_str());
   }
@@ -440,6 +523,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       error->all(FLERR, (std::string("mff/torch/kk runtime long-range solver failed: ") + e.what()).c_str());
     }
   }
+  finish_segment(reciprocal_ms);
 
   if (eflag_global) eng_vdwl += out.energy;
   if (eflag_global && use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
@@ -455,7 +539,6 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
         f(i, 1) += forces_v(i, 1);
         f(i, 2) += forces_v(i, 2);
       });
-  Kokkos::fence();
   if (use_runtime_long_range && reciprocal_out.forces_local.defined()) {
     reciprocal_forces_dev = reciprocal_out.forces_local.to(dev, torch::kFloat32).contiguous();
     Kokkos::View<float **, Kokkos::LayoutRight, DeviceType, Unmanaged> reciprocal_forces_v(
@@ -466,8 +549,8 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
           f(i, 1) += reciprocal_forces_v(i, 1);
           f(i, 2) += reciprocal_forces_v(i, 2);
         });
-    Kokkos::fence();
   }
+  finish_segment(force_ms);
 
   // Per-atom energy: copy NN atom_energy to LAMMPS eatom (local atoms only).
   if (eflag_atom && eatom && out.atom_energy.defined()) {
@@ -480,6 +563,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
     const double *ep = ae_recip.data_ptr<double>();
     for (int i = 0; i < nlocal; i++) eatom[i] += ep[i];
   }
+  finish_segment(atom_output_ms);
 
   // Per-atom virial: engine computed atom_virial [ntotal, 6] on GPU via edge-force
   // outer products (rij ⊗ edge_forces), scatter-added 50/50 to src and dst.
@@ -498,6 +582,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       vatom[i][5] += vp[i * 6 + 5];
     }
   }
+  finish_segment(virial_ms);
 
 #ifdef MFF_ENABLE_VIRIAL
   if (vflag_global) {
@@ -548,6 +633,27 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
     }
   }
 #endif
+  if (debug_kk_timings) {
+    Kokkos::fence();
+    const auto total_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total_start).count();
+    std::fprintf(
+        stderr,
+        "[MFF_DEBUG_KK_TIMINGS] nlocal=%d ntotal=%d nedges=%lld edge_count_ms=%.3f offset_scan_ms=%.3f fill_ms=%.3f prepare_ms=%.3f compute_ms=%.3f reciprocal_ms=%.3f force_ms=%.3f atom_output_ms=%.3f virial_ms=%.3f total_ms=%.3f\n",
+        nlocal,
+        ntotal,
+        static_cast<long long>(Etotal),
+        edge_count_ms,
+        offset_scan_ms,
+        fill_ms,
+        prepare_ms,
+        compute_ms,
+        reciprocal_ms,
+        force_ms,
+        atom_output_ms,
+        virial_ms,
+        total_ms);
+  }
 }
 
 namespace LAMMPS_NS {

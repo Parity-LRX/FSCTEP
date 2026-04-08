@@ -19,6 +19,7 @@ PairStyle(mff/torch/kk/host,PairMFFTorchKokkos<LMPHostType>);
 
 #include "kokkos_type.h"
 
+#include <array>
 #include <torch/torch.h>
 
 namespace LAMMPS_NS {
@@ -54,6 +55,14 @@ class PairMFFTorchKokkos : public PairMFFTorch {
   // Cached Kokkos views to avoid per-step GPU allocation.
   int cached_inum_ = 0;
   Kokkos::View<int64_t *, DeviceType> cached_d_offsets_;
+
+  // Cached cell tensor and shape preparation state.
+  bool cached_cell_valid_ = false;
+  std::array<float, 9> cached_cell_values_{};
+  torch::Tensor cached_cell_t_;
+  int64_t prepared_nlocal_ = -1;
+  int64_t prepared_ntotal_ = -1;
+  int64_t prepared_nedges_ = -1;
 };
 
 }  // namespace LAMMPS_NS
