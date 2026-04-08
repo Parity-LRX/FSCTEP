@@ -92,11 +92,24 @@ def _stack_group_weights(
     segments: List[Tuple[int, ...]],
     compute_dtype: torch.dtype,
 ) -> torch.Tensor:
-    stacked = torch.stack(
-        [w_param[int(seg[0])].to(dtype=compute_dtype) for seg in segments],
-        dim=0,
-    )
+    path_indices = [int(seg[0]) for seg in segments]
+    start = path_indices[0]
+    if path_indices == list(range(start, start + len(path_indices))):
+        stacked = w_param.narrow(0, start, len(path_indices))
+    else:
+        idx_t = torch.tensor(path_indices, device=w_param.device, dtype=torch.long)
+        stacked = w_param.index_select(0, idx_t)
+    if stacked.dtype != compute_dtype:
+        stacked = stacked.to(dtype=compute_dtype)
     return stacked.contiguous().view(stacked.shape[0], stacked.shape[1], -1)
+
+
+def _slice_or_index_lastdim(t: torch.Tensor, path_indices: List[int]) -> torch.Tensor:
+    start = int(path_indices[0])
+    if path_indices == list(range(start, start + len(path_indices))):
+        return t.narrow(-1, start, len(path_indices))
+    idx_t = torch.tensor(path_indices, device=t.device, dtype=torch.long)
+    return t.index_select(-1, idx_t)
 
 
 def _build_kdim_buckets(
@@ -123,6 +136,111 @@ def _build_kdim_buckets(
         }
         buckets.append(bucket)
     return buckets
+
+
+
+
+def _detect_scalar_identity_group_meta(
+    U: torch.Tensor,
+    *,
+    l1: int,
+    l2: int,
+    segments: List[Tuple[int, ...]],
+) -> Dict[str, object] | None:
+    if l1 != 0 and l2 != 0:
+        return None
+    side = "rhs" if l2 == 0 else "lhs"
+    ref_l = int(l1 if l2 == 0 else l2)
+    m = 2 * ref_l + 1
+    eye = torch.eye(m, device=U.device, dtype=U.dtype)
+    if U.shape[0] != m:
+        return None
+    if U.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        atol = 1e-5
+        rtol = 1e-4
+    else:
+        atol = 1e-8
+        rtol = 1e-6
+    meta_segments: List[Tuple[int, object, float]] = []
+    for seg in segments:
+        if len(seg) == 4:
+            p_idx, l3, s, e = seg
+            key_ir: object = int(l3)
+        elif len(seg) == 5:
+            p_idx, l3, p3, s, e = seg
+            key_ir = (int(l3), int(p3))
+        else:
+            return None
+        s_i = int(s)
+        e_i = int(e)
+        if int(l3) != ref_l or (e_i - s_i) != m:
+            return None
+        U_seg = U[:, s_i:e_i]
+        alpha = torch.trace(U_seg) / float(m)
+        if not torch.allclose(U_seg, alpha * eye, atol=atol, rtol=rtol):
+            return None
+        meta_segments.append((int(p_idx), key_ir, float(alpha.item())))
+    return {
+        "side": side,
+        "segments": meta_segments,
+    }
+
+
+def _detect_scalar_output_split_meta(
+    U: torch.Tensor,
+    *,
+    l1: int,
+    l2: int,
+    segments: List[Tuple[int, ...]],
+) -> Dict[str, object] | None:
+    if l1 != l2:
+        return None
+    m = 2 * l1 + 1
+    if m <= 1:
+        return None
+    eye = torch.eye(m, device=U.device, dtype=U.dtype)
+    if U.shape[0] != m * m:
+        return None
+    if U.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        atol = 1e-5
+        rtol = 1e-4
+    else:
+        atol = 1e-8
+        rtol = 1e-6
+    scalar_entries: List[Tuple[int, object, float]] = []
+    rem_segments: List[Tuple[int, object, int, int]] = []
+    rem_cols: List[torch.Tensor] = []
+    rem_start = 0
+    for seg in segments:
+        if len(seg) == 4:
+            p_idx, l3, s, e = seg
+            key_ir: object = int(l3)
+        elif len(seg) == 5:
+            p_idx, l3, p3, s, e = seg
+            key_ir = (int(l3), int(p3))
+        else:
+            return None
+        s_i = int(s)
+        e_i = int(e)
+        if int(l3) == 0 and (e_i - s_i) == 1:
+            U_seg = U[:, s_i:e_i].reshape(m, m)
+            alpha = torch.trace(U_seg) / float(m)
+            if not torch.allclose(U_seg, alpha * eye, atol=atol, rtol=rtol):
+                return None
+            scalar_entries.append((int(p_idx), key_ir, float(alpha.item())))
+        else:
+            kdim = e_i - s_i
+            rem_segments.append((int(p_idx), key_ir, rem_start, rem_start + kdim))
+            rem_cols.append(U[:, s_i:e_i])
+            rem_start += kdim
+    if not scalar_entries:
+        return None
+    U_rem = torch.cat(rem_cols, dim=1).contiguous() if rem_cols else None
+    return {
+        "scalar_entries": scalar_entries,
+        "rem_segments": rem_segments,
+        "U_rem": U_rem,
+    }
 
 
 def sym_dim(L: int) -> int:
@@ -858,6 +976,9 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         # Packed same-kdim buckets for the custom CUDA backend.
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
+        self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+        self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
+        self._scalar_split_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
 
 
     @_dynamo_disable
@@ -962,6 +1083,66 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         return buckets
 
     @_dynamo_disable
+    def _get_proj_group_view_list(self, device: torch.device, dtype: torch.dtype) -> List[Dict[str, object]]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._proj_group_view_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        views: List[Dict[str, object]] = []
+        for g_idx, g in enumerate(self._groups):
+            l1 = int(g["l1"])  # type: ignore[arg-type]
+            l2 = int(g["l2"])  # type: ignore[arg-type]
+            segments = g["segments"]  # type: ignore[assignment]
+            U3 = proj_list[g_idx].reshape(2 * l1 + 1, 2 * l2 + 1, -1)
+            seg_views = [(seg, U3[:, :, int(seg[-2]): int(seg[-1])]) for seg in segments]
+            views.append({"U3": U3, "seg_views": seg_views})
+        self._proj_group_view_cache_by_dev_dtype[key] = views
+        return views
+
+
+    @_dynamo_disable
+    def _get_scalar_identity_group_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Dict[str, object]]]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._scalar_identity_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        metas = [
+            _detect_scalar_identity_group_meta(
+                proj_list[g_idx],
+                l1=int(g["l1"]),
+                l2=int(g["l2"]),
+                segments=g["segments"],  # type: ignore[arg-type]
+            )
+            for g_idx, g in enumerate(self._groups)
+        ]
+        self._scalar_identity_group_cache_by_dev_dtype[key] = metas
+        return metas
+
+    @_dynamo_disable
+    def _get_scalar_split_group_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Dict[str, object]]]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._scalar_split_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        metas = [
+            _detect_scalar_output_split_meta(
+                proj_list[g_idx],
+                l1=int(g["l1"]),
+                l2=int(g["l2"]),
+                segments=g["segments"],  # type: ignore[arg-type]
+            )
+            for g_idx, g in enumerate(self._groups)
+        ]
+        self._scalar_split_group_cache_by_dev_dtype[key] = metas
+        return metas
+
+    @_dynamo_disable
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         """Pre-build internal caches on (device, dtype).
 
@@ -1052,9 +1233,8 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                         ).to(device=a_comp.device)
                         gates_bucket = None
                         if weights is not None:
-                            gates_bucket = torch.stack(
-                                [weights[..., int(p_idx)] for p_idx in bucket_path_indices], dim=-1
-                            ).reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
+                            gates_bucket = _slice_or_index_lastdim(weights, [int(p_idx) for p_idx in bucket_path_indices])
+                            gates_bucket = gates_bucket.reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
                         bucket_out = _tp_cuda_ext_bucket_forward(
                             backend=self.ictd_tp_backend,
                             a=a_flat,
@@ -1424,6 +1604,9 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         self._proj_bucket_cache_by_dev_dtype: Dict[Tuple[str, str], List[List[Dict[str, object]]]] = {}
+        self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+        self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
+        self._scalar_split_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -1508,6 +1691,63 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         return buckets
 
     @_dynamo_disable
+    def _get_proj_group_view_list(self, device: torch.device, dtype: torch.dtype) -> List[Dict[str, object]]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._proj_group_view_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        views: List[Dict[str, object]] = []
+        for g_idx, g in enumerate(self._groups):
+            l1 = int(g["l1"])
+            l2 = int(g["l2"])
+            segments = g["segments"]
+            U3 = proj_list[g_idx].reshape(2 * l1 + 1, 2 * l2 + 1, -1)
+            seg_views = [(seg, U3[:, :, int(seg[-2]): int(seg[-1])]) for seg in segments]
+            views.append({"U3": U3, "seg_views": seg_views})
+        self._proj_group_view_cache_by_dev_dtype[key] = views
+        return views
+
+    @_dynamo_disable
+    def _get_scalar_identity_group_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Dict[str, object]]]:
+        key = (str(device), str(self.internal_compute_dtype))
+        cached = self._scalar_identity_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        metas = [
+            _detect_scalar_identity_group_meta(
+                proj_list[g_idx],
+                l1=int(g["l1"]),
+                l2=int(g["l2"]),
+                segments=g["segments"],  # type: ignore[arg-type]
+            )
+            for g_idx, g in enumerate(self._groups)
+        ]
+        self._scalar_identity_group_cache_by_dev_dtype[key] = metas
+        return metas
+
+    @_dynamo_disable
+    def _get_scalar_split_group_list(self, device: torch.device, dtype: torch.dtype) -> List[Optional[Dict[str, object]]]:
+        key = (str(device), str(self.internal_compute_dtype))
+        cached = self._scalar_split_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        metas = [
+            _detect_scalar_output_split_meta(
+                proj_list[g_idx],
+                l1=int(g["l1"]),
+                l2=int(g["l2"]),
+                segments=g["segments"],  # type: ignore[arg-type]
+            )
+            for g_idx, g in enumerate(self._groups)
+        ]
+        self._scalar_split_group_cache_by_dev_dtype[key] = metas
+        return metas
+
+    @_dynamo_disable
     def prewarm_caches(self, device: torch.device, dtype: torch.dtype) -> None:
         _ = self._get_cg_list(device=device, dtype=dtype)
         _ = self._get_proj_group_list(device=device, dtype=dtype)
@@ -1581,9 +1821,8 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                         ).to(device=a_comp.device)
                         gates_bucket = None
                         if weights is not None:
-                            gates_bucket = torch.stack(
-                                [weights[..., int(p_idx)] for p_idx in bucket_path_indices], dim=-1
-                            ).reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
+                            gates_bucket = _slice_or_index_lastdim(weights, [int(p_idx) for p_idx in bucket_path_indices])
+                            gates_bucket = gates_bucket.reshape(B_flat, len(bucket_path_indices)).to(dtype=compute_dtype)
                         bucket_out = _tp_cuda_ext_bucket_forward(
                             backend=self.ictd_tp_backend,
                             a=a_flat,
@@ -1752,6 +1991,20 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
         self.channel_mode = "broadcast_rhs" if int(mul_in2) == 1 else "paired"
         self.weight_numel = self.num_paths * self.mul_out * self.channel_mul
         self.weight = nn.Parameter(torch.randn(self.num_paths, self.mul_out, self.channel_mul) * 0.02)
+        out_offsets: List[int] = []
+        start = 0
+        for l in range(self.lmax + 1):
+            out_offsets.append(start)
+            start += 2 * l + 1
+        self._out_offsets = tuple(out_offsets)
+        self._out_total_dim = start
+        out_offsets: List[int] = []
+        start = 0
+        for l in range(self.lmax + 1):
+            out_offsets.append(start)
+            start += 2 * l + 1
+        self._out_offsets = tuple(out_offsets)
+        self._out_total_dim = start
 
     def forward(
         self,
@@ -1781,6 +2034,9 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
         }
         proj_list = self._get_proj_group_list(device=device, dtype=dtype)
         bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
+        proj_view_list = self._get_proj_group_view_list(device=device, dtype=dtype)
+        scalar_meta_list = self._get_scalar_identity_group_list(device=device, dtype=dtype)
+        scalar_split_list = self._get_scalar_split_group_list(device=device, dtype=dtype)
 
         for g_idx, g in enumerate(self._groups):
             l1 = int(g["l1"])
@@ -1811,6 +2067,49 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
 
             a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
             b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            scalar_meta = scalar_meta_list[g_idx]
+            if scalar_meta is not None:
+                side = str(scalar_meta["side"])
+                if side == "rhs":
+                    base = a_comp * b_comp[..., 0, 0][..., None, None]
+                else:
+                    lhs = a_comp[..., :, 0]
+                    if self.channel_mode == "broadcast_rhs":
+                        base = lhs.unsqueeze(-1) * b_comp[..., 0, :].unsqueeze(-2)
+                    else:
+                        base = lhs.unsqueeze(-1) * b_comp
+                for p_idx, key_ir, alpha in scalar_meta["segments"]:  # type: ignore[index]
+                    Wp = self.weight[int(p_idx)]
+                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    out_seg = torch.matmul(
+                        (base * float(alpha)).movedim(-1, -2).contiguous(),
+                        Wp_comp.transpose(0, 1),
+                    ).movedim(-1, -2)
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                    if weights is not None:
+                        out_seg = out_seg * weights[..., int(p_idx), None, None]
+                    out[key_ir] = out[key_ir] + out_seg
+                continue
+            scalar_split_meta = scalar_split_list[g_idx] if self.channel_mode == "paired" else None
+            active_segments = segments
+            active_U = proj_list[g_idx]
+            if scalar_split_meta is not None:
+                base_scalar = (a_comp * b_comp).sum(dim=-1, keepdim=True)
+                for p_idx, key_ir, alpha in scalar_split_meta["scalar_entries"]:  # type: ignore[index]
+                    Wp = self.weight[int(p_idx)]
+                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    out_seg = torch.matmul(
+                        (base_scalar * float(alpha)).movedim(-1, -2).contiguous(),
+                        Wp_comp.transpose(0, 1),
+                    ).movedim(-1, -2)
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                    if weights is not None:
+                        out_seg = out_seg * weights[..., int(p_idx), None, None]
+                    out[key_ir] = out[key_ir] + out_seg
+                active_segments = scalar_split_meta["rem_segments"]  # type: ignore[assignment]
+                active_U = scalar_split_meta["U_rem"]  # type: ignore[assignment]
+                if active_U is None:
+                    continue
             used_fused_mix = False
             if self.channel_mode == "broadcast_rhs" and a_comp.dim() >= 2:
                 B_flat = 1
@@ -1872,9 +2171,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         ).to(device=a_comp.device)
                         gates_bucket = None
                         if gates_all is not None:
-                            gates_bucket = torch.stack(
-                                [gates_all[:, int(p_idx)] for p_idx in bucket_path_indices], dim=-1
-                            )
+                            gates_bucket = _slice_or_index_lastdim(gates_all, [int(p_idx) for p_idx in bucket_path_indices])
                         bucket_out = _tp_cuda_ext_bucket_forward(
                             backend=self.ictd_tp_backend,
                             a=a_flat,
@@ -1898,22 +2195,62 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                             bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
                             out[key_ir] = out[key_ir] + bucket_out
                         continue
-            if self.channel_mode == "broadcast_rhs":
-                b_comp = b_comp[..., 0, :].unsqueeze(-2).unsqueeze(-2)
-            else:
-                b_comp = b_comp.unsqueeze(-2)
-
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
-            U = proj_list[g_idx]
-            t_mn = a_comp.unsqueeze(-1) * b_comp
-            t_flat = t_mn.reshape(*batch_shape, self.channel_mul, m1 * m2)
-            if not t_flat.is_contiguous():
-                t_flat = t_flat.contiguous()
-            y = torch.matmul(t_flat, U)
+            U3 = active_U.reshape(m1, m2, -1)
+            if len(active_segments) <= 2:
+                if self.channel_mode == "broadcast_rhs":
+                    b_rhs = b_comp[..., 0, :]
+                    for seg in active_segments:
+                        if len(seg) == 5:
+                            p_idx, l3, p3, s, e = seg
+                            key_ir = (int(l3), int(p3))
+                        else:
+                            p_idx, key_ir, s, e = seg
+                        Wp = self.weight[int(p_idx)]
+                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        out_seg = torch.einsum(
+                            "...cm,...n,mnk,oc->...ok",
+                            a_comp,
+                            b_rhs,
+                            U3[:, :, int(s): int(e)],
+                            Wp_comp,
+                        )
+                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                        if weights is not None:
+                            out_seg = out_seg * weights[..., int(p_idx), None, None]
+                        out[key_ir] = out[key_ir] + out_seg
+                else:
+                    for seg in active_segments:
+                        if len(seg) == 5:
+                            p_idx, l3, p3, s, e = seg
+                            key_ir = (int(l3), int(p3))
+                        else:
+                            p_idx, key_ir, s, e = seg
+                        Wp = self.weight[int(p_idx)]
+                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        out_seg = torch.einsum(
+                            "...cm,...cn,mnk,oc->...ok",
+                            a_comp,
+                            b_comp,
+                            U3[:, :, int(s): int(e)],
+                            Wp_comp,
+                        )
+                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                        if weights is not None:
+                            out_seg = out_seg * weights[..., int(p_idx), None, None]
+                        out[key_ir] = out[key_ir] + out_seg
+                continue
+            if self.channel_mode == "broadcast_rhs":
+                b_rhs = b_comp[..., 0, :]
+                y = torch.einsum("...cm,...n,mnk->...ck", a_comp, b_rhs, U3)
+            else:
+                y = torch.einsum("...cm,...cn,mnk->...ck", a_comp, b_comp, U3)
             if _USE_BUCKETED_CHANNELWISE_MIX:
                 for bucket in bucket_list[g_idx]:
                     bucket_segments = bucket["segments"]  # type: ignore[assignment]
+                    if active_segments is not segments:
+                        continue
                     starts = [int(seg[-2]) for seg in bucket_segments]
                     kdim = int(bucket["kdim"])  # type: ignore[arg-type]
                     y_bucket = torch.stack([y[..., :, s : s + kdim] for s in starts], dim=-3)
@@ -1926,9 +2263,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                     out_bucket = out_bucket.to(dtype=dtype) if out_bucket.dtype != dtype else out_bucket
                     if weights is not None:
                         path_indices = [int(seg[0]) for seg in bucket_segments]
-                        gates_bucket = torch.stack(
-                            [weights[..., p_idx] for p_idx in path_indices], dim=-1
-                        )
+                        gates_bucket = _slice_or_index_lastdim(weights, path_indices)
                         out_bucket = out_bucket * gates_bucket[..., :, None, None]
                     key_to_local: Dict[Tuple[int, int], List[int]] = {}
                     for local_idx, seg in enumerate(bucket_segments):
@@ -1936,7 +2271,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                     for key_ir, local_indices in key_to_local.items():
                         out[key_ir] = out[key_ir] + out_bucket[..., local_indices, :, :].sum(dim=-3)
             else:
-                for p_idx, l3, p3, s, e in segments:
+                for p_idx, l3, p3, s, e in active_segments:
                     Wp = self.weight[int(p_idx)]
                     Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
                     y_seg = y[..., :, int(s): int(e)]
@@ -2001,6 +2336,13 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
         self.channel_mode = "broadcast_rhs" if int(mul_in2) == 1 else "paired"
         self.weight_numel = self.num_paths * self.mul_out * self.channel_mul
         self.weight = nn.Parameter(torch.randn(self.num_paths, self.mul_out, self.channel_mul) * 0.02)
+        out_offsets: List[int] = []
+        start = 0
+        for l in range(self.lmax + 1):
+            out_offsets.append(start)
+            start += 2 * l + 1
+        self._out_offsets = tuple(out_offsets)
+        self._out_total_dim = start
 
     def forward(
         self,
@@ -2030,6 +2372,9 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
         }
         proj_list = self._get_proj_group_list(device=device, dtype=dtype)
         bucket_list = self._get_proj_bucket_list(device=device, dtype=dtype)
+        proj_view_list = self._get_proj_group_view_list(device=device, dtype=dtype)
+        scalar_meta_list = self._get_scalar_identity_group_list(device=device, dtype=dtype)
+        scalar_split_list = self._get_scalar_split_group_list(device=device, dtype=dtype)
 
         for g_idx, g in enumerate(self._groups):
             l1 = int(g["l1"])  # type: ignore[arg-type]
@@ -2056,6 +2401,49 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
 
             a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
             b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            scalar_meta = scalar_meta_list[g_idx]
+            if scalar_meta is not None:
+                side = str(scalar_meta["side"])
+                if side == "rhs":
+                    base = a_comp * b_comp[..., 0, 0][..., None, None]
+                else:
+                    lhs = a_comp[..., :, 0]
+                    if self.channel_mode == "broadcast_rhs":
+                        base = lhs.unsqueeze(-1) * b_comp[..., 0, :].unsqueeze(-2)
+                    else:
+                        base = lhs.unsqueeze(-1) * b_comp
+                for p_idx, key_ir, alpha in scalar_meta["segments"]:  # type: ignore[index]
+                    Wp = self.weight[int(p_idx)]
+                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    out_seg = torch.matmul(
+                        (base * float(alpha)).movedim(-1, -2).contiguous(),
+                        Wp_comp.transpose(0, 1),
+                    ).movedim(-1, -2)
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                    if weights is not None:
+                        out_seg = out_seg * weights[..., int(p_idx), None, None]
+                    out[int(key_ir)] = out[int(key_ir)] + out_seg
+                continue
+            scalar_split_meta = scalar_split_list[g_idx] if self.channel_mode == "paired" else None
+            active_segments = segments
+            active_U = proj_list[g_idx]
+            if scalar_split_meta is not None:
+                base_scalar = (a_comp * b_comp).sum(dim=-1, keepdim=True)
+                for p_idx, key_ir, alpha in scalar_split_meta["scalar_entries"]:  # type: ignore[index]
+                    Wp = self.weight[int(p_idx)]
+                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    out_seg = torch.matmul(
+                        (base_scalar * float(alpha)).movedim(-1, -2).contiguous(),
+                        Wp_comp.transpose(0, 1),
+                    ).movedim(-1, -2)
+                    out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                    if weights is not None:
+                        out_seg = out_seg * weights[..., int(p_idx), None, None]
+                    out[int(key_ir)] = out[int(key_ir)] + out_seg
+                active_segments = scalar_split_meta["rem_segments"]  # type: ignore[assignment]
+                active_U = scalar_split_meta["U_rem"]  # type: ignore[assignment]
+                if active_U is None:
+                    continue
             used_fused_mix = False
             if self.channel_mode == "broadcast_rhs" and a_comp.dim() >= 2:
                 B_flat = 1
@@ -2117,9 +2505,7 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                         ).to(device=a_comp.device)
                         gates_bucket = None
                         if gates_all is not None:
-                            gates_bucket = torch.stack(
-                                [gates_all[:, int(p_idx)] for p_idx in bucket_path_indices], dim=-1
-                            )
+                            gates_bucket = _slice_or_index_lastdim(gates_all, [int(p_idx) for p_idx in bucket_path_indices])
                         bucket_out = _tp_cuda_ext_bucket_forward(
                             backend=self.ictd_tp_backend,
                             a=a_flat,
@@ -2140,22 +2526,60 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                             bucket_out = bucket_out.to(dtype=dtype) if bucket_out.dtype != dtype else bucket_out
                             out[l3] = out[l3] + bucket_out
                         continue
-            if self.channel_mode == "broadcast_rhs":
-                b_comp = b_comp[..., 0, :].unsqueeze(-2).unsqueeze(-2)
-            else:
-                b_comp = b_comp.unsqueeze(-2)
-
             m1 = 2 * l1 + 1
             m2 = 2 * l2 + 1
-            U = proj_list[g_idx]
-            t_mn = a_comp.unsqueeze(-1) * b_comp
-            t_flat = t_mn.reshape(*batch_shape, self.channel_mul, m1 * m2)
-            if not t_flat.is_contiguous():
-                t_flat = t_flat.contiguous()
-            y = torch.matmul(t_flat, U)
+            if active_segments is segments and active_U is proj_list[g_idx]:
+                view_meta = proj_view_list[g_idx]
+                U3 = view_meta["U3"]  # type: ignore[assignment]
+                seg_views = view_meta["seg_views"]  # type: ignore[assignment]
+            else:
+                U3 = active_U.reshape(m1, m2, -1)
+                seg_views = [(seg, U3[:, :, int(seg[-2]): int(seg[-1])]) for seg in active_segments]
+            if len(active_segments) <= 2:
+                if self.channel_mode == "broadcast_rhs":
+                    b_rhs = b_comp[..., 0, :]
+                    for seg, U_seg in seg_views:
+                        p_idx, l3, s, e = seg  # type: ignore[misc]
+                        Wp = self.weight[int(p_idx)]
+                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        out_seg = torch.einsum(
+                            "...cm,...n,mnk,oc->...ok",
+                            a_comp,
+                            b_rhs,
+                            U_seg,
+                            Wp_comp,
+                        )
+                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                        if weights is not None:
+                            out_seg = out_seg * weights[..., int(p_idx), None, None]
+                        out[int(l3)] = out[int(l3)] + out_seg
+                else:
+                    for seg, U_seg in seg_views:
+                        p_idx, l3, s, e = seg  # type: ignore[misc]
+                        Wp = self.weight[int(p_idx)]
+                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        out_seg = torch.einsum(
+                            "...cm,...cn,mnk,oc->...ok",
+                            a_comp,
+                            b_comp,
+                            U_seg,
+                            Wp_comp,
+                        )
+                        out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
+                        if weights is not None:
+                            out_seg = out_seg * weights[..., int(p_idx), None, None]
+                        out[int(l3)] = out[int(l3)] + out_seg
+                continue
+            if self.channel_mode == "broadcast_rhs":
+                b_rhs = b_comp[..., 0, :]
+                y = torch.einsum("...cm,...n,mnk->...ck", a_comp, b_rhs, U3)
+            else:
+                y = torch.einsum("...cm,...cn,mnk->...ck", a_comp, b_comp, U3)
             if _USE_BUCKETED_CHANNELWISE_MIX:
                 for bucket in bucket_list[g_idx]:
                     bucket_segments = bucket["segments"]  # type: ignore[assignment]
+                    if active_segments is not segments:
+                        continue
                     starts = [int(seg[-2]) for seg in bucket_segments]
                     kdim = int(bucket["kdim"])  # type: ignore[arg-type]
                     y_bucket = torch.stack([y[..., :, s : s + kdim] for s in starts], dim=-3)
@@ -2168,13 +2592,11 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                     out_bucket = out_bucket.to(dtype=dtype) if out_bucket.dtype != dtype else out_bucket
                     if weights is not None:
                         path_indices = [int(seg[0]) for seg in bucket_segments]
-                        gates_bucket = torch.stack(
-                            [weights[..., p_idx] for p_idx in path_indices], dim=-1
-                        )
+                        gates_bucket = _slice_or_index_lastdim(weights, path_indices)
                         out_bucket = out_bucket * gates_bucket[..., :, None, None]
                     out[int(bucket_segments[0][1])] = out[int(bucket_segments[0][1])] + out_bucket.sum(dim=-3)
             else:
-                for p_idx, l3, s, e in segments:  # type: ignore[misc]
+                for p_idx, l3, s, e in active_segments:  # type: ignore[misc]
                     Wp = self.weight[int(p_idx)]
                     Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
                     y_seg = y[..., :, int(s): int(e)]

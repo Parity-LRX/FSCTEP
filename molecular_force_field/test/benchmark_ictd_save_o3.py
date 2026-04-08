@@ -62,7 +62,8 @@ def build_models(device: torch.device, dtype: torch.dtype):
         hidden_dim=64,
         channel_in2=32,
         embedding_dim=16,
-        max_atomvalue=10,
+        # Dummy graphs use 1-based atomic labels in [1, 5].
+        max_atomvalue=max(10, 5 + 1),
         output_size=8,
         embed_size=[128, 128, 128],
         main_hidden_sizes3=[64, 32],

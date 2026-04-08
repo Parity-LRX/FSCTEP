@@ -458,8 +458,10 @@ class ICTDIrrepsE3Conv(nn.Module):
                 scale = self.external_tensor_scale_by_l[l] if self.external_tensor_scale_by_l is not None else 1.0
                 f_in[l] = f_in[l] + t_e * scale
 
-        x2 = {l: torch.zeros(edge_src.shape[0], self.output_size, 2 * l + 1, device=Ai.device, dtype=Ai.dtype) for l in range(self.lmax + 1)}
-        x2[0] = Ai[edge_dst].unsqueeze(-1)  # scalar only
+        # Only the scalar destination block is semantically active here. Supplying
+        # missing l>0 blocks lets the TP skip those groups entirely instead of
+        # spending time multiplying by explicit zeros.
+        x2 = {0: Ai[edge_dst].unsqueeze(-1)}
 
         emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
         emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=Ai.dtype)
