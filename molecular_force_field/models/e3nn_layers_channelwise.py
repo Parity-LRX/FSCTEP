@@ -481,13 +481,10 @@ class E3_TransformerLayer_multi(nn.Module):
         )
 
         irreps_input_multi = o3.Irreps(irreps_input) * self.num_interaction
-        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
-        self.product_3 = o3.FullyConnectedTensorProduct(
+        self.product_3 = o3.ElementwiseTensorProduct(
             irreps_input_multi,
             irreps_input_multi,
-            f"{scalar_channels}x0e",
-            shared_weights=True,
-            internal_weights=True,
+            ["0e"],
             normalization="component",
         )
 
