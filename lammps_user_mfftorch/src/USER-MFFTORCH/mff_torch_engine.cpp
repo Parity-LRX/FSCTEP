@@ -1078,14 +1078,14 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   }();
   const auto t_start = std::chrono::steady_clock::now();
 
-  auto pos = pos0.clone().detach().requires_grad_(true);
+  auto pos = pos0.detach().requires_grad_(true);
   auto edge_batch = buf_batch_.index_select(0, edge_src);
   auto edge_cells = cell.index_select(0, edge_batch);
   auto shift_vec = torch::einsum("ni,nij->nj", {edge_shifts, edge_cells});
 
   torch::Tensor shift_leaf;
   if (need_atom_virial) {
-    shift_leaf = shift_vec.clone().detach().requires_grad_(true);
+    shift_leaf = shift_vec.detach().requires_grad_(true);
   } else {
     shift_leaf = shift_vec;
   }
