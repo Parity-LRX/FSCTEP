@@ -242,7 +242,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         num_fidelity_levels: int = 0,
         # Learnable per-l scale for external injection; default 0 keeps behavior unchanged at init.
         external_tensor_scale_init: float = 0.0,
-        ictd_tp_backend: str = "auto",
+        ictd_tp_backend: str = "pytorch",
     ):
         super().__init__()
         self.max_radius = max_radius
@@ -511,7 +511,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         k_policy: str = "k0",
         # Internal computation dtype for ICTD operations (default: float64 for stability)
         internal_compute_dtype: torch.dtype | None = None,
-        ictd_tp_backend: str = "auto",
+        ictd_tp_backend: str = "pytorch",
         # Optional: allow per-l multiplicities for the "product_5-like" scalar invariant vector.
         # If None: keep current behavior (mul_l = channels for all l).
         # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
