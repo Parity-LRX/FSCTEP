@@ -5,72 +5,6 @@
 using torch::Tensor;
 
 #ifdef WITH_CUDA
-Tensor project_bucket_forward_cuda(
-    const Tensor& a,
-    const Tensor& b,
-    const Tensor& u_bucket,
-    int64_t num_paths);
-Tensor project_bucket_transpose_a_cuda(
-    const Tensor& grad_y,
-    const Tensor& b,
-    const Tensor& u_bucket);
-Tensor project_bucket_transpose_b_cuda(
-    const Tensor& grad_y,
-    const Tensor& a,
-    const Tensor& u_bucket);
-Tensor project_bucket_transpose_u_cuda(
-    const Tensor& grad_y,
-    const Tensor& a,
-    const Tensor& b);
-Tensor mix_bucket_forward_cuda(
-    const Tensor& y,
-    const Tensor& w,
-    const Tensor& gates);
-Tensor mix_bucket_transpose_y_cuda(
-    const Tensor& grad_out,
-    const Tensor& w,
-    const Tensor& gates);
-Tensor mix_bucket_transpose_w_cuda(
-    const Tensor& grad_out,
-    const Tensor& y,
-    const Tensor& gates);
-Tensor mix_bucket_transpose_g_cuda(
-    const Tensor& grad_out,
-    const Tensor& y,
-    const Tensor& w);
-Tensor project_dbl_bwd_grad_h_cuda(
-    const Tensor& a, const Tensor& gga,
-    const Tensor& b, const Tensor& ggb,
-    const Tensor& u, const Tensor& ggu,
-    int64_t num_paths);
-Tensor project_dbl_bwd_grad_a_cuda(
-    const Tensor& h,
-    const Tensor& b, const Tensor& ggb,
-    const Tensor& u, const Tensor& ggu);
-Tensor project_dbl_bwd_grad_b_cuda(
-    const Tensor& h,
-    const Tensor& a, const Tensor& gga,
-    const Tensor& u, const Tensor& ggu);
-Tensor project_dbl_bwd_grad_u_cuda(
-    const Tensor& h,
-    const Tensor& a, const Tensor& gga,
-    const Tensor& b, const Tensor& ggb);
-Tensor mix_dbl_bwd_grad_g_out_cuda(
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& w, const Tensor& ggw,
-    const Tensor& gates, const Tensor& ggg);
-Tensor mix_dbl_bwd_grad_y_cuda(
-    const Tensor& g_out,
-    const Tensor& w, const Tensor& ggw,
-    const Tensor& gates, const Tensor& ggg);
-Tensor mix_dbl_bwd_grad_w_cuda(
-    const Tensor& g_out,
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& gates, const Tensor& ggg);
-Tensor mix_dbl_bwd_grad_g_cuda(
-    const Tensor& g_out,
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& w, const Tensor& ggw);
 #endif
 
 namespace {
@@ -155,12 +89,6 @@ Tensor project_bucket_forward(
   const auto m1 = a.size(2);
   const auto m2 = b.size(2);
 
-#ifdef WITH_CUDA
-  if (a.is_cuda() && mul_in2 == 1) {
-    return project_bucket_forward_cuda(a, b, u_bucket, num_paths);
-  }
-#endif
-
   auto a_c = a.contiguous();
   auto b_c = b.contiguous();
   auto u_stage1 = pack_u_stage1(u_bucket, m1, m2);                          // (m1, pk*m2)
@@ -194,12 +122,6 @@ Tensor project_bucket_transpose_a(
   const auto pk = num_paths * kdim;
   TORCH_CHECK(m1 * m2 == u_bucket.size(0), "u_bucket first dim must factor into m1*m2");
 
-#ifdef WITH_CUDA
-  if (grad_y.is_cuda() && mul_in2 == 1) {
-    return project_bucket_transpose_a_cuda(grad_y, b, u_bucket);
-  }
-#endif
-
   auto grad_rows = grad_y_to_stage2_rows(grad_y, mul_in1, mul_in2);        // (B, I*pk, J)
   auto grad_tmp = at::bmm(grad_rows, b.contiguous());                       // (B, I*pk, m2)
   auto grad_tmp_flat = grad_tmp.view({batch * mul_in1, pk * m2});          // (B*I, pk*m2)
@@ -226,12 +148,6 @@ Tensor project_bucket_transpose_b(
   const auto pk = num_paths * kdim;
   TORCH_CHECK(m1 * m2 == u_bucket.size(0), "u_bucket first dim must factor into m1*m2");
 
-#ifdef WITH_CUDA
-  if (grad_y.is_cuda() && mul_in2 == 1) {
-    return project_bucket_transpose_b_cuda(grad_y, a, u_bucket);
-  }
-#endif
-
   auto grad_rows = grad_y_to_stage2_rows(grad_y, mul_in1, mul_in2);        // (B, I*pk, J)
   auto u_stage1 = pack_u_stage1(u_bucket, m1, m2);                          // (m1, pk*m2)
   auto tmp_flat = at::matmul(a.contiguous().view({batch * mul_in1, m1}), u_stage1);  // (B*I, pk*m2)
@@ -255,11 +171,6 @@ Tensor project_bucket_transpose_u(
   const auto num_paths = grad_y.size(1);
   const auto kdim = grad_y.size(2);
   const auto pk = num_paths * kdim;
-#ifdef WITH_CUDA
-  if (grad_y.is_cuda() && mul_in2 == 1) {
-    return project_bucket_transpose_u_cuda(grad_y, a, b);
-  }
-#endif
   auto grad_rows = grad_y_to_stage2_rows(grad_y, mul_in1, mul_in2);        // (B, I*pk, J)
   auto grad_tmp = at::bmm(grad_rows, b.contiguous());                       // (B, I*pk, m2)
   auto grad_tmp_flat = grad_tmp.view({grad_tmp.size(0), mul_in1, pk * m2});  // (B, I, pk*m2)
@@ -278,12 +189,6 @@ Tensor mix_bucket_forward(
   const auto kdim = y.size(2);
   const auto ij = y.size(3);
   const auto mul_out = w.size(1);
-
-#ifdef WITH_CUDA
-  if (y.is_cuda()) {
-    return mix_bucket_forward_cuda(y, w, gates);
-  }
-#endif
 
   auto y_bmm = y.permute({1, 0, 2, 3}).contiguous().view({num_paths, batch * kdim, ij});
   auto w_bmm = w.permute({0, 2, 1}).contiguous();
@@ -308,12 +213,6 @@ Tensor mix_bucket_transpose_y(
   TORCH_CHECK(w.size(1) == mul_out, "w output dim must match grad_out");
   TORCH_CHECK(gates.size(0) == batch && gates.size(1) == num_paths, "gates must match grad_out and w");
 
-#ifdef WITH_CUDA
-  if (grad_out.is_cuda()) {
-    return mix_bucket_transpose_y_cuda(grad_out, w, gates);
-  }
-#endif
-
   auto grad_out_gated = grad_out.contiguous().unsqueeze(1) * gates.contiguous().view({batch, num_paths, 1, 1});
   auto lhs = grad_out_gated.permute({1, 0, 3, 2}).contiguous().view({num_paths, batch * kdim, mul_out});
   auto rhs = w.contiguous();
@@ -331,12 +230,6 @@ Tensor mix_bucket_transpose_w(
   const auto kdim = y.size(2);
   const auto ij = y.size(3);
   const auto mul_out = grad_out.size(1);
-
-#ifdef WITH_CUDA
-  if (grad_out.is_cuda()) {
-    return mix_bucket_transpose_w_cuda(grad_out, y, gates);
-  }
-#endif
 
   auto grad_out_gated = grad_out.contiguous().unsqueeze(1) * gates.contiguous().view({batch, num_paths, 1, 1});
   auto lhs = grad_out_gated.permute({1, 2, 0, 3}).contiguous().view({num_paths, mul_out, batch * kdim});
@@ -358,12 +251,6 @@ Tensor mix_bucket_transpose_g(
   const auto mul_out = grad_out.size(1);
   TORCH_CHECK(grad_out.size(0) == batch && grad_out.size(2) == kdim, "grad_out must match y");
   TORCH_CHECK(w.size(0) == num_paths && w.size(1) == mul_out && w.size(2) == ij, "w must match y and grad_out");
-
-#ifdef WITH_CUDA
-  if (grad_out.is_cuda()) {
-    return mix_bucket_transpose_g_cuda(grad_out, y, w);
-  }
-#endif
 
   auto y_bmm = y.permute({1, 0, 2, 3}).contiguous().view({num_paths, batch * kdim, ij});
   auto w_bmm = w.permute({0, 2, 1}).contiguous();
@@ -393,11 +280,6 @@ Tensor project_dbl_bwd_grad_h(
     const Tensor& b, const Tensor& ggb,
     const Tensor& u, const Tensor& ggu,
     int64_t num_paths) {
-#ifdef WITH_CUDA
-  if (a.is_cuda()) {
-    return project_dbl_bwd_grad_h_cuda(a, gga, b, ggb, u, ggu, num_paths);
-  }
-#endif
   TORCH_CHECK(false, "project_dbl_bwd_grad_h requires CUDA tensors");
   return {};
 }
@@ -406,11 +288,6 @@ Tensor project_dbl_bwd_grad_a(
     const Tensor& h,
     const Tensor& b, const Tensor& ggb,
     const Tensor& u, const Tensor& ggu) {
-#ifdef WITH_CUDA
-  if (h.is_cuda()) {
-    return project_dbl_bwd_grad_a_cuda(h, b, ggb, u, ggu);
-  }
-#endif
   TORCH_CHECK(false, "project_dbl_bwd_grad_a requires CUDA tensors");
   return {};
 }
@@ -419,11 +296,6 @@ Tensor project_dbl_bwd_grad_b(
     const Tensor& h,
     const Tensor& a, const Tensor& gga,
     const Tensor& u, const Tensor& ggu) {
-#ifdef WITH_CUDA
-  if (h.is_cuda()) {
-    return project_dbl_bwd_grad_b_cuda(h, a, gga, u, ggu);
-  }
-#endif
   TORCH_CHECK(false, "project_dbl_bwd_grad_b requires CUDA tensors");
   return {};
 }
@@ -432,11 +304,6 @@ Tensor project_dbl_bwd_grad_u(
     const Tensor& h,
     const Tensor& a, const Tensor& gga,
     const Tensor& b, const Tensor& ggb) {
-#ifdef WITH_CUDA
-  if (h.is_cuda()) {
-    return project_dbl_bwd_grad_u_cuda(h, a, gga, b, ggb);
-  }
-#endif
   TORCH_CHECK(false, "project_dbl_bwd_grad_u requires CUDA tensors");
   return {};
 }
@@ -445,11 +312,6 @@ Tensor mix_dbl_bwd_grad_g_out(
     const Tensor& y, const Tensor& ggy,
     const Tensor& w, const Tensor& ggw,
     const Tensor& gates, const Tensor& ggg) {
-#ifdef WITH_CUDA
-  if (y.is_cuda()) {
-    return mix_dbl_bwd_grad_g_out_cuda(y, ggy, w, ggw, gates, ggg);
-  }
-#endif
   TORCH_CHECK(false, "mix_dbl_bwd_grad_g_out requires CUDA tensors");
   return {};
 }
@@ -458,11 +320,6 @@ Tensor mix_dbl_bwd_grad_y(
     const Tensor& g_out,
     const Tensor& w, const Tensor& ggw,
     const Tensor& gates, const Tensor& ggg) {
-#ifdef WITH_CUDA
-  if (g_out.is_cuda()) {
-    return mix_dbl_bwd_grad_y_cuda(g_out, w, ggw, gates, ggg);
-  }
-#endif
   TORCH_CHECK(false, "mix_dbl_bwd_grad_y requires CUDA tensors");
   return {};
 }
@@ -471,11 +328,6 @@ Tensor mix_dbl_bwd_grad_w(
     const Tensor& g_out,
     const Tensor& y, const Tensor& ggy,
     const Tensor& gates, const Tensor& ggg) {
-#ifdef WITH_CUDA
-  if (g_out.is_cuda()) {
-    return mix_dbl_bwd_grad_w_cuda(g_out, y, ggy, gates, ggg);
-  }
-#endif
   TORCH_CHECK(false, "mix_dbl_bwd_grad_w requires CUDA tensors");
   return {};
 }
@@ -484,11 +336,6 @@ Tensor mix_dbl_bwd_grad_g(
     const Tensor& g_out,
     const Tensor& y, const Tensor& ggy,
     const Tensor& w, const Tensor& ggw) {
-#ifdef WITH_CUDA
-  if (g_out.is_cuda()) {
-    return mix_dbl_bwd_grad_g_cuda(g_out, y, ggy, w, ggw);
-  }
-#endif
   TORCH_CHECK(false, "mix_dbl_bwd_grad_g requires CUDA tensors");
   return {};
 }

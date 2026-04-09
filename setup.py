@@ -20,7 +20,10 @@ if readme_file.exists():
     long_description = readme_file.read_text(encoding='utf-8')
 
 def _get_ext_modules():
-    if os.environ.get("MFF_BUILD_ICTD_TP_EXT", "1") != "1":
+    # The optional ICTD TP extension is opt-in by default.
+    # Current stable installs should prefer the pure-PyTorch path unless the
+    # user explicitly requests extension builds for local experimentation.
+    if os.environ.get("MFF_BUILD_ICTD_TP_EXT", "0") != "1":
         return []
     if CppExtension is None:
         return []

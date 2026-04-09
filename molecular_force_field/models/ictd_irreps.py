@@ -138,8 +138,6 @@ def _build_kdim_buckets(
     return buckets
 
 
-
-
 def _detect_scalar_identity_group_meta(
     U: torch.Tensor,
     *,
@@ -1097,7 +1095,12 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
             segments = g["segments"]  # type: ignore[assignment]
             U3 = proj_list[g_idx].reshape(2 * l1 + 1, 2 * l2 + 1, -1)
             seg_views = [(seg, U3[:, :, int(seg[-2]): int(seg[-1])]) for seg in segments]
-            views.append({"U3": U3, "seg_views": seg_views})
+            views.append(
+                {
+                    "U3": U3,
+                    "seg_views": seg_views,
+                }
+            )
         self._proj_group_view_cache_by_dev_dtype[key] = views
         return views
 

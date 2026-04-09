@@ -1,3 +1,18 @@
+// Group-level CUDA kernels for HarmonicChannelWiseTensorProduct (SO3, broadcast_rhs).
+//
+// All kernels assume:
+//   - broadcast_rhs channel mode (mul_in2 == 1, so `b_rhs` has shape (B, m2))
+//   - float32 compute dtype
+//   - inputs and outputs are contiguous
+//   - `seg_starts[p]` / `seg_ends[p]` describe segment offsets into the group's
+//     concatenated k axis, k_total = sum over segments of (2*l3+1).
+//
+// The forward produces a zero-padded (B, P, O, k_total) tensor; each path p's
+// valid region is [seg_starts[p], seg_ends[p]), the rest is explicitly zeroed.
+// Callers slice per segment to accumulate into per-l3 outputs. The backward
+// kernels treat grad_y outside a segment as zero regardless of what the caller
+// writes there.
+
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -11,1371 +26,791 @@ using torch::Tensor;
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// Forward
+// y[b,p,o,k] = sum_{c,m,n} a[b,c,m] * b_rhs[b,n] * U[m*m2+n,k] * W[p,o,c]
+//              for k in [seg_starts[p], seg_ends[p]), else 0.
+// One CUDA block per batch index b. Shared memory caches a[b,:,:], b_rhs[b,:],
+// U (group-shared), and Z[c,k] = sum_{m,n} a[b,c,m]*b_rhs[b,n]*U[m*m2+n,k].
+// ---------------------------------------------------------------------------
 template <typename scalar_t>
-__global__ void project_forward_mul_in2eq1_kernel(
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ b,
-    const scalar_t* __restrict__ u,
-    scalar_t* __restrict__ y,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * pk * mul_in1;
-  if (linear >= total) {
-    return;
+__global__ void channelwise_group_forward_kernel(
+    const scalar_t* __restrict__ a,           // (B, C, m1)
+    const scalar_t* __restrict__ b_rhs,       // (B, m2)
+    const scalar_t* __restrict__ U,           // (m1*m2, k_total)
+    const scalar_t* __restrict__ W,           // (P, O, C)
+    const int64_t* __restrict__ seg_starts,   // (P,)
+    const int64_t* __restrict__ seg_ends,     // (P,)
+    scalar_t* __restrict__ y,                 // (B, P, O, k_total)
+    const int C,
+    const int m1,
+    const int m2,
+    const int k_total,
+    const int P,
+    const int O) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
+  scalar_t* a_s = smem;                               // C*m1
+  scalar_t* b_s = a_s + C * m1;                       // m2
+  scalar_t* U_s = b_s + m2;                           // m1*m2*k_total
+  scalar_t* Z_s = U_s + m1 * m2 * k_total;            // C*k_total
+
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int blk = blockDim.x;
+
+  // Load a[b, :, :]
+  const int a_count = C * m1;
+  for (int i = tid; i < a_count; i += blk) {
+    a_s[i] = a[b * a_count + i];
   }
-
-  const int64_t i = linear % mul_in1;
-  const int64_t tmp = linear / mul_in1;
-  const int64_t pk_idx = tmp % pk;
-  const int64_t b_idx = tmp / pk;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t mi = 0; mi < m1; ++mi) {
-    const scalar_t a_val = a[(b_idx * mul_in1 + i) * m1 + mi];
-    const int64_t u_base = (mi * m2) * pk + pk_idx;
-    for (int64_t mj = 0; mj < m2; ++mj) {
-      acc += a_val * b[b_idx * m2 + mj] * u[u_base + mj * pk];
-    }
+  // Load b_rhs[b, :]
+  for (int i = tid; i < m2; i += blk) {
+    b_s[i] = b_rhs[b * m2 + i];
   }
-  y[(b_idx * pk + pk_idx) * mul_in1 + i] = acc;
-}
-
-template <typename scalar_t>
-__global__ void project_transpose_a_mul_in2eq1_kernel(
-    const scalar_t* __restrict__ grad_y,
-    const scalar_t* __restrict__ b,
-    const scalar_t* __restrict__ u,
-    scalar_t* __restrict__ grad_a,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  extern __shared__ char smem_raw_a[];
-  scalar_t* u_smem = reinterpret_cast<scalar_t*>(smem_raw_a);
-
-  const int64_t u_total = m1 * m2 * pk;
-  for (int64_t idx = threadIdx.x; idx < u_total; idx += blockDim.x) {
-    u_smem[idx] = u[idx];
+  // Load U
+  const int u_count = m1 * m2 * k_total;
+  for (int i = tid; i < u_count; i += blk) {
+    U_s[i] = U[i];
   }
   __syncthreads();
 
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * mul_in1 * m1;
-  if (linear >= total) {
-    return;
-  }
-
-  const int64_t mi = linear % m1;
-  const int64_t tmp = linear / m1;
-  const int64_t i = tmp % mul_in1;
-  const int64_t b_idx = tmp / mul_in1;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t pk_idx = 0; pk_idx < pk; ++pk_idx) {
-    scalar_t inner = scalar_t(0);
-    const int64_t u_base = (mi * m2) * pk + pk_idx;
-    for (int64_t mj = 0; mj < m2; ++mj) {
-      inner += b[b_idx * m2 + mj] * u_smem[u_base + mj * pk];
-    }
-    acc += grad_y[(b_idx * pk + pk_idx) * mul_in1 + i] * inner;
-  }
-  grad_a[(b_idx * mul_in1 + i) * m1 + mi] = acc;
-}
-
-template <typename scalar_t>
-__global__ void project_transpose_b_mul_in2eq1_kernel(
-    const scalar_t* __restrict__ grad_y,
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ u,
-    scalar_t* __restrict__ grad_b,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  extern __shared__ char smem_raw_b[];
-  scalar_t* u_smem = reinterpret_cast<scalar_t*>(smem_raw_b);
-
-  const int64_t u_total = m1 * m2 * pk;
-  for (int64_t idx = threadIdx.x; idx < u_total; idx += blockDim.x) {
-    u_smem[idx] = u[idx];
-  }
-  __syncthreads();
-
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * m2;
-  if (linear >= total) {
-    return;
-  }
-
-  const int64_t mj = linear % m2;
-  const int64_t b_idx = linear / m2;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t pk_idx = 0; pk_idx < pk; ++pk_idx) {
-    for (int64_t i = 0; i < mul_in1; ++i) {
-      scalar_t inner = scalar_t(0);
-      for (int64_t mi = 0; mi < m1; ++mi) {
-        inner += a[(b_idx * mul_in1 + i) * m1 + mi] * u_smem[(mi * m2 + mj) * pk + pk_idx];
+  // Z[c, k] = sum_{m, n} a[b,c,m] * b_rhs[b,n] * U[m*m2+n, k]
+  const int z_total = C * k_total;
+  for (int idx = tid; idx < z_total; idx += blk) {
+    const int k = idx % k_total;
+    const int c = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    const scalar_t* a_c = a_s + c * m1;
+    for (int m = 0; m < m1; ++m) {
+      const scalar_t av = a_c[m];
+      const scalar_t* U_row = U_s + (m * m2) * k_total + k;
+      for (int n = 0; n < m2; ++n) {
+        acc += av * b_s[n] * U_row[n * k_total];
       }
-      acc += grad_y[(b_idx * pk + pk_idx) * mul_in1 + i] * inner;
     }
+    Z_s[c * k_total + k] = acc;
   }
-  grad_b[b_idx * m2 + mj] = acc;
+  __syncthreads();
+
+  // y[b, p, o, k] = sum_c Z[c, k] * W[p, o, c]   (masked outside segment)
+  const int y_total = P * O * k_total;
+  for (int idx = tid; idx < y_total; idx += blk) {
+    const int k = idx % k_total;
+    int rem = idx / k_total;
+    const int o = rem % O;
+    const int p = rem / O;
+    const int s = static_cast<int>(seg_starts[p]);
+    const int e = static_cast<int>(seg_ends[p]);
+    scalar_t out = scalar_t(0);
+    if (k >= s && k < e) {
+      const scalar_t* W_po = W + (p * O + o) * C;
+      for (int c = 0; c < C; ++c) {
+        out += Z_s[c * k_total + k] * W_po[c];
+      }
+    }
+    y[((b * P + p) * O + o) * k_total + k] = out;
+  }
 }
 
+// ---------------------------------------------------------------------------
+// Backward w.r.t. a
+// grad_a[b,c,m] = sum_{p,o,n,k_in_seg} G[b,p,o,k] * b_rhs[b,n] * U[mn,k] * W[p,o,c]
+//              = sum_k Q[b,c,k] * T[b,m,k]
+// where
+//   Q[b,c,k]  = sum_{p,o} G[b,p,o,k] * W[p,o,c]      (effective G is masked by segments)
+//   T[b,m,k]  = sum_n b_rhs[b,n] * U[mn,k]
+// ---------------------------------------------------------------------------
 template <typename scalar_t>
-__global__ void project_transpose_u_mul_in2eq1_kernel(
-    const scalar_t* __restrict__ grad_y,
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ b,
-    scalar_t* __restrict__ grad_u,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = m1 * m2 * pk;
-  if (linear >= total) return;
+__global__ void channelwise_group_transpose_a_kernel(
+    const scalar_t* __restrict__ grad_y,      // (B, P, O, k_total)
+    const scalar_t* __restrict__ b_rhs,       // (B, m2)
+    const scalar_t* __restrict__ U,           // (m1*m2, k_total)
+    const scalar_t* __restrict__ W,           // (P, O, C)
+    const int64_t* __restrict__ seg_starts,   // (P,)
+    const int64_t* __restrict__ seg_ends,     // (P,)
+    scalar_t* __restrict__ grad_a,            // (B, C, m1)
+    const int C,
+    const int m1,
+    const int m2,
+    const int k_total,
+    const int P,
+    const int O) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
+  scalar_t* G_s = smem;                               // P*O*k_total
+  scalar_t* b_s = G_s + P * O * k_total;              // m2
+  scalar_t* U_s = b_s + m2;                           // m1*m2*k_total
+  scalar_t* Q_s = U_s + m1 * m2 * k_total;            // C*k_total
+  scalar_t* T_s = Q_s + C * k_total;                  // m1*k_total
 
-  const int64_t pk_idx = linear % pk;
-  const int64_t tmp = linear / pk;
-  const int64_t mj = tmp % m2;
-  const int64_t mi = tmp / m2;
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int blk = blockDim.x;
 
-  scalar_t acc = scalar_t(0);
-  for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
-    const scalar_t b_val = b[b_idx * m2 + mj];
-    for (int64_t i = 0; i < mul_in1; ++i) {
-      acc += grad_y[(b_idx * pk + pk_idx) * mul_in1 + i] *
-             a[(b_idx * mul_in1 + i) * m1 + mi] *
-             b_val;
-    }
+  // Load grad_y[b] with segment masking
+  const int g_total = P * O * k_total;
+  for (int idx = tid; idx < g_total; idx += blk) {
+    const int k = idx % k_total;
+    int rem = idx / k_total;
+    const int o = rem % O;
+    const int p = rem / O;
+    const int s = static_cast<int>(seg_starts[p]);
+    const int e = static_cast<int>(seg_ends[p]);
+    scalar_t g = (k >= s && k < e)
+                     ? grad_y[((b * P + p) * O + o) * k_total + k]
+                     : scalar_t(0);
+    G_s[idx] = g;
   }
-  grad_u[(mi * m2 + mj) * pk + pk_idx] = acc;
+  for (int i = tid; i < m2; i += blk) {
+    b_s[i] = b_rhs[b * m2 + i];
+  }
+  const int u_count = m1 * m2 * k_total;
+  for (int i = tid; i < u_count; i += blk) {
+    U_s[i] = U[i];
+  }
+  __syncthreads();
+
+  // Q[c, k] = sum_{p, o} G[p, o, k] * W[p, o, c]
+  const int q_total = C * k_total;
+  for (int idx = tid; idx < q_total; idx += blk) {
+    const int k = idx % k_total;
+    const int c = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    for (int p = 0; p < P; ++p) {
+      for (int o = 0; o < O; ++o) {
+        acc += G_s[(p * O + o) * k_total + k] * W[(p * O + o) * C + c];
+      }
+    }
+    Q_s[c * k_total + k] = acc;
+  }
+
+  // T[m, k] = sum_n b_rhs[n] * U[m*m2+n, k]
+  const int t_total = m1 * k_total;
+  for (int idx = tid; idx < t_total; idx += blk) {
+    const int k = idx % k_total;
+    const int m = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    for (int n = 0; n < m2; ++n) {
+      acc += b_s[n] * U_s[(m * m2 + n) * k_total + k];
+    }
+    T_s[m * k_total + k] = acc;
+  }
+  __syncthreads();
+
+  // grad_a[b, c, m] = sum_k Q[c, k] * T[m, k]
+  const int a_total = C * m1;
+  for (int idx = tid; idx < a_total; idx += blk) {
+    const int m = idx % m1;
+    const int c = idx / m1;
+    scalar_t acc = scalar_t(0);
+    const scalar_t* Q_row = Q_s + c * k_total;
+    const scalar_t* T_row = T_s + m * k_total;
+    for (int k = 0; k < k_total; ++k) {
+      acc += Q_row[k] * T_row[k];
+    }
+    grad_a[b * a_total + idx] = acc;
+  }
 }
 
+// ---------------------------------------------------------------------------
+// Backward w.r.t. b_rhs
+// grad_b[b,n] = sum_{c,m,k} a[b,c,m] * U[mn,k] * Q[b,c,k]
+//             = sum_{m,k} S[b,m,k] * U[mn,k]
+// where S[b,m,k] = sum_c a[b,c,m] * Q[b,c,k], and Q as in grad_a kernel.
+// ---------------------------------------------------------------------------
 template <typename scalar_t>
-void launch_project_forward_mul_in2eq1(
+__global__ void channelwise_group_transpose_b_kernel(
+    const scalar_t* __restrict__ grad_y,      // (B, P, O, k_total)
+    const scalar_t* __restrict__ a,           // (B, C, m1)
+    const scalar_t* __restrict__ U,           // (m1*m2, k_total)
+    const scalar_t* __restrict__ W,           // (P, O, C)
+    const int64_t* __restrict__ seg_starts,   // (P,)
+    const int64_t* __restrict__ seg_ends,     // (P,)
+    scalar_t* __restrict__ grad_b,            // (B, m2)
+    const int C,
+    const int m1,
+    const int m2,
+    const int k_total,
+    const int P,
+    const int O) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
+  scalar_t* G_s = smem;                               // P*O*k_total
+  scalar_t* a_s = G_s + P * O * k_total;              // C*m1
+  scalar_t* U_s = a_s + C * m1;                       // m1*m2*k_total
+  scalar_t* Q_s = U_s + m1 * m2 * k_total;            // C*k_total
+  scalar_t* S_s = Q_s + C * k_total;                  // m1*k_total
+
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int blk = blockDim.x;
+
+  // Load grad_y[b] masked
+  const int g_total = P * O * k_total;
+  for (int idx = tid; idx < g_total; idx += blk) {
+    const int k = idx % k_total;
+    int rem = idx / k_total;
+    const int o = rem % O;
+    const int p = rem / O;
+    const int s = static_cast<int>(seg_starts[p]);
+    const int e = static_cast<int>(seg_ends[p]);
+    scalar_t g = (k >= s && k < e)
+                     ? grad_y[((b * P + p) * O + o) * k_total + k]
+                     : scalar_t(0);
+    G_s[idx] = g;
+  }
+  const int a_count = C * m1;
+  for (int i = tid; i < a_count; i += blk) {
+    a_s[i] = a[b * a_count + i];
+  }
+  const int u_count = m1 * m2 * k_total;
+  for (int i = tid; i < u_count; i += blk) {
+    U_s[i] = U[i];
+  }
+  __syncthreads();
+
+  // Q[c, k]
+  const int q_total = C * k_total;
+  for (int idx = tid; idx < q_total; idx += blk) {
+    const int k = idx % k_total;
+    const int c = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    for (int p = 0; p < P; ++p) {
+      for (int o = 0; o < O; ++o) {
+        acc += G_s[(p * O + o) * k_total + k] * W[(p * O + o) * C + c];
+      }
+    }
+    Q_s[c * k_total + k] = acc;
+  }
+  __syncthreads();
+
+  // S[m, k] = sum_c a[c, m] * Q[c, k]
+  const int s_total = m1 * k_total;
+  for (int idx = tid; idx < s_total; idx += blk) {
+    const int k = idx % k_total;
+    const int m = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    for (int c = 0; c < C; ++c) {
+      acc += a_s[c * m1 + m] * Q_s[c * k_total + k];
+    }
+    S_s[m * k_total + k] = acc;
+  }
+  __syncthreads();
+
+  // grad_b[b, n] = sum_{m, k} S[m, k] * U[m*m2+n, k]
+  for (int n = tid; n < m2; n += blk) {
+    scalar_t acc = scalar_t(0);
+    for (int m = 0; m < m1; ++m) {
+      const scalar_t* U_row = U_s + (m * m2 + n) * k_total;
+      const scalar_t* S_row = S_s + m * k_total;
+      for (int k = 0; k < k_total; ++k) {
+        acc += S_row[k] * U_row[k];
+      }
+    }
+    grad_b[b * m2 + n] = acc;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backward w.r.t. U
+// grad_U[mn,k] = sum_{b,c} a[b,c,m] * b_rhs[b,n] * X[b,c,k]
+// where X[b,c,k] = sum_{p,o} G[b,p,o,k] * W[p,o,c] (effective G masked).
+//
+// One block per batch index b. Each block accumulates its local contribution
+// to grad_U in shared memory, then atomicAdds that contribution into the
+// global grad_U tensor.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void channelwise_group_transpose_u_kernel(
+    const scalar_t* __restrict__ grad_y,      // (B, P, O, k_total)
+    const scalar_t* __restrict__ a,           // (B, C, m1)
+    const scalar_t* __restrict__ b_rhs,       // (B, m2)
+    const scalar_t* __restrict__ W,           // (P, O, C)
+    const int64_t* __restrict__ seg_starts,   // (P,)
+    const int64_t* __restrict__ seg_ends,     // (P,)
+    scalar_t* __restrict__ grad_U,            // (m1*m2, k_total)
+    const int C,
+    const int m1,
+    const int m2,
+    const int k_total,
+    const int P,
+    const int O) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
+  scalar_t* G_s = smem;                               // P*O*k_total
+  scalar_t* a_s = G_s + P * O * k_total;              // C*m1
+  scalar_t* b_s = a_s + C * m1;                       // m2
+  scalar_t* X_s = b_s + m2;                           // C*k_total
+  scalar_t* gU_s = X_s + C * k_total;                 // m1*m2*k_total
+
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int blk = blockDim.x;
+
+  // Load grad_y[b] masked
+  const int g_total = P * O * k_total;
+  for (int idx = tid; idx < g_total; idx += blk) {
+    const int k = idx % k_total;
+    int rem = idx / k_total;
+    const int o = rem % O;
+    const int p = rem / O;
+    const int s = static_cast<int>(seg_starts[p]);
+    const int e = static_cast<int>(seg_ends[p]);
+    scalar_t g = (k >= s && k < e)
+                     ? grad_y[((b * P + p) * O + o) * k_total + k]
+                     : scalar_t(0);
+    G_s[idx] = g;
+  }
+  const int a_count = C * m1;
+  for (int i = tid; i < a_count; i += blk) {
+    a_s[i] = a[b * a_count + i];
+  }
+  for (int i = tid; i < m2; i += blk) {
+    b_s[i] = b_rhs[b * m2 + i];
+  }
+  __syncthreads();
+
+  // X[c, k] = sum_{p, o} G[p, o, k] * W[p, o, c]
+  const int x_total = C * k_total;
+  for (int idx = tid; idx < x_total; idx += blk) {
+    const int k = idx % k_total;
+    const int c = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    for (int p = 0; p < P; ++p) {
+      for (int o = 0; o < O; ++o) {
+        acc += G_s[(p * O + o) * k_total + k] * W[(p * O + o) * C + c];
+      }
+    }
+    X_s[c * k_total + k] = acc;
+  }
+  __syncthreads();
+
+  // Local grad_U contribution: gU_s[m*m2+n, k] = sum_c a[c,m] * b_rhs[n] * X[c, k]
+  const int gu_total = m1 * m2 * k_total;
+  for (int idx = tid; idx < gu_total; idx += blk) {
+    const int k = idx % k_total;
+    int rem = idx / k_total;
+    const int n = rem % m2;
+    const int m = rem / m2;
+    const scalar_t bn = b_s[n];
+    scalar_t acc = scalar_t(0);
+    for (int c = 0; c < C; ++c) {
+      acc += a_s[c * m1 + m] * bn * X_s[c * k_total + k];
+    }
+    gU_s[idx] = acc;
+  }
+  __syncthreads();
+
+  // AtomicAdd local gU to global grad_U
+  for (int idx = tid; idx < gu_total; idx += blk) {
+    atomicAdd(grad_U + idx, gU_s[idx]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backward w.r.t. W
+// grad_W[p,o,c] = sum_{b, k in [s_p, e_p)} G[b,p,o,k] * Z[b,c,k]
+// where Z[b,c,k] = sum_{m,n} a[b,c,m] * b_rhs[b,n] * U[mn,k]  (same as forward).
+//
+// One block per batch b. Accumulate local contribution in smem, atomicAdd to
+// global grad_W at the end.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void channelwise_group_transpose_w_kernel(
+    const scalar_t* __restrict__ grad_y,      // (B, P, O, k_total)
+    const scalar_t* __restrict__ a,           // (B, C, m1)
+    const scalar_t* __restrict__ b_rhs,       // (B, m2)
+    const scalar_t* __restrict__ U,           // (m1*m2, k_total)
+    const int64_t* __restrict__ seg_starts,   // (P,)
+    const int64_t* __restrict__ seg_ends,     // (P,)
+    scalar_t* __restrict__ grad_W,            // (P, O, C)
+    const int C,
+    const int m1,
+    const int m2,
+    const int k_total,
+    const int P,
+    const int O) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
+  scalar_t* G_s = smem;                               // P*O*k_total
+  scalar_t* a_s = G_s + P * O * k_total;              // C*m1
+  scalar_t* b_s = a_s + C * m1;                       // m2
+  scalar_t* U_s = b_s + m2;                           // m1*m2*k_total
+  scalar_t* Z_s = U_s + m1 * m2 * k_total;            // C*k_total
+
+  const int b = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int blk = blockDim.x;
+
+  // Load grad_y[b] masked
+  const int g_total = P * O * k_total;
+  for (int idx = tid; idx < g_total; idx += blk) {
+    const int k = idx % k_total;
+    int rem = idx / k_total;
+    const int o = rem % O;
+    const int p = rem / O;
+    const int s = static_cast<int>(seg_starts[p]);
+    const int e = static_cast<int>(seg_ends[p]);
+    scalar_t g = (k >= s && k < e)
+                     ? grad_y[((b * P + p) * O + o) * k_total + k]
+                     : scalar_t(0);
+    G_s[idx] = g;
+  }
+  const int a_count = C * m1;
+  for (int i = tid; i < a_count; i += blk) {
+    a_s[i] = a[b * a_count + i];
+  }
+  for (int i = tid; i < m2; i += blk) {
+    b_s[i] = b_rhs[b * m2 + i];
+  }
+  const int u_count = m1 * m2 * k_total;
+  for (int i = tid; i < u_count; i += blk) {
+    U_s[i] = U[i];
+  }
+  __syncthreads();
+
+  // Z[c, k] = sum_{m, n} a[c, m] * b_rhs[n] * U[m*m2+n, k]
+  const int z_total = C * k_total;
+  for (int idx = tid; idx < z_total; idx += blk) {
+    const int k = idx % k_total;
+    const int c = idx / k_total;
+    scalar_t acc = scalar_t(0);
+    const scalar_t* a_c = a_s + c * m1;
+    for (int m = 0; m < m1; ++m) {
+      const scalar_t av = a_c[m];
+      for (int n = 0; n < m2; ++n) {
+        acc += av * b_s[n] * U_s[(m * m2 + n) * k_total + k];
+      }
+    }
+    Z_s[c * k_total + k] = acc;
+  }
+  __syncthreads();
+
+  // For each (p, o, c): contribution = sum_{k in seg_p} G[p,o,k] * Z[c, k]
+  // AtomicAdd into global grad_W[p, o, c].
+  const int poc_total = P * O * C;
+  for (int idx = tid; idx < poc_total; idx += blk) {
+    const int c = idx % C;
+    int rem = idx / C;
+    const int o = rem % O;
+    const int p = rem / O;
+    scalar_t acc = scalar_t(0);
+    const scalar_t* G_po = G_s + (p * O + o) * k_total;
+    const scalar_t* Z_c = Z_s + c * k_total;
+    for (int k = 0; k < k_total; ++k) {
+      acc += G_po[k] * Z_c[k];
+    }
+    atomicAdd(grad_W + idx, acc);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Launchers
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+void launch_group_forward(
     const Tensor& a,
-    const Tensor& b,
-    const Tensor& u,
+    const Tensor& b_rhs,
+    const Tensor& U,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
     Tensor& y) {
-  const auto batch = a.size(0);
-  const auto mul_in1 = a.size(1);
-  const auto m1 = a.size(2);
-  const auto m2 = b.size(1);
-  const auto pk = u.size(1);
+  const int B = static_cast<int>(a.size(0));
+  const int C = static_cast<int>(a.size(1));
+  const int m1 = static_cast<int>(a.size(2));
+  const int m2 = static_cast<int>(b_rhs.size(1));
+  const int k_total = static_cast<int>(U.size(1));
+  const int P = static_cast<int>(W.size(0));
+  const int O = static_cast<int>(W.size(1));
   const int threads = 256;
-  const int64_t total = batch * pk * mul_in1;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  project_forward_mul_in2eq1_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      a.data_ptr<scalar_t>(),
-      b.data_ptr<scalar_t>(),
-      u.data_ptr<scalar_t>(),
-      y.data_ptr<scalar_t>(),
-      batch,
-      mul_in1,
-      m1,
-      m2,
-      pk);
+  const size_t smem =
+      (C * m1 + m2 + m1 * m2 * k_total + C * k_total) * sizeof(scalar_t);
+  channelwise_group_forward_kernel<scalar_t>
+      <<<B, threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+          a.data_ptr<scalar_t>(),
+          b_rhs.data_ptr<scalar_t>(),
+          U.data_ptr<scalar_t>(),
+          W.data_ptr<scalar_t>(),
+          seg_starts.data_ptr<int64_t>(),
+          seg_ends.data_ptr<int64_t>(),
+          y.data_ptr<scalar_t>(),
+          C, m1, m2, k_total, P, O);
 }
 
 template <typename scalar_t>
-void launch_project_transpose_a_mul_in2eq1(
+void launch_group_transpose_a(
     const Tensor& grad_y,
-    const Tensor& b,
-    const Tensor& u,
+    const Tensor& b_rhs,
+    const Tensor& U,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
     Tensor& grad_a) {
-  const auto batch = b.size(0);
-  const auto mul_in1 = grad_a.size(1);
-  const auto m1 = grad_a.size(2);
-  const auto m2 = b.size(1);
-  const auto pk = grad_y.size(1) * grad_y.size(2);
+  const int B = static_cast<int>(grad_y.size(0));
+  const int P = static_cast<int>(grad_y.size(1));
+  const int O = static_cast<int>(grad_y.size(2));
+  const int k_total = static_cast<int>(grad_y.size(3));
+  const int C = static_cast<int>(grad_a.size(1));
+  const int m1 = static_cast<int>(grad_a.size(2));
+  const int m2 = static_cast<int>(b_rhs.size(1));
   const int threads = 256;
-  const int64_t total = batch * mul_in1 * m1;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  const size_t smem_bytes = m1 * m2 * pk * sizeof(scalar_t);
-  project_transpose_a_mul_in2eq1_kernel<scalar_t><<<blocks, threads, smem_bytes, at::cuda::getDefaultCUDAStream()>>>(
-      grad_y.data_ptr<scalar_t>(),
-      b.data_ptr<scalar_t>(),
-      u.data_ptr<scalar_t>(),
-      grad_a.data_ptr<scalar_t>(),
-      batch,
-      mul_in1,
-      m1,
-      m2,
-      pk);
+  const size_t smem =
+      (P * O * k_total + m2 + m1 * m2 * k_total + C * k_total + m1 * k_total) *
+      sizeof(scalar_t);
+  channelwise_group_transpose_a_kernel<scalar_t>
+      <<<B, threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+          grad_y.data_ptr<scalar_t>(),
+          b_rhs.data_ptr<scalar_t>(),
+          U.data_ptr<scalar_t>(),
+          W.data_ptr<scalar_t>(),
+          seg_starts.data_ptr<int64_t>(),
+          seg_ends.data_ptr<int64_t>(),
+          grad_a.data_ptr<scalar_t>(),
+          C, m1, m2, k_total, P, O);
 }
 
 template <typename scalar_t>
-void launch_project_transpose_b_mul_in2eq1(
+void launch_group_transpose_b(
     const Tensor& grad_y,
     const Tensor& a,
-    const Tensor& u,
+    const Tensor& U,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
     Tensor& grad_b) {
-  const auto batch = a.size(0);
-  const auto mul_in1 = a.size(1);
-  const auto m1 = a.size(2);
-  const auto m2 = grad_b.size(2);
-  const auto pk = grad_y.size(1) * grad_y.size(2);
+  const int B = static_cast<int>(grad_y.size(0));
+  const int P = static_cast<int>(grad_y.size(1));
+  const int O = static_cast<int>(grad_y.size(2));
+  const int k_total = static_cast<int>(grad_y.size(3));
+  const int C = static_cast<int>(a.size(1));
+  const int m1 = static_cast<int>(a.size(2));
+  const int m2 = static_cast<int>(grad_b.size(1));
   const int threads = 256;
-  const int64_t total = batch * m2;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  const size_t smem_bytes = m1 * m2 * pk * sizeof(scalar_t);
-  project_transpose_b_mul_in2eq1_kernel<scalar_t><<<blocks, threads, smem_bytes, at::cuda::getDefaultCUDAStream()>>>(
-      grad_y.data_ptr<scalar_t>(),
-      a.data_ptr<scalar_t>(),
-      u.data_ptr<scalar_t>(),
-      grad_b.data_ptr<scalar_t>(),
-      batch,
-      mul_in1,
-      m1,
-      m2,
-      pk);
+  const size_t smem =
+      (P * O * k_total + C * m1 + m1 * m2 * k_total + C * k_total + m1 * k_total) *
+      sizeof(scalar_t);
+  channelwise_group_transpose_b_kernel<scalar_t>
+      <<<B, threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+          grad_y.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(),
+          U.data_ptr<scalar_t>(),
+          W.data_ptr<scalar_t>(),
+          seg_starts.data_ptr<int64_t>(),
+          seg_ends.data_ptr<int64_t>(),
+          grad_b.data_ptr<scalar_t>(),
+          C, m1, m2, k_total, P, O);
 }
 
 template <typename scalar_t>
-void launch_project_transpose_u_mul_in2eq1(
+void launch_group_transpose_u(
     const Tensor& grad_y,
     const Tensor& a,
-    const Tensor& b,
-    Tensor& grad_u) {
-  const auto batch = a.size(0);
-  const auto mul_in1 = a.size(1);
-  const auto m1 = a.size(2);
-  const auto m2 = b.size(1);
-  const auto pk = grad_y.size(1) * grad_y.size(2);
+    const Tensor& b_rhs,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
+    Tensor& grad_U) {
+  const int B = static_cast<int>(grad_y.size(0));
+  const int P = static_cast<int>(grad_y.size(1));
+  const int O = static_cast<int>(grad_y.size(2));
+  const int k_total = static_cast<int>(grad_y.size(3));
+  const int C = static_cast<int>(a.size(1));
+  const int m1 = static_cast<int>(a.size(2));
+  const int m2 = static_cast<int>(b_rhs.size(1));
   const int threads = 256;
-  const int64_t total = m1 * m2 * pk;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  project_transpose_u_mul_in2eq1_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      grad_y.data_ptr<scalar_t>(),
-      a.data_ptr<scalar_t>(),
-      b.data_ptr<scalar_t>(),
-      grad_u.data_ptr<scalar_t>(),
-      batch,
-      mul_in1,
-      m1,
-      m2,
-      pk);
+  const size_t smem =
+      (P * O * k_total + C * m1 + m2 + C * k_total + m1 * m2 * k_total) *
+      sizeof(scalar_t);
+  channelwise_group_transpose_u_kernel<scalar_t>
+      <<<B, threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+          grad_y.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(),
+          b_rhs.data_ptr<scalar_t>(),
+          W.data_ptr<scalar_t>(),
+          seg_starts.data_ptr<int64_t>(),
+          seg_ends.data_ptr<int64_t>(),
+          grad_U.data_ptr<scalar_t>(),
+          C, m1, m2, k_total, P, O);
 }
 
 template <typename scalar_t>
-__global__ void mix_forward_kernel(
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ gates,
-    scalar_t* __restrict__ out,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  extern __shared__ char smem_raw_mix[];
-  scalar_t* w_tile = reinterpret_cast<scalar_t*>(smem_raw_mix);
-
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * mul_out * kdim;
-
-  int64_t k = 0, o = 0, b_idx = 0;
-  if (linear < total) {
-    k = linear % kdim;
-    const int64_t tmp = linear / kdim;
-    o = tmp % mul_out;
-    b_idx = tmp / mul_out;
-  }
-
-  scalar_t acc = scalar_t(0);
-
-  for (int64_t p = 0; p < num_paths; ++p) {
-    const int64_t w_offset = p * mul_out * ij;
-    for (int64_t idx = threadIdx.x; idx < mul_out * ij; idx += blockDim.x) {
-      w_tile[idx] = w[w_offset + idx];
-    }
-    __syncthreads();
-
-    if (linear < total) {
-      const scalar_t gate = gates[b_idx * num_paths + p];
-      const int64_t y_base = ((b_idx * num_paths + p) * kdim + k) * ij;
-      scalar_t inner = scalar_t(0);
-      for (int64_t q = 0; q < ij; ++q) {
-        inner += y[y_base + q] * w_tile[o * ij + q];
-      }
-      acc += gate * inner;
-    }
-    __syncthreads();
-  }
-
-  if (linear < total) {
-    out[(b_idx * mul_out + o) * kdim + k] = acc;
-  }
-}
-
-template <typename scalar_t>
-__global__ void mix_transpose_y_kernel(
-    const scalar_t* __restrict__ grad_out,
-    const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ gates,
-    scalar_t* __restrict__ grad_y,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * num_paths * kdim * ij;
-  if (linear >= total) {
-    return;
-  }
-
-  const int64_t q = linear % ij;
-  const int64_t tmp0 = linear / ij;
-  const int64_t k = tmp0 % kdim;
-  const int64_t tmp1 = tmp0 / kdim;
-  const int64_t p = tmp1 % num_paths;
-  const int64_t b_idx = tmp1 / num_paths;
-
-  const scalar_t gate = gates[b_idx * num_paths + p];
-  scalar_t acc = scalar_t(0);
-  for (int64_t o = 0; o < mul_out; ++o) {
-    acc += grad_out[(b_idx * mul_out + o) * kdim + k] * w[(p * mul_out + o) * ij + q];
-  }
-  grad_y[linear] = gate * acc;
-}
-
-template <typename scalar_t>
-__global__ void mix_transpose_w_kernel(
-    const scalar_t* __restrict__ grad_out,
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ gates,
-    scalar_t* __restrict__ grad_w,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = num_paths * mul_out * ij;
-  if (linear >= total) {
-    return;
-  }
-
-  const int64_t q = linear % ij;
-  const int64_t tmp = linear / ij;
-  const int64_t o = tmp % mul_out;
-  const int64_t p = tmp / mul_out;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
-    const scalar_t gate = gates[b_idx * num_paths + p];
-    for (int64_t k = 0; k < kdim; ++k) {
-      acc += grad_out[(b_idx * mul_out + o) * kdim + k] *
-             gate *
-             y[((b_idx * num_paths + p) * kdim + k) * ij + q];
-    }
-  }
-  grad_w[(p * mul_out + o) * ij + q] = acc;
-}
-
-template <typename scalar_t>
-__global__ void mix_transpose_g_kernel(
-    const scalar_t* __restrict__ grad_out,
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ w,
-    scalar_t* __restrict__ grad_g,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * num_paths;
-  if (linear >= total) {
-    return;
-  }
-
-  const int64_t p = linear % num_paths;
-  const int64_t b_idx = linear / num_paths;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t o = 0; o < mul_out; ++o) {
-    for (int64_t k = 0; k < kdim; ++k) {
-      const scalar_t go = grad_out[(b_idx * mul_out + o) * kdim + k];
-      const int64_t y_base = ((b_idx * num_paths + p) * kdim + k) * ij;
-      const int64_t w_base = (p * mul_out + o) * ij;
-      scalar_t inner = scalar_t(0);
-      for (int64_t q = 0; q < ij; ++q) {
-        inner += y[y_base + q] * w[w_base + q];
-      }
-      acc += go * inner;
-    }
-  }
-  grad_g[linear] = acc;
-}
-
-template <typename scalar_t>
-void launch_mix_forward(
-    const Tensor& y,
-    const Tensor& w,
-    const Tensor& gates,
-    Tensor& out) {
-  const auto batch = y.size(0);
-  const auto num_paths = y.size(1);
-  const auto kdim = y.size(2);
-  const auto ij = y.size(3);
-  const auto mul_out = w.size(1);
+void launch_group_transpose_w(
+    const Tensor& grad_y,
+    const Tensor& a,
+    const Tensor& b_rhs,
+    const Tensor& U,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
+    Tensor& grad_W) {
+  const int B = static_cast<int>(grad_y.size(0));
+  const int P = static_cast<int>(grad_y.size(1));
+  const int O = static_cast<int>(grad_y.size(2));
+  const int k_total = static_cast<int>(grad_y.size(3));
+  const int C = static_cast<int>(a.size(1));
+  const int m1 = static_cast<int>(a.size(2));
+  const int m2 = static_cast<int>(b_rhs.size(1));
   const int threads = 256;
-  const int64_t total = batch * mul_out * kdim;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  const size_t smem_bytes = mul_out * ij * sizeof(scalar_t);
-  mix_forward_kernel<scalar_t><<<blocks, threads, smem_bytes, at::cuda::getDefaultCUDAStream()>>>(
-      y.data_ptr<scalar_t>(),
-      w.data_ptr<scalar_t>(),
-      gates.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch,
-      num_paths,
-      kdim,
-      mul_out,
-      ij);
-}
-
-template <typename scalar_t>
-void launch_mix_transpose_y(
-    const Tensor& grad_out,
-    const Tensor& w,
-    const Tensor& gates,
-    Tensor& grad_y) {
-  const auto batch = grad_y.size(0);
-  const auto num_paths = grad_y.size(1);
-  const auto kdim = grad_y.size(2);
-  const auto ij = grad_y.size(3);
-  const auto mul_out = grad_out.size(1);
-  const int threads = 256;
-  const int64_t total = batch * num_paths * kdim * ij;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  mix_transpose_y_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      grad_out.data_ptr<scalar_t>(),
-      w.data_ptr<scalar_t>(),
-      gates.data_ptr<scalar_t>(),
-      grad_y.data_ptr<scalar_t>(),
-      batch,
-      num_paths,
-      kdim,
-      mul_out,
-      ij);
-}
-
-template <typename scalar_t>
-void launch_mix_transpose_w(
-    const Tensor& grad_out,
-    const Tensor& y,
-    const Tensor& gates,
-    Tensor& grad_w) {
-  const auto batch = y.size(0);
-  const auto num_paths = y.size(1);
-  const auto kdim = y.size(2);
-  const auto ij = y.size(3);
-  const auto mul_out = grad_out.size(1);
-  const int threads = 256;
-  const int64_t total = num_paths * mul_out * ij;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  mix_transpose_w_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      grad_out.data_ptr<scalar_t>(),
-      y.data_ptr<scalar_t>(),
-      gates.data_ptr<scalar_t>(),
-      grad_w.data_ptr<scalar_t>(),
-      batch,
-      num_paths,
-      kdim,
-      mul_out,
-      ij);
-}
-
-template <typename scalar_t>
-void launch_mix_transpose_g(
-    const Tensor& grad_out,
-    const Tensor& y,
-    const Tensor& w,
-    Tensor& grad_g) {
-  const auto batch = y.size(0);
-  const auto num_paths = y.size(1);
-  const auto kdim = y.size(2);
-  const auto ij = y.size(3);
-  const auto mul_out = grad_out.size(1);
-  const int threads = 256;
-  const int64_t total = batch * num_paths;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  mix_transpose_g_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      grad_out.data_ptr<scalar_t>(),
-      y.data_ptr<scalar_t>(),
-      w.data_ptr<scalar_t>(),
-      grad_g.data_ptr<scalar_t>(),
-      batch,
-      num_paths,
-      kdim,
-      mul_out,
-      ij);
-}
-
-// ---------------------------------------------------------------------------
-// Project double-backward fused kernels
-// grad_H  = PF(GGA,b,U) + PF(a,GGB,U) + PF(a,b,GGU)   [3-term, PF shape]
-// grad_a2 = PAT(H,GGB,U) + PAT(H,b,GGU)                [2-term, PAT shape]
-// grad_b2 = PBT(H,GGA,U) + PBT(H,a,GGU)                [2-term, PBT shape]
-// grad_U2 = PUT(H,GGA,b) + PUT(H,a,GGB)                 [2-term, PUT shape]
-// ---------------------------------------------------------------------------
-
-template <typename scalar_t>
-__global__ void project_dbl_bwd_grad_h_kernel(
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ gga,
-    const scalar_t* __restrict__ b,
-    const scalar_t* __restrict__ ggb,
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ ggu,
-    scalar_t* __restrict__ grad_h,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * pk * mul_in1;
-  if (linear >= total) return;
-
-  const int64_t i = linear % mul_in1;
-  const int64_t tmp = linear / mul_in1;
-  const int64_t pk_idx = tmp % pk;
-  const int64_t b_idx = tmp / pk;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t mi = 0; mi < m1; ++mi) {
-    const scalar_t a_val = a[(b_idx * mul_in1 + i) * m1 + mi];
-    const scalar_t gga_val = gga[(b_idx * mul_in1 + i) * m1 + mi];
-    const int64_t u_base = (mi * m2) * pk + pk_idx;
-    for (int64_t mj = 0; mj < m2; ++mj) {
-      const scalar_t b_val = b[b_idx * m2 + mj];
-      const scalar_t ggb_val = ggb[b_idx * m2 + mj];
-      const scalar_t u_val = u[u_base + mj * pk];
-      const scalar_t ggu_val = ggu[u_base + mj * pk];
-      acc += gga_val * b_val * u_val
-           + a_val * ggb_val * u_val
-           + a_val * b_val * ggu_val;
-    }
-  }
-  grad_h[(b_idx * pk + pk_idx) * mul_in1 + i] = acc;
-}
-
-template <typename scalar_t>
-__global__ void project_dbl_bwd_grad_a_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ b,
-    const scalar_t* __restrict__ ggb,
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ ggu,
-    scalar_t* __restrict__ grad_a,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  extern __shared__ char smem_dbl_a[];
-  scalar_t* u_smem = reinterpret_cast<scalar_t*>(smem_dbl_a);
-  scalar_t* ggu_smem = u_smem + m1 * m2 * pk;
-
-  const int64_t u_total = m1 * m2 * pk;
-  for (int64_t idx = threadIdx.x; idx < u_total; idx += blockDim.x) {
-    u_smem[idx] = u[idx];
-    ggu_smem[idx] = ggu[idx];
-  }
-  __syncthreads();
-
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * mul_in1 * m1;
-  if (linear >= total) return;
-
-  const int64_t mi = linear % m1;
-  const int64_t tmp = linear / m1;
-  const int64_t i = tmp % mul_in1;
-  const int64_t b_idx = tmp / mul_in1;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t pk_idx = 0; pk_idx < pk; ++pk_idx) {
-    scalar_t inner = scalar_t(0);
-    const int64_t u_base = (mi * m2) * pk + pk_idx;
-    for (int64_t mj = 0; mj < m2; ++mj) {
-      inner += ggb[b_idx * m2 + mj] * u_smem[u_base + mj * pk]
-             + b[b_idx * m2 + mj] * ggu_smem[u_base + mj * pk];
-    }
-    acc += h[(b_idx * pk + pk_idx) * mul_in1 + i] * inner;
-  }
-  grad_a[(b_idx * mul_in1 + i) * m1 + mi] = acc;
-}
-
-template <typename scalar_t>
-__global__ void project_dbl_bwd_grad_b_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ gga,
-    const scalar_t* __restrict__ u,
-    const scalar_t* __restrict__ ggu,
-    scalar_t* __restrict__ grad_b,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  extern __shared__ char smem_dbl_b[];
-  scalar_t* u_smem = reinterpret_cast<scalar_t*>(smem_dbl_b);
-  scalar_t* ggu_smem = u_smem + m1 * m2 * pk;
-
-  const int64_t u_total = m1 * m2 * pk;
-  for (int64_t idx = threadIdx.x; idx < u_total; idx += blockDim.x) {
-    u_smem[idx] = u[idx];
-    ggu_smem[idx] = ggu[idx];
-  }
-  __syncthreads();
-
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * m2;
-  if (linear >= total) return;
-
-  const int64_t mj = linear % m2;
-  const int64_t b_idx = linear / m2;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t pk_idx = 0; pk_idx < pk; ++pk_idx) {
-    for (int64_t i = 0; i < mul_in1; ++i) {
-      scalar_t inner = scalar_t(0);
-      for (int64_t mi = 0; mi < m1; ++mi) {
-        inner += gga[(b_idx * mul_in1 + i) * m1 + mi] * u_smem[(mi * m2 + mj) * pk + pk_idx]
-               + a[(b_idx * mul_in1 + i) * m1 + mi] * ggu_smem[(mi * m2 + mj) * pk + pk_idx];
-      }
-      acc += h[(b_idx * pk + pk_idx) * mul_in1 + i] * inner;
-    }
-  }
-  grad_b[b_idx * m2 + mj] = acc;
-}
-
-template <typename scalar_t>
-__global__ void project_dbl_bwd_grad_u_kernel(
-    const scalar_t* __restrict__ h,
-    const scalar_t* __restrict__ a,
-    const scalar_t* __restrict__ gga,
-    const scalar_t* __restrict__ b,
-    const scalar_t* __restrict__ ggb,
-    scalar_t* __restrict__ grad_u,
-    const int64_t batch,
-    const int64_t mul_in1,
-    const int64_t m1,
-    const int64_t m2,
-    const int64_t pk) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = m1 * m2 * pk;
-  if (linear >= total) return;
-
-  const int64_t pk_idx = linear % pk;
-  const int64_t tmp = linear / pk;
-  const int64_t mj = tmp % m2;
-  const int64_t mi = tmp / m2;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
-    const scalar_t b_val = b[b_idx * m2 + mj];
-    const scalar_t ggb_val = ggb[b_idx * m2 + mj];
-    for (int64_t i = 0; i < mul_in1; ++i) {
-      const scalar_t gy_val = h[(b_idx * pk + pk_idx) * mul_in1 + i];
-      acc += gy_val * (gga[(b_idx * mul_in1 + i) * m1 + mi] * b_val
-                     + a[(b_idx * mul_in1 + i) * m1 + mi] * ggb_val);
-    }
-  }
-
-  if (linear < total) {
-    grad_u[(mi * m2 + mj) * pk + pk_idx] = acc;
-  }
-}
-
-template <typename scalar_t>
-void launch_project_dbl_bwd_grad_h(
-    const Tensor& a, const Tensor& gga,
-    const Tensor& b, const Tensor& ggb,
-    const Tensor& u, const Tensor& ggu,
-    Tensor& out) {
-  const auto batch = a.size(0);
-  const auto mul_in1 = a.size(1);
-  const auto m1 = a.size(2);
-  const auto m2 = b.size(1);
-  const auto pk = u.size(1);
-  const int threads = 256;
-  const int64_t total = batch * pk * mul_in1;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  project_dbl_bwd_grad_h_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      a.data_ptr<scalar_t>(), gga.data_ptr<scalar_t>(),
-      b.data_ptr<scalar_t>(), ggb.data_ptr<scalar_t>(),
-      u.data_ptr<scalar_t>(), ggu.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, mul_in1, m1, m2, pk);
-}
-
-template <typename scalar_t>
-void launch_project_dbl_bwd_grad_a(
-    const Tensor& h,
-    const Tensor& b, const Tensor& ggb,
-    const Tensor& u, const Tensor& ggu,
-    Tensor& out) {
-  const auto batch = b.size(0);
-  const auto mul_in1 = out.size(1);
-  const auto m1 = out.size(2);
-  const auto m2 = b.size(1);
-  const auto pk = h.size(1) * h.size(2);
-  const int threads = 256;
-  const int64_t total = batch * mul_in1 * m1;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  const size_t smem_bytes = 2 * m1 * m2 * pk * sizeof(scalar_t);
-  project_dbl_bwd_grad_a_kernel<scalar_t><<<blocks, threads, smem_bytes, at::cuda::getDefaultCUDAStream()>>>(
-      h.data_ptr<scalar_t>(),
-      b.data_ptr<scalar_t>(), ggb.data_ptr<scalar_t>(),
-      u.data_ptr<scalar_t>(), ggu.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, mul_in1, m1, m2, pk);
-}
-
-template <typename scalar_t>
-void launch_project_dbl_bwd_grad_b(
-    const Tensor& h,
-    const Tensor& a, const Tensor& gga,
-    const Tensor& u, const Tensor& ggu,
-    Tensor& out) {
-  const auto batch = a.size(0);
-  const auto mul_in1 = a.size(1);
-  const auto m1 = a.size(2);
-  const auto m2 = out.size(1);
-  const auto pk = h.size(1) * h.size(2);
-  const int threads = 256;
-  const int64_t total = batch * m2;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  const size_t smem_bytes = 2 * m1 * m2 * pk * sizeof(scalar_t);
-  project_dbl_bwd_grad_b_kernel<scalar_t><<<blocks, threads, smem_bytes, at::cuda::getDefaultCUDAStream()>>>(
-      h.data_ptr<scalar_t>(),
-      a.data_ptr<scalar_t>(), gga.data_ptr<scalar_t>(),
-      u.data_ptr<scalar_t>(), ggu.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, mul_in1, m1, m2, pk);
-}
-
-template <typename scalar_t>
-void launch_project_dbl_bwd_grad_u(
-    const Tensor& h,
-    const Tensor& a, const Tensor& gga,
-    const Tensor& b, const Tensor& ggb,
-    Tensor& out) {
-  const auto batch = a.size(0);
-  const auto mul_in1 = a.size(1);
-  const auto m1 = a.size(2);
-  const auto m2 = b.size(1);
-  const auto pk = h.size(1) * h.size(2);
-  const int threads = 256;
-  const int64_t total = m1 * m2 * pk;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  project_dbl_bwd_grad_u_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      h.data_ptr<scalar_t>(),
-      a.data_ptr<scalar_t>(), gga.data_ptr<scalar_t>(),
-      b.data_ptr<scalar_t>(), ggb.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, mul_in1, m1, m2, pk);
-}
-
-// ---------------------------------------------------------------------------
-// Mix double-backward fused kernels
-// grad_G  = MF(GGY,W,g) + MF(Y,GGW,g) + MF(Y,W,GGg)   [3-term, MF shape]
-// grad_Y2 = MYT(G,GGW,g) + MYT(G,W,GGg)                [2-term, MYT shape]
-// grad_W2 = MWT(G,GGY,g) + MWT(G,Y,GGg)                 [2-term, MWT shape]
-// grad_g2 = MGT(G,GGY,W) + MGT(G,Y,GGW)                 [2-term, MGT shape]
-// ---------------------------------------------------------------------------
-
-template <typename scalar_t>
-__global__ void mix_dbl_bwd_grad_g_out_kernel(
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ ggy,
-    const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ ggw,
-    const scalar_t* __restrict__ gates,
-    const scalar_t* __restrict__ ggg,
-    scalar_t* __restrict__ grad_g_out,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  extern __shared__ char smem_dbl_mg[];
-  scalar_t* w_tile = reinterpret_cast<scalar_t*>(smem_dbl_mg);
-  scalar_t* ggw_tile = w_tile + mul_out * ij;
-
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * mul_out * kdim;
-
-  int64_t k = 0, o = 0, b_idx = 0;
-  if (linear < total) {
-    k = linear % kdim;
-    const int64_t tmp = linear / kdim;
-    o = tmp % mul_out;
-    b_idx = tmp / mul_out;
-  }
-
-  scalar_t acc = scalar_t(0);
-
-  for (int64_t p = 0; p < num_paths; ++p) {
-    const int64_t w_offset = p * mul_out * ij;
-    for (int64_t idx = threadIdx.x; idx < mul_out * ij; idx += blockDim.x) {
-      w_tile[idx] = w[w_offset + idx];
-      ggw_tile[idx] = ggw[w_offset + idx];
-    }
-    __syncthreads();
-
-    if (linear < total) {
-      const scalar_t gate = gates[b_idx * num_paths + p];
-      const scalar_t ggate = ggg[b_idx * num_paths + p];
-      const int64_t y_base = ((b_idx * num_paths + p) * kdim + k) * ij;
-      scalar_t inner = scalar_t(0);
-      for (int64_t q = 0; q < ij; ++q) {
-        const scalar_t y_val = y[y_base + q];
-        const scalar_t ggy_val = ggy[y_base + q];
-        const scalar_t w_val = w_tile[o * ij + q];
-        const scalar_t ggw_val = ggw_tile[o * ij + q];
-        inner += gate * (ggy_val * w_val + y_val * ggw_val)
-               + ggate * y_val * w_val;
-      }
-      acc += inner;
-    }
-    __syncthreads();
-  }
-
-  if (linear < total) {
-    grad_g_out[(b_idx * mul_out + o) * kdim + k] = acc;
-  }
-}
-
-template <typename scalar_t>
-__global__ void mix_dbl_bwd_grad_y_kernel(
-    const scalar_t* __restrict__ g_out,
-    const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ ggw,
-    const scalar_t* __restrict__ gates,
-    const scalar_t* __restrict__ ggg,
-    scalar_t* __restrict__ grad_y,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * num_paths * kdim * ij;
-  if (linear >= total) return;
-
-  const int64_t q = linear % ij;
-  const int64_t tmp0 = linear / ij;
-  const int64_t k = tmp0 % kdim;
-  const int64_t tmp1 = tmp0 / kdim;
-  const int64_t p = tmp1 % num_paths;
-  const int64_t b_idx = tmp1 / num_paths;
-
-  const scalar_t gate = gates[b_idx * num_paths + p];
-  const scalar_t ggate = ggg[b_idx * num_paths + p];
-  scalar_t acc = scalar_t(0);
-  for (int64_t o = 0; o < mul_out; ++o) {
-    const scalar_t go = g_out[(b_idx * mul_out + o) * kdim + k];
-    acc += go * (gate * ggw[(p * mul_out + o) * ij + q]
-               + ggate * w[(p * mul_out + o) * ij + q]);
-  }
-  grad_y[linear] = acc;
-}
-
-template <typename scalar_t>
-__global__ void mix_dbl_bwd_grad_w_kernel(
-    const scalar_t* __restrict__ g_out,
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ ggy,
-    const scalar_t* __restrict__ gates,
-    const scalar_t* __restrict__ ggg,
-    scalar_t* __restrict__ grad_w,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = num_paths * mul_out * ij;
-  if (linear >= total) return;
-
-  const int64_t q = linear % ij;
-  const int64_t tmp = linear / ij;
-  const int64_t o = tmp % mul_out;
-  const int64_t p = tmp / mul_out;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t b_idx = 0; b_idx < batch; ++b_idx) {
-    const scalar_t gate = gates[b_idx * num_paths + p];
-    const scalar_t ggate = ggg[b_idx * num_paths + p];
-    for (int64_t k = 0; k < kdim; ++k) {
-      const scalar_t go = g_out[(b_idx * mul_out + o) * kdim + k];
-      acc += go * (gate * ggy[((b_idx * num_paths + p) * kdim + k) * ij + q]
-                 + ggate * y[((b_idx * num_paths + p) * kdim + k) * ij + q]);
-    }
-  }
-  grad_w[(p * mul_out + o) * ij + q] = acc;
-}
-
-template <typename scalar_t>
-__global__ void mix_dbl_bwd_grad_g_kernel(
-    const scalar_t* __restrict__ g_out,
-    const scalar_t* __restrict__ y,
-    const scalar_t* __restrict__ ggy,
-    const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ ggw,
-    scalar_t* __restrict__ grad_g,
-    const int64_t batch,
-    const int64_t num_paths,
-    const int64_t kdim,
-    const int64_t mul_out,
-    const int64_t ij) {
-  const int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t total = batch * num_paths;
-  if (linear >= total) return;
-
-  const int64_t p = linear % num_paths;
-  const int64_t b_idx = linear / num_paths;
-
-  scalar_t acc = scalar_t(0);
-  for (int64_t o = 0; o < mul_out; ++o) {
-    for (int64_t k = 0; k < kdim; ++k) {
-      const scalar_t go = g_out[(b_idx * mul_out + o) * kdim + k];
-      const int64_t y_base = ((b_idx * num_paths + p) * kdim + k) * ij;
-      const int64_t w_base = (p * mul_out + o) * ij;
-      scalar_t inner = scalar_t(0);
-      for (int64_t q = 0; q < ij; ++q) {
-        inner += ggy[y_base + q] * w[w_base + q]
-               + y[y_base + q] * ggw[w_base + q];
-      }
-      acc += go * inner;
-    }
-  }
-  grad_g[linear] = acc;
-}
-
-template <typename scalar_t>
-void launch_mix_dbl_bwd_grad_g_out(
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& w, const Tensor& ggw,
-    const Tensor& gates, const Tensor& ggg,
-    Tensor& out) {
-  const auto batch = y.size(0);
-  const auto num_paths = y.size(1);
-  const auto kdim = y.size(2);
-  const auto ij = y.size(3);
-  const auto mul_out = w.size(1);
-  const int threads = 256;
-  const int64_t total = batch * mul_out * kdim;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  const size_t smem_bytes = 2 * mul_out * ij * sizeof(scalar_t);
-  mix_dbl_bwd_grad_g_out_kernel<scalar_t><<<blocks, threads, smem_bytes, at::cuda::getDefaultCUDAStream()>>>(
-      y.data_ptr<scalar_t>(), ggy.data_ptr<scalar_t>(),
-      w.data_ptr<scalar_t>(), ggw.data_ptr<scalar_t>(),
-      gates.data_ptr<scalar_t>(), ggg.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, num_paths, kdim, mul_out, ij);
-}
-
-template <typename scalar_t>
-void launch_mix_dbl_bwd_grad_y(
-    const Tensor& g_out,
-    const Tensor& w, const Tensor& ggw,
-    const Tensor& gates, const Tensor& ggg,
-    Tensor& out) {
-  const auto batch = out.size(0);
-  const auto num_paths = out.size(1);
-  const auto kdim = out.size(2);
-  const auto ij = out.size(3);
-  const auto mul_out = g_out.size(1);
-  const int threads = 256;
-  const int64_t total = batch * num_paths * kdim * ij;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  mix_dbl_bwd_grad_y_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      g_out.data_ptr<scalar_t>(),
-      w.data_ptr<scalar_t>(), ggw.data_ptr<scalar_t>(),
-      gates.data_ptr<scalar_t>(), ggg.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, num_paths, kdim, mul_out, ij);
-}
-
-template <typename scalar_t>
-void launch_mix_dbl_bwd_grad_w(
-    const Tensor& g_out,
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& gates, const Tensor& ggg,
-    Tensor& out) {
-  const auto batch = y.size(0);
-  const auto num_paths = y.size(1);
-  const auto kdim = y.size(2);
-  const auto ij = y.size(3);
-  const auto mul_out = g_out.size(1);
-  const int threads = 256;
-  const int64_t total = num_paths * mul_out * ij;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  mix_dbl_bwd_grad_w_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      g_out.data_ptr<scalar_t>(),
-      y.data_ptr<scalar_t>(), ggy.data_ptr<scalar_t>(),
-      gates.data_ptr<scalar_t>(), ggg.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, num_paths, kdim, mul_out, ij);
-}
-
-template <typename scalar_t>
-void launch_mix_dbl_bwd_grad_g(
-    const Tensor& g_out,
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& w, const Tensor& ggw,
-    Tensor& out) {
-  const auto batch = y.size(0);
-  const auto num_paths = y.size(1);
-  const auto kdim = y.size(2);
-  const auto ij = y.size(3);
-  const auto mul_out = g_out.size(1);
-  const int threads = 256;
-  const int64_t total = batch * num_paths;
-  const int blocks = static_cast<int>((total + threads - 1) / threads);
-  mix_dbl_bwd_grad_g_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
-      g_out.data_ptr<scalar_t>(),
-      y.data_ptr<scalar_t>(), ggy.data_ptr<scalar_t>(),
-      w.data_ptr<scalar_t>(), ggw.data_ptr<scalar_t>(),
-      out.data_ptr<scalar_t>(),
-      batch, num_paths, kdim, mul_out, ij);
+  const size_t smem =
+      (P * O * k_total + C * m1 + m2 + m1 * m2 * k_total + C * k_total) *
+      sizeof(scalar_t);
+  channelwise_group_transpose_w_kernel<scalar_t>
+      <<<B, threads, smem, at::cuda::getCurrentCUDAStream()>>>(
+          grad_y.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(),
+          b_rhs.data_ptr<scalar_t>(),
+          U.data_ptr<scalar_t>(),
+          seg_starts.data_ptr<int64_t>(),
+          seg_ends.data_ptr<int64_t>(),
+          grad_W.data_ptr<scalar_t>(),
+          C, m1, m2, k_total, P, O);
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Project double-backward C++ entry points
+// Tensor-facing top-level entry points
 // ---------------------------------------------------------------------------
-
-Tensor project_dbl_bwd_grad_h_cuda(
-    const Tensor& a, const Tensor& gga,
-    const Tensor& b, const Tensor& ggb,
-    const Tensor& u, const Tensor& ggu,
-    int64_t num_paths) {
-  const auto kdim = u.size(1) / num_paths;
-  auto out = torch::zeros({a.size(0), num_paths, kdim, a.size(1)}, a.options());
-  const c10::cuda::CUDAGuard device_guard(a.device());
-  auto a_c = a.contiguous(); auto gga_c = gga.contiguous();
-  auto b_c = b.contiguous().view({b.size(0), b.size(2)});
-  auto ggb_c = ggb.contiguous().view({ggb.size(0), ggb.size(2)});
-  auto u_c = u.contiguous(); auto ggu_c = ggu.contiguous();
-  if (a.scalar_type() == torch::kFloat32) {
-    launch_project_dbl_bwd_grad_h<float>(a_c, gga_c, b_c, ggb_c, u_c, ggu_c, out);
-  } else {
-    launch_project_dbl_bwd_grad_h<double>(a_c, gga_c, b_c, ggb_c, u_c, ggu_c, out);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-Tensor project_dbl_bwd_grad_a_cuda(
-    const Tensor& h,
-    const Tensor& b, const Tensor& ggb,
-    const Tensor& u, const Tensor& ggu) {
-  auto grad_a = torch::zeros({b.size(0), h.size(3), u.size(0) / b.size(2)}, h.options());
-  const c10::cuda::CUDAGuard device_guard(h.device());
-  auto h_c = h.contiguous();
-  auto b_c = b.contiguous().view({b.size(0), b.size(2)});
-  auto ggb_c = ggb.contiguous().view({ggb.size(0), ggb.size(2)});
-  auto u_c = u.contiguous(); auto ggu_c = ggu.contiguous();
-  if (h.scalar_type() == torch::kFloat32) {
-    launch_project_dbl_bwd_grad_a<float>(h_c, b_c, ggb_c, u_c, ggu_c, grad_a);
-  } else {
-    launch_project_dbl_bwd_grad_a<double>(h_c, b_c, ggb_c, u_c, ggu_c, grad_a);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_a;
-}
-
-Tensor project_dbl_bwd_grad_b_cuda(
-    const Tensor& h,
-    const Tensor& a, const Tensor& gga,
-    const Tensor& u, const Tensor& ggu) {
-  auto grad_b = torch::zeros({a.size(0), 1, u.size(0) / a.size(2)}, h.options());
-  const c10::cuda::CUDAGuard device_guard(h.device());
-  auto h_c = h.contiguous(); auto a_c = a.contiguous(); auto gga_c = gga.contiguous();
-  auto u_c = u.contiguous(); auto ggu_c = ggu.contiguous();
-  if (h.scalar_type() == torch::kFloat32) {
-    launch_project_dbl_bwd_grad_b<float>(h_c, a_c, gga_c, u_c, ggu_c, grad_b);
-  } else {
-    launch_project_dbl_bwd_grad_b<double>(h_c, a_c, gga_c, u_c, ggu_c, grad_b);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_b;
-}
-
-Tensor project_dbl_bwd_grad_u_cuda(
-    const Tensor& h,
-    const Tensor& a, const Tensor& gga,
-    const Tensor& b, const Tensor& ggb) {
-  auto grad_u = torch::zeros({a.size(2) * b.size(2), h.size(1) * h.size(2)}, h.options());
-  const c10::cuda::CUDAGuard device_guard(h.device());
-  auto h_c = h.contiguous(); auto a_c = a.contiguous(); auto gga_c = gga.contiguous();
-  auto b_c = b.contiguous().view({b.size(0), b.size(2)});
-  auto ggb_c = ggb.contiguous().view({ggb.size(0), ggb.size(2)});
-  if (h.scalar_type() == torch::kFloat32) {
-    launch_project_dbl_bwd_grad_u<float>(h_c, a_c, gga_c, b_c, ggb_c, grad_u);
-  } else {
-    launch_project_dbl_bwd_grad_u<double>(h_c, a_c, gga_c, b_c, ggb_c, grad_u);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_u;
-}
-
-// ---------------------------------------------------------------------------
-// Mix double-backward C++ entry points
-// ---------------------------------------------------------------------------
-
-Tensor mix_dbl_bwd_grad_g_out_cuda(
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& w, const Tensor& ggw,
-    const Tensor& gates, const Tensor& ggg) {
-  auto out = torch::zeros({y.size(0), w.size(1), y.size(2)}, y.options());
-  const c10::cuda::CUDAGuard device_guard(y.device());
-  auto y_c = y.contiguous(); auto ggy_c = ggy.contiguous();
-  auto w_c = w.contiguous(); auto ggw_c = ggw.contiguous();
-  auto g_c = gates.contiguous(); auto ggg_c = ggg.contiguous();
-  if (y.scalar_type() == torch::kFloat32) {
-    launch_mix_dbl_bwd_grad_g_out<float>(y_c, ggy_c, w_c, ggw_c, g_c, ggg_c, out);
-  } else {
-    launch_mix_dbl_bwd_grad_g_out<double>(y_c, ggy_c, w_c, ggw_c, g_c, ggg_c, out);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-Tensor mix_dbl_bwd_grad_y_cuda(
-    const Tensor& g_out,
-    const Tensor& w, const Tensor& ggw,
-    const Tensor& gates, const Tensor& ggg) {
-  auto out = torch::zeros({g_out.size(0), w.size(0), g_out.size(2), w.size(2)}, g_out.options());
-  const c10::cuda::CUDAGuard device_guard(g_out.device());
-  auto go_c = g_out.contiguous();
-  auto w_c = w.contiguous(); auto ggw_c = ggw.contiguous();
-  auto g_c = gates.contiguous(); auto ggg_c = ggg.contiguous();
-  if (g_out.scalar_type() == torch::kFloat32) {
-    launch_mix_dbl_bwd_grad_y<float>(go_c, w_c, ggw_c, g_c, ggg_c, out);
-  } else {
-    launch_mix_dbl_bwd_grad_y<double>(go_c, w_c, ggw_c, g_c, ggg_c, out);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-Tensor mix_dbl_bwd_grad_w_cuda(
-    const Tensor& g_out,
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& gates, const Tensor& ggg) {
-  auto out = torch::zeros({y.size(1), g_out.size(1), y.size(3)}, y.options());
-  const c10::cuda::CUDAGuard device_guard(g_out.device());
-  auto go_c = g_out.contiguous();
-  auto y_c = y.contiguous(); auto ggy_c = ggy.contiguous();
-  auto g_c = gates.contiguous(); auto ggg_c = ggg.contiguous();
-  if (g_out.scalar_type() == torch::kFloat32) {
-    launch_mix_dbl_bwd_grad_w<float>(go_c, y_c, ggy_c, g_c, ggg_c, out);
-  } else {
-    launch_mix_dbl_bwd_grad_w<double>(go_c, y_c, ggy_c, g_c, ggg_c, out);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-Tensor mix_dbl_bwd_grad_g_cuda(
-    const Tensor& g_out,
-    const Tensor& y, const Tensor& ggy,
-    const Tensor& w, const Tensor& ggw) {
-  auto out = torch::zeros({y.size(0), y.size(1)}, y.options());
-  const c10::cuda::CUDAGuard device_guard(g_out.device());
-  auto go_c = g_out.contiguous();
-  auto y_c = y.contiguous(); auto ggy_c = ggy.contiguous();
-  auto w_c = w.contiguous(); auto ggw_c = ggw.contiguous();
-  if (g_out.scalar_type() == torch::kFloat32) {
-    launch_mix_dbl_bwd_grad_g<float>(go_c, y_c, ggy_c, w_c, ggw_c, out);
-  } else {
-    launch_mix_dbl_bwd_grad_g<double>(go_c, y_c, ggy_c, w_c, ggw_c, out);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-Tensor project_bucket_forward_cuda(
+Tensor channelwise_group_forward_cuda(
     const Tensor& a,
-    const Tensor& b,
-    const Tensor& u_bucket,
-    int64_t num_paths) {
-  TORCH_CHECK(a.is_cuda() && b.is_cuda() && u_bucket.is_cuda(), "project_bucket_forward_cuda expects CUDA tensors");
-  TORCH_CHECK(b.size(1) == 1, "project_bucket_forward_cuda currently supports mul_in2 == 1");
-  TORCH_CHECK(u_bucket.size(1) % num_paths == 0, "u_bucket second dim must be divisible by num_paths");
-  const auto kdim = u_bucket.size(1) / num_paths;
-  auto y = torch::zeros({a.size(0), num_paths, kdim, a.size(1)}, a.options());
+    const Tensor& b_rhs,
+    const Tensor& U,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends) {
+  TORCH_CHECK(a.is_cuda() && b_rhs.is_cuda() && U.is_cuda() && W.is_cuda(),
+              "channelwise_group_forward_cuda expects CUDA tensors");
+  TORCH_CHECK(seg_starts.is_cuda() && seg_ends.is_cuda(),
+              "seg_starts/seg_ends must be on CUDA");
+  TORCH_CHECK(a.scalar_type() == torch::kFloat32, "float32 only for now");
+  TORCH_CHECK(a.dim() == 3, "a must be (B, C, m1)");
+  TORCH_CHECK(b_rhs.dim() == 2, "b_rhs must be (B, m2)");
+  TORCH_CHECK(U.dim() == 2, "U must be (m1*m2, k_total)");
+  TORCH_CHECK(W.dim() == 3, "W must be (P, O, C)");
+  TORCH_CHECK(seg_starts.dim() == 1 && seg_ends.dim() == 1, "segs must be 1D");
+  TORCH_CHECK(seg_starts.scalar_type() == torch::kInt64, "seg_starts must be int64");
+  TORCH_CHECK(seg_ends.scalar_type() == torch::kInt64, "seg_ends must be int64");
+  const auto B = a.size(0);
+  const auto P = W.size(0);
+  const auto O = W.size(1);
+  const auto k_total = U.size(1);
+  TORCH_CHECK(b_rhs.size(0) == B, "b_rhs batch mismatch");
+  TORCH_CHECK(W.size(2) == a.size(1), "W last dim must equal a channel dim");
+  TORCH_CHECK(seg_starts.size(0) == P, "seg_starts must have P entries");
+  TORCH_CHECK(seg_ends.size(0) == P, "seg_ends must have P entries");
+  TORCH_CHECK(U.size(0) == a.size(2) * b_rhs.size(1),
+              "U first dim must equal m1*m2");
+
+  auto a_c = a.contiguous();
+  auto b_c = b_rhs.contiguous();
+  auto U_c = U.contiguous();
+  auto W_c = W.contiguous();
+  auto s_c = seg_starts.contiguous();
+  auto e_c = seg_ends.contiguous();
+
+  auto y = torch::empty({B, P, O, k_total}, a.options());
   const c10::cuda::CUDAGuard device_guard(a.device());
-  if (a.scalar_type() == torch::kFloat32) {
-    launch_project_forward_mul_in2eq1<float>(a.contiguous(), b.contiguous().view({b.size(0), b.size(2)}), u_bucket.contiguous(), y);
-  } else if (a.scalar_type() == torch::kFloat64) {
-    launch_project_forward_mul_in2eq1<double>(a.contiguous(), b.contiguous().view({b.size(0), b.size(2)}), u_bucket.contiguous(), y);
-  } else {
-    TORCH_CHECK(false, "project_bucket_forward_cuda supports only float32/float64");
-  }
+  launch_group_forward<float>(a_c, b_c, U_c, W_c, s_c, e_c, y);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
 
-Tensor project_bucket_transpose_a_cuda(
+Tensor channelwise_group_transpose_a_cuda(
     const Tensor& grad_y,
-    const Tensor& b,
-    const Tensor& u_bucket) {
-  TORCH_CHECK(grad_y.is_cuda() && b.is_cuda() && u_bucket.is_cuda(), "project_bucket_transpose_a_cuda expects CUDA tensors");
-  TORCH_CHECK(b.size(1) == 1, "project_bucket_transpose_a_cuda currently supports mul_in2 == 1");
-  auto grad_a = torch::zeros({b.size(0), grad_y.size(3), u_bucket.size(0) / b.size(2)}, grad_y.options());
+    const Tensor& b_rhs,
+    const Tensor& U,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
+    int64_t channel_mul,
+    int64_t m1_size) {
+  TORCH_CHECK(grad_y.is_cuda(), "grad_y must be CUDA");
+  TORCH_CHECK(grad_y.scalar_type() == torch::kFloat32, "float32 only");
+  const auto B = grad_y.size(0);
+  auto grad_a = torch::empty({B, channel_mul, m1_size}, grad_y.options());
+  auto g_c = grad_y.contiguous();
+  auto b_c = b_rhs.contiguous();
+  auto U_c = U.contiguous();
+  auto W_c = W.contiguous();
+  auto s_c = seg_starts.contiguous();
+  auto e_c = seg_ends.contiguous();
   const c10::cuda::CUDAGuard device_guard(grad_y.device());
-  if (grad_y.scalar_type() == torch::kFloat32) {
-    launch_project_transpose_a_mul_in2eq1<float>(grad_y.contiguous(), b.contiguous().view({b.size(0), b.size(2)}), u_bucket.contiguous(), grad_a);
-  } else if (grad_y.scalar_type() == torch::kFloat64) {
-    launch_project_transpose_a_mul_in2eq1<double>(grad_y.contiguous(), b.contiguous().view({b.size(0), b.size(2)}), u_bucket.contiguous(), grad_a);
-  } else {
-    TORCH_CHECK(false, "project_bucket_transpose_a_cuda supports only float32/float64");
-  }
+  launch_group_transpose_a<float>(g_c, b_c, U_c, W_c, s_c, e_c, grad_a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return grad_a;
 }
 
-Tensor project_bucket_transpose_b_cuda(
+Tensor channelwise_group_transpose_b_cuda(
     const Tensor& grad_y,
     const Tensor& a,
-    const Tensor& u_bucket) {
-  TORCH_CHECK(grad_y.is_cuda() && a.is_cuda() && u_bucket.is_cuda(), "project_bucket_transpose_b_cuda expects CUDA tensors");
-  TORCH_CHECK(grad_y.size(3) % a.size(1) == 0, "grad_y IJ dim must be divisible by mul_in1");
-  TORCH_CHECK(grad_y.size(3) / a.size(1) == 1, "project_bucket_transpose_b_cuda currently supports mul_in2 == 1");
-  auto grad_b = torch::zeros({a.size(0), 1, u_bucket.size(0) / a.size(2)}, grad_y.options());
+    const Tensor& U,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends,
+    int64_t m2_size) {
+  TORCH_CHECK(grad_y.is_cuda(), "grad_y must be CUDA");
+  TORCH_CHECK(grad_y.scalar_type() == torch::kFloat32, "float32 only");
+  const auto B = grad_y.size(0);
+  auto grad_b = torch::empty({B, m2_size}, grad_y.options());
+  auto g_c = grad_y.contiguous();
+  auto a_c = a.contiguous();
+  auto U_c = U.contiguous();
+  auto W_c = W.contiguous();
+  auto s_c = seg_starts.contiguous();
+  auto e_c = seg_ends.contiguous();
   const c10::cuda::CUDAGuard device_guard(grad_y.device());
-  if (grad_y.scalar_type() == torch::kFloat32) {
-    launch_project_transpose_b_mul_in2eq1<float>(grad_y.contiguous(), a.contiguous(), u_bucket.contiguous(), grad_b);
-  } else if (grad_y.scalar_type() == torch::kFloat64) {
-    launch_project_transpose_b_mul_in2eq1<double>(grad_y.contiguous(), a.contiguous(), u_bucket.contiguous(), grad_b);
-  } else {
-    TORCH_CHECK(false, "project_bucket_transpose_b_cuda supports only float32/float64");
-  }
+  launch_group_transpose_b<float>(g_c, a_c, U_c, W_c, s_c, e_c, grad_b);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return grad_b;
 }
 
-Tensor project_bucket_transpose_u_cuda(
+Tensor channelwise_group_transpose_u_cuda(
     const Tensor& grad_y,
     const Tensor& a,
-    const Tensor& b) {
-  TORCH_CHECK(grad_y.is_cuda() && a.is_cuda() && b.is_cuda(), "project_bucket_transpose_u_cuda expects CUDA tensors");
-  TORCH_CHECK(b.size(1) == 1, "project_bucket_transpose_u_cuda currently supports mul_in2 == 1");
-  auto grad_u = torch::zeros({a.size(2) * b.size(2), grad_y.size(1) * grad_y.size(2)}, grad_y.options());
+    const Tensor& b_rhs,
+    const Tensor& W,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends) {
+  TORCH_CHECK(grad_y.is_cuda(), "grad_y must be CUDA");
+  TORCH_CHECK(grad_y.scalar_type() == torch::kFloat32, "float32 only");
+  const auto m1 = a.size(2);
+  const auto m2 = b_rhs.size(1);
+  const auto k_total = grad_y.size(3);
+  auto grad_U = torch::zeros({m1 * m2, k_total}, grad_y.options());
+  auto g_c = grad_y.contiguous();
+  auto a_c = a.contiguous();
+  auto b_c = b_rhs.contiguous();
+  auto W_c = W.contiguous();
+  auto s_c = seg_starts.contiguous();
+  auto e_c = seg_ends.contiguous();
   const c10::cuda::CUDAGuard device_guard(grad_y.device());
-  if (grad_y.scalar_type() == torch::kFloat32) {
-    launch_project_transpose_u_mul_in2eq1<float>(grad_y.contiguous(), a.contiguous(), b.contiguous().view({b.size(0), b.size(2)}), grad_u);
-  } else if (grad_y.scalar_type() == torch::kFloat64) {
-    launch_project_transpose_u_mul_in2eq1<double>(grad_y.contiguous(), a.contiguous(), b.contiguous().view({b.size(0), b.size(2)}), grad_u);
-  } else {
-    TORCH_CHECK(false, "project_bucket_transpose_u_cuda supports only float32/float64");
-  }
+  launch_group_transpose_u<float>(g_c, a_c, b_c, W_c, s_c, e_c, grad_U);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_u;
+  return grad_U;
 }
 
-Tensor mix_bucket_forward_cuda(
-    const Tensor& y,
-    const Tensor& w,
-    const Tensor& gates) {
-  TORCH_CHECK(y.is_cuda() && w.is_cuda() && gates.is_cuda(), "mix_bucket_forward_cuda expects CUDA tensors");
-  auto out = torch::zeros({y.size(0), w.size(1), y.size(2)}, y.options());
-  const c10::cuda::CUDAGuard device_guard(y.device());
-  auto y_c = y.contiguous();
-  auto w_c = w.contiguous();
-  auto g_c = gates.contiguous();
-  if (y.scalar_type() == torch::kFloat32) {
-    launch_mix_forward<float>(y_c, w_c, g_c, out);
-  } else if (y.scalar_type() == torch::kFloat64) {
-    launch_mix_forward<double>(y_c, w_c, g_c, out);
-  } else {
-    TORCH_CHECK(false, "mix_bucket_forward_cuda supports only float32/float64");
-  }
+Tensor channelwise_group_transpose_w_cuda(
+    const Tensor& grad_y,
+    const Tensor& a,
+    const Tensor& b_rhs,
+    const Tensor& U,
+    const Tensor& seg_starts,
+    const Tensor& seg_ends) {
+  TORCH_CHECK(grad_y.is_cuda(), "grad_y must be CUDA");
+  TORCH_CHECK(grad_y.scalar_type() == torch::kFloat32, "float32 only");
+  const auto P = grad_y.size(1);
+  const auto O = grad_y.size(2);
+  const auto C = a.size(1);
+  auto grad_W = torch::zeros({P, O, C}, grad_y.options());
+  auto g_c = grad_y.contiguous();
+  auto a_c = a.contiguous();
+  auto b_c = b_rhs.contiguous();
+  auto U_c = U.contiguous();
+  auto s_c = seg_starts.contiguous();
+  auto e_c = seg_ends.contiguous();
+  const c10::cuda::CUDAGuard device_guard(grad_y.device());
+  launch_group_transpose_w<float>(g_c, a_c, b_c, U_c, s_c, e_c, grad_W);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-Tensor mix_bucket_transpose_y_cuda(
-    const Tensor& grad_out,
-    const Tensor& w,
-    const Tensor& gates) {
-  TORCH_CHECK(grad_out.is_cuda() && w.is_cuda() && gates.is_cuda(), "mix_bucket_transpose_y_cuda expects CUDA tensors");
-  auto grad_y = torch::zeros({grad_out.size(0), w.size(0), grad_out.size(2), w.size(2)}, grad_out.options());
-  const c10::cuda::CUDAGuard device_guard(grad_out.device());
-  auto go_c = grad_out.contiguous();
-  auto w_c = w.contiguous();
-  auto g_c = gates.contiguous();
-  if (grad_out.scalar_type() == torch::kFloat32) {
-    launch_mix_transpose_y<float>(go_c, w_c, g_c, grad_y);
-  } else if (grad_out.scalar_type() == torch::kFloat64) {
-    launch_mix_transpose_y<double>(go_c, w_c, g_c, grad_y);
-  } else {
-    TORCH_CHECK(false, "mix_bucket_transpose_y_cuda supports only float32/float64");
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_y;
-}
-
-Tensor mix_bucket_transpose_w_cuda(
-    const Tensor& grad_out,
-    const Tensor& y,
-    const Tensor& gates) {
-  TORCH_CHECK(grad_out.is_cuda() && y.is_cuda() && gates.is_cuda(), "mix_bucket_transpose_w_cuda expects CUDA tensors");
-  auto grad_w = torch::zeros({y.size(1), grad_out.size(1), y.size(3)}, y.options());
-  const c10::cuda::CUDAGuard device_guard(grad_out.device());
-  auto go_c = grad_out.contiguous();
-  auto y_c = y.contiguous();
-  auto g_c = gates.contiguous();
-  if (grad_out.scalar_type() == torch::kFloat32) {
-    launch_mix_transpose_w<float>(go_c, y_c, g_c, grad_w);
-  } else if (grad_out.scalar_type() == torch::kFloat64) {
-    launch_mix_transpose_w<double>(go_c, y_c, g_c, grad_w);
-  } else {
-    TORCH_CHECK(false, "mix_bucket_transpose_w_cuda supports only float32/float64");
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_w;
-}
-
-Tensor mix_bucket_transpose_g_cuda(
-    const Tensor& grad_out,
-    const Tensor& y,
-    const Tensor& w) {
-  TORCH_CHECK(grad_out.is_cuda() && y.is_cuda() && w.is_cuda(), "mix_bucket_transpose_g_cuda expects CUDA tensors");
-  auto grad_g = torch::zeros({y.size(0), y.size(1)}, y.options());
-  const c10::cuda::CUDAGuard device_guard(grad_out.device());
-  auto go_c = grad_out.contiguous();
-  auto y_c = y.contiguous();
-  auto w_c = w.contiguous();
-  if (grad_out.scalar_type() == torch::kFloat32) {
-    launch_mix_transpose_g<float>(go_c, y_c, w_c, grad_g);
-  } else if (grad_out.scalar_type() == torch::kFloat64) {
-    launch_mix_transpose_g<double>(go_c, y_c, w_c, grad_g);
-  } else {
-    TORCH_CHECK(false, "mix_bucket_transpose_g_cuda supports only float32/float64");
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return grad_g;
+  return grad_W;
 }
