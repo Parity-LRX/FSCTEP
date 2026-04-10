@@ -6,7 +6,7 @@ from molecular_force_field.data.collate import collate_fn_h5
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
     PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerFull,
 )
-from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDO3TransformerLayer
+from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import PureCartesianICTDO3TransformerLayer
 from molecular_force_field.models.pure_cartesian_sparse_layers import PureCartesianSparseTransformerLayer
 
 

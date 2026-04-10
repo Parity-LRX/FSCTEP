@@ -9,7 +9,7 @@ import torch
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
     PureCartesianICTDTransformerLayer as PureCartesianICTDSO3,
 )
-from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
+from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import (
     PureCartesianICTDO3TransformerLayer,
 )
 

@@ -6,6 +6,7 @@ precomputed-edge-vector / edge-force interface:
 - e3nn_layers_channelwise.py (spherical-save)
 - cue_layers_channelwise.py (spherical-save-cue, cuEquivariance GPU acceleration)
 - pure_cartesian_ictd_layers.py (pure-cartesian-ictd-save)
+- pure_cartesian_ictd_layers_o3.py (pure-cartesian-ictd-save-o3)
 - pure_cartesian_ictd_layers_full.py (pure-cartesian-ictd)
 
 Note:
@@ -56,10 +57,10 @@ def main():
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="Output .pt file (default: <checkpoint>-mliap.pt)")
     parser.add_argument("--tensor-product-mode", type=str, default=None,
-                        choices=["spherical", "spherical-save", "spherical-save-cue", "pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save"],
+                        choices=["spherical", "spherical-save", "spherical-save-cue", "pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-o3"],
                         help="Override tensor_product_mode. If not set, restore from checkpoint metadata, else fall back to spherical. "
                              "ML-IAP export currently supports: spherical, spherical-save, spherical-save-cue, "
-                             "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save. "
+                             "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save, pure-cartesian-ictd-save-o3. "
                              "spherical-save-cue uses cuEquivariance for GPU acceleration.")
     parser.add_argument("--num-interaction", type=int, default=None,
                         help="Override checkpoint num_interaction (applies to all tensor-product-mode). "

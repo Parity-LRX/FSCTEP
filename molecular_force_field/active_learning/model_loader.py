@@ -240,6 +240,7 @@ def build_e3trans_from_checkpoint(
         PureCartesianSparseTransformerLayerSave,
         PureCartesianICTDTransformerLayer,
         PureCartesianICTDO3TransformerLayer,
+        PureCartesianICTDSaveO3TransformerLayer,
     )
     from molecular_force_field.models.e3nn_layers_channelwise import (
         E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
@@ -338,7 +339,12 @@ def build_e3trans_from_checkpoint(
             multi_fidelity_mode=multi_fidelity_mode,
             **ictd_kwargs,
         )
-    elif mode == "pure-cartesian-ictd-o3":
+    elif mode in {"pure-cartesian-ictd-o3", "pure-cartesian-ictd-save-o3"}:
+        o3_model_cls = (
+            PureCartesianICTDSaveO3TransformerLayer
+            if mode == "pure-cartesian-ictd-save-o3"
+            else PureCartesianICTDO3TransformerLayer
+        )
         ictd_kwargs = dict(
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
@@ -352,7 +358,7 @@ def build_e3trans_from_checkpoint(
             ictd_kwargs["external_tensor_irrep"] = external_tensor_irrep
         if external_tensor_specs is not None:
             ictd_kwargs["external_tensor_specs"] = external_tensor_specs
-        e3trans = PureCartesianICTDO3TransformerLayer(
+        e3trans = o3_model_cls(
             **k_cartesian,
             physical_tensor_outputs=physical_tensor_outputs,
             num_fidelity_levels=num_fidelity_levels,
@@ -371,7 +377,7 @@ def build_e3trans_from_checkpoint(
             f"Unsupported tensor_product_mode: {mode}. "
             "Supported: spherical, spherical-save, spherical-save-cue, "
             "partial-cartesian, partial-cartesian-loose, pure-cartesian, "
-            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save"
+            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-ictd-save"
         )
 
     e3trans = e3trans.to(device=device, dtype=dtype)

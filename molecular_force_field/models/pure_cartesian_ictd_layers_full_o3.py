@@ -1,5 +1,5 @@
 """
-O(3) parity-aware ICTD-save transformer.
+O(3) parity-aware full ICTD transformer.
 
 This keeps the existing ICTD polynomial / harmonic basis, but promotes internal
 features from l-only blocks to (l, parity) blocks.
@@ -545,7 +545,7 @@ class ICTDO3E3Conv(nn.Module):
         return out
 
 
-class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
+class PureCartesianICTDO3TransformerLayer(nn.Module):
     def __init__(
         self,
         max_embed_radius: float,
@@ -764,13 +764,16 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
 
         combined_channels = self.channels * self.num_interaction
         scalar_channels = (self.num_interaction - 1) * self.invariant_channels
-        self._scalar_readout_adapt = nn.ModuleDict()
+        self.W_read = nn.ParameterDict()
         for l, p in self.active_irreps:
-            key = _irrep_key_str(l, p)
-            if scalar_channels == combined_channels:
-                self._scalar_readout_adapt[key] = nn.Identity()
-            else:
-                self._scalar_readout_adapt[key] = nn.Linear(combined_channels, scalar_channels, bias=False)
+            self.W_read[_irrep_key_str(l, p)] = nn.Parameter(
+                torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02
+            )
+        self.readout_linear = nn.Sequential(
+            nn.Linear(scalar_channels + combined_channels * len(self.active_irreps), embed_size[0]),
+            nn.SiLU(),
+            nn.Linear(embed_size[0], 17),
+        )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
 
         self._p5_adapt = nn.ModuleList()
@@ -1025,8 +1028,8 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
         )
         for l, p in self.active_irreps:
             t = xb[(l, p)]
-            t = _apply_channel_adapter_per_irrep(t, self._scalar_readout_adapt[_irrep_key_str(l, p)])
-            scalars = scalars + (t * t).sum(dim=-1) / math.sqrt(2 * l + 1)
+            gram = torch.einsum("ncm,ndm->ncd", t, t) / math.sqrt(2 * l + 1)
+            scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[_irrep_key_str(l, p)], gram)
 
         T_blocks: dict[tuple[int, int], torch.Tensor] = {}
         splits = [_split_irreps_o3(f, self.channels, self.active_irreps) for f in features]
@@ -1083,3 +1086,6 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
         if return_reciprocal_source:
             return e_scalar, reciprocal_source
         return e_scalar
+
+
+PureCartesianICTDFullO3TransformerLayer = PureCartesianICTDO3TransformerLayer

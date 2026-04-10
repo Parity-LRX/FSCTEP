@@ -113,7 +113,7 @@ _DEFAULT_CUE_NATIVE_TRACE_BUCKETS: list[tuple[str, int, int]] = [
 
 
 def _default_trace_num_nodes_edges(mode: str) -> tuple[int, int]:
-    if mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save"}:
+    if mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-o3"}:
         return 2048, 32000
     return 32, 256
 
@@ -502,6 +502,7 @@ def _export_single_core(
         "pure-cartesian-ictd",
         "pure-cartesian-ictd-o3",
         "pure-cartesian-ictd-save",
+        "pure-cartesian-ictd-save-o3",
         "spherical-save-cue",
     )
 
@@ -790,7 +791,7 @@ def export_core(
         "hybrid"
         if (
             (mode == "spherical-save-cue" and native_ops)
-            or mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save"}
+            or mode in {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-o3"}
         )
         else "trace"
     )
@@ -885,7 +886,7 @@ def main() -> None:
     p.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--mode", type=str, default=None,
                    help="Model mode. If not set, restore from checkpoint metadata. "
-                        "Supported: pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save, spherical-save-cue")
+                        "Supported: pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save, pure-cartesian-ictd-save-o3, spherical-save-cue")
     p.add_argument("--max-radius", type=float, default=None,
                    help="Override checkpoint cutoff radius (Å). If not set, restore from checkpoint metadata.")
     p.add_argument("--num-interaction", type=int, default=None,
@@ -911,10 +912,10 @@ def main() -> None:
                         "If omitted, core.pt keeps a runtime fidelity_ids input.")
     p.add_argument("--trace-num-nodes", type=int, default=None,
                    help="Representative node count used during TorchScript tracing. "
-                        "Default: 2048 for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save, else 32.")
+                        "Default: 2048 for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save / pure-cartesian-ictd-save-o3, else 32.")
     p.add_argument("--trace-num-edges", type=int, default=None,
                    help="Representative edge count used during TorchScript tracing. "
-                        "Default: 32000 for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save, else 256.")
+                        "Default: 32000 for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save / pure-cartesian-ictd-save-o3, else 256.")
     p.add_argument("--bundle-out", type=str, default=None,
                    help="Export a multi-core bundle directory instead of a single core.pt. "
                         "Writes per-bucket cores plus manifest.json.")
@@ -922,7 +923,7 @@ def main() -> None:
                    help="Comma-separated bucket list for --bundle-out. Format: nodes:edges or name=nodes:edges. "
                         "Default for spherical-save-cue --native-ops: small=648:35804,medium=1296:80000,large=4096:262144.")
     p.add_argument("--jit-mode", type=str, default=None, choices=["trace", "hybrid"],
-                   help="Export mode. Default: hybrid for spherical-save-cue with --native-ops and for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save; else trace. "
+                   help="Export mode. Default: hybrid for spherical-save-cue with --native-ops and for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save / pure-cartesian-ictd-save-o3; else trace. "
                         "hybrid scripts an export-only wrapper around the traced numeric core.")
     p.add_argument("--out", type=str, default="core.pt", help="Output TorchScript file path")
     args = p.parse_args()

@@ -18,7 +18,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
     PureCartesianICTDTransformerLayer as PureCartesianICTD,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
-    PureCartesianICTDO3TransformerLayer,
+    PureCartesianICTDSaveO3TransformerLayer,
 )
 from molecular_force_field.models.cue_layers_channelwise import (
     E3_TransformerLayer_multi as CueLayer,
@@ -106,11 +106,11 @@ def build_models(device, dtype, *, channels: int, lmax: int, num_interaction: in
         ).to(device=device, dtype=dtype),
         "ictd": PureCartesianICTD(**common_cfg).to(device=device, dtype=dtype),
         "ictd-save-so3": PureCartesianICTDSave(**common_cfg).to(device=device, dtype=dtype),
-        "ictd-save-o3-auto": PureCartesianICTDO3TransformerLayer(
+        "ictd-save-o3-auto": PureCartesianICTDSaveO3TransformerLayer(
             **common_cfg,
             o3_irrep_preset="auto",
         ).to(device=device, dtype=dtype),
-        "ictd-save-o3-min": PureCartesianICTDO3TransformerLayer(
+        "ictd-save-o3-min": PureCartesianICTDSaveO3TransformerLayer(
             **common_cfg,
             o3_irrep_preset="minimal",
         ).to(device=device, dtype=dtype),

@@ -38,11 +38,19 @@ from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PureCartesianICTDTransformerLayer,
 )
 try:
-    from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
+    from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import (
         PureCartesianICTDO3TransformerLayer,
+        PureCartesianICTDFullO3TransformerLayer,
     )
 except ImportError:  # pragma: no cover
     PureCartesianICTDO3TransformerLayer = None  # type: ignore[assignment]
+    PureCartesianICTDFullO3TransformerLayer = None  # type: ignore[assignment]
+try:
+    from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
+        PureCartesianICTDSaveO3TransformerLayer,
+    )
+except ImportError:  # pragma: no cover
+    PureCartesianICTDSaveO3TransformerLayer = None  # type: ignore[assignment]
 from molecular_force_field.models.pure_cartesian_sparse_layers import (
     PureCartesianSparseTransformerLayer,
 )
@@ -92,3 +100,7 @@ __all__ = [
 
 if PureCartesianICTDO3TransformerLayer is not None:
     __all__.append("PureCartesianICTDO3TransformerLayer")
+if PureCartesianICTDFullO3TransformerLayer is not None:
+    __all__.append("PureCartesianICTDFullO3TransformerLayer")
+if PureCartesianICTDSaveO3TransformerLayer is not None:
+    __all__.append("PureCartesianICTDSaveO3TransformerLayer")

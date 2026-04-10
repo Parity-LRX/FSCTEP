@@ -546,7 +546,7 @@ def _make_dummy_checkpoint_pure_cartesian_ictd_o3(
     o3_active_irreps: str | None = None,
 ) -> ModelConfig:
     """创建 pure-cartesian-ictd-o3 的 dummy checkpoint。"""
-    from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDO3TransformerLayer
+    from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import PureCartesianICTDO3TransformerLayer
 
     config = ModelConfig(dtype=torch.float64)
     config.atomic_energy_keys = torch.tensor([1, 8], dtype=torch.long)

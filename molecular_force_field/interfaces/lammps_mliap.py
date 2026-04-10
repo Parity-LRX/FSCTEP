@@ -68,7 +68,8 @@ from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PureCartesianICTDTransformerLayer as PureCartesianICTDTransformerLayerSave,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import PureCartesianICTDTransformerLayer
-from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDO3TransformerLayer
+from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import PureCartesianICTDO3TransformerLayer
+from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDSaveO3TransformerLayer
 from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
@@ -935,6 +936,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         - "pure-cartesian-sparse-save": PureCartesianSparseTransformerLayerSave
         - "pure-cartesian-ictd": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers_full)
         - "pure-cartesian-ictd-save": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers)
+        - "pure-cartesian-ictd-save-o3": PureCartesianICTDSaveO3TransformerLayer (pure_cartesian_ictd_layers_o3)
         """
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         selected_state_dict, state_source = get_checkpoint_e3_state_dict(ckpt)
@@ -1121,8 +1123,13 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
-        elif mode == "pure-cartesian-ictd-o3":
-            model = PureCartesianICTDO3TransformerLayer(
+        elif mode in {"pure-cartesian-ictd-o3", "pure-cartesian-ictd-save-o3"}:
+            o3_model_cls = (
+                PureCartesianICTDSaveO3TransformerLayer
+                if mode == "pure-cartesian-ictd-save-o3"
+                else PureCartesianICTDO3TransformerLayer
+            )
+            model = o3_model_cls(
                 max_embed_radius=config.max_radius,
                 main_max_radius=config.max_radius_main,
                 main_number_of_basis=config.number_of_basis_main,
@@ -1556,7 +1563,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         # Optional TorchScript tracing
         use_ts = bool(torchscript) or (os.environ.get("MLIAP_USE_TORCHSCRIPT", "").lower() in ("1", "true", "yes"))
         if use_ts:
-            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "spherical-save-cue")
+            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-o3", "spherical-save-cue")
             if mode not in _ts_supported:
                 raise ValueError(f"TorchScript export is only supported for {_ts_supported}, got {mode!r}")
             model = _maybe_torchscript_trace_model(

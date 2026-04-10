@@ -23,7 +23,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
     ICTDIrrepsE3Conv as FullConv1,
     PureCartesianICTDTransformerLayer as FullModel,
 )
-from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
+from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import (
     PureCartesianICTDO3TransformerLayer as O3Model,
     _merge_irreps_o3 as merge_o3_irreps,
     _o3_active_irreps,

@@ -11,7 +11,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PureCartesianICTDTransformerLayer as PureCartesianICTDSave,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import (
-    PureCartesianICTDO3TransformerLayer,
+    PureCartesianICTDSaveO3TransformerLayer,
 )
 
 
@@ -73,13 +73,13 @@ def build_models(device: torch.device, dtype: torch.dtype):
     )
     models = {
         "ictd-save-so3": PureCartesianICTDSave(**common).to(device=device, dtype=dtype),
-        "ictd-save-o3-auto": PureCartesianICTDO3TransformerLayer(
+        "ictd-save-o3-auto": PureCartesianICTDSaveO3TransformerLayer(
             **common, o3_irrep_preset="auto"
         ).to(device=device, dtype=dtype),
-        "ictd-save-o3-min": PureCartesianICTDO3TransformerLayer(
+        "ictd-save-o3-min": PureCartesianICTDSaveO3TransformerLayer(
             **common, o3_irrep_preset="minimal"
         ).to(device=device, dtype=dtype),
-        "ictd-save-o3-full": PureCartesianICTDO3TransformerLayer(
+        "ictd-save-o3-full": PureCartesianICTDSaveO3TransformerLayer(
             **common, o3_irrep_preset="full"
         ).to(device=device, dtype=dtype),
     }

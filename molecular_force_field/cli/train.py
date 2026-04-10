@@ -24,6 +24,7 @@ from molecular_force_field.models import (
     PureCartesianSparseTransformerLayerSave,
     PureCartesianICTDTransformerLayer,
     PureCartesianICTDO3TransformerLayer,
+    PureCartesianICTDSaveO3TransformerLayer,
     MainNet,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
@@ -532,13 +533,13 @@ def main():
                         help='Optional parity shorthand for external tensor injection. Ignored when --external-tensor-irrep is set.')
     parser.add_argument('--o3-irrep-preset', type=str, default=None,
                         choices=['auto', 'minimal', 'balanced', 'full'],
-                        help='Active-irrep preset for pure-cartesian-ictd-o3. '
+                        help='Active-irrep preset for pure-cartesian-ictd-o3 / pure-cartesian-ictd-save-o3. '
                              '"auto" keeps canonical SO(3) irreps plus parity-sensitive inputs/outputs, '
                              '"minimal" keeps only required irreps, '
                              '"balanced" adds one extra coupling shell around auto, '
                              '"full" keeps every (l,e/o) block.')
     parser.add_argument('--o3-active-irreps', type=str, default=None,
-                        help="Explicit active irrep override for pure-cartesian-ictd-o3, e.g. '0e,1e,2e'. "
+                        help="Explicit active irrep override for pure-cartesian-ictd-o3 / pure-cartesian-ictd-save-o3, e.g. '0e,1e,2e'. "
                              'When set, this overrides --o3-irrep-preset but still auto-includes required inputs/outputs.')
     parser.add_argument('--extra-per-node-file', type=str, default=None,
                         help='Per-node label HDF5 (sample_0, sample_1, ... with charge_per_atom, dipole_per_atom, etc.)')
@@ -590,7 +591,7 @@ def main():
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-o3'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
@@ -601,8 +602,9 @@ def main():
                              '"pure-cartesian-sparse" uses a sparse pure-cartesian delta/epsilon tensor product (O(3) strict) by restricting rank-rank paths, '
                              '"pure-cartesian-sparse-save" uses the same sparse pure-cartesian implementation under a dedicated save-mode name, '
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
-                             '"pure-cartesian-ictd-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware O(3) ICTD). '
+                             '"pure-cartesian-ictd-o3" uses pure_cartesian_ictd_layers_full_o3 (strict parity-aware full O(3) ICTD). '
                              '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, same readout, DDP supported). '
+                             '"pure-cartesian-ictd-save-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware save O(3) ICTD). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--max-rank-other', type=int, default=None,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
@@ -1031,6 +1033,7 @@ def main():
         "spherical-save-cue",
         "pure-cartesian-ictd",
         "pure-cartesian-ictd-o3",
+        "pure-cartesian-ictd-save-o3",
         "pure-cartesian-sparse",
         "pure-cartesian-sparse-save",
     }
@@ -1039,7 +1042,7 @@ def main():
     if num_fidelity_levels > 0 and args.tensor_product_mode not in fidelity_supported_modes:
         raise ValueError(
             "--num-fidelity-levels is currently supported only for --tensor-product-mode "
-            "spherical-save-cue, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+            "spherical-save-cue, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
         )
     if multi_fidelity_mode not in {"conditioning", "delta-baseline"}:
         raise ValueError("--multi-fidelity-mode must be one of conditioning|delta-baseline")
@@ -1049,7 +1052,7 @@ def main():
             "The model will include external field architecture. If 'external_field' "
             "is not embedded in the H5 dataset, the field will be zero at runtime."
         )
-    phys_supported_modes = {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-sparse", "pure-cartesian-sparse-save"}
+    phys_supported_modes = {"pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save-o3", "pure-cartesian-sparse", "pure-cartesian-sparse-save"}
     has_external_tensor_request = bool(
         args.external_tensor_rank
         or args.external_tensor_irrep
@@ -1063,12 +1066,12 @@ def main():
     if has_external_tensor_request and args.tensor_product_mode not in phys_supported_modes:
         raise ValueError(
             "External tensor embedding is only supported for --tensor-product-mode "
-            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
         )
     if (args.physical_tensors or args.physical_tensors_per_node) and args.tensor_product_mode not in phys_supported_modes:
         raise ValueError(
             "--physical-tensors and --physical-tensors-per-node only supported for --tensor-product-mode "
-            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
         )
     if args.physical_tensors_per_node and not args.extra_per_node_file:
         raise ValueError("--physical-tensors-per-node requires --extra-per-node-file")
@@ -1754,8 +1757,17 @@ def main():
             feature_spectral_include_k0=args.feature_spectral_include_k0,
             feature_spectral_gate_init=args.feature_spectral_gate_init,
         ).to(device)
-    elif args.tensor_product_mode == 'pure-cartesian-ictd-o3':
-        logging.info("Using PURE Cartesian ICTD O(3) mode (strict parity-aware ICTD), num_interaction=%d", args.num_interaction)
+    elif args.tensor_product_mode in {'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save-o3'}:
+        o3_model_cls = (
+            PureCartesianICTDSaveO3TransformerLayer
+            if args.tensor_product_mode == 'pure-cartesian-ictd-save-o3'
+            else PureCartesianICTDO3TransformerLayer
+        )
+        logging.info(
+            "Using PURE Cartesian ICTD %sO(3) mode (strict parity-aware ICTD), num_interaction=%d",
+            "save " if args.tensor_product_mode == 'pure-cartesian-ictd-save-o3' else "",
+            args.num_interaction,
+        )
         logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
         _phys_specs = {"charge": [0], "dipole": [1], "magnetic_moment": [1], "polarizability": [0, 2], "quadrupole": [2], "born_effective_charge": [0, 1, 2]}
         _phys_irreps = {
@@ -1786,7 +1798,7 @@ def main():
                         "magnetic_moment_per_atom, polarizability_per_atom, quadrupole_per_atom, born_effective_charge_per_atom"
                     )
         physical_tensor_outputs = physical_tensor_outputs if physical_tensor_outputs else restored_physical_tensor_outputs
-        e3trans = PureCartesianICTDO3TransformerLayer(
+        e3trans = o3_model_cls(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
             main_number_of_basis=config.number_of_basis_main,

@@ -1155,12 +1155,13 @@ def main():
     if args.external_tensor_rank and args.tensor_product_mode not in {
         "pure-cartesian-ictd",
         "pure-cartesian-ictd-o3",
+        "pure-cartesian-ictd-save-o3",
         "pure-cartesian-sparse",
         "pure-cartesian-sparse-save",
     }:
         raise ValueError(
             "--external-tensor-rank only supported for --tensor-product-mode "
-            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
+            "pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-sparse, or pure-cartesian-sparse-save"
         )
 
     # ------------------------------------------------------------------ #

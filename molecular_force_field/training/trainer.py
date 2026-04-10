@@ -192,7 +192,8 @@ class Trainer:
                 Options: 'spherical', 'spherical-save', 'spherical-save-cue',
                 'partial-cartesian', 'partial-cartesian-loose',
                 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save',
-                'pure-cartesian-ictd', 'pure-cartesian-ictd-save'
+                'pure-cartesian-ictd', 'pure-cartesian-ictd-o3',
+                'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-o3'
         """
         self.distributed = distributed
         self.rank = rank
@@ -230,7 +231,9 @@ class Trainer:
             'pure-cartesian-sparse': '_pure_cartesian_sparse',
             'pure-cartesian-sparse-save': '_pure_cartesian_sparse_save',
             'pure-cartesian-ictd': '_pure_cartesian_ictd',
+            'pure-cartesian-ictd-o3': '_pure_cartesian_ictd_o3',
             'pure-cartesian-ictd-save': '_pure_cartesian_ictd_save',
+            'pure-cartesian-ictd-save-o3': '_pure_cartesian_ictd_save_o3',
         }
         self.tensor_product_suffix = mode_suffix_map.get(tensor_product_mode, '_spherical')
         

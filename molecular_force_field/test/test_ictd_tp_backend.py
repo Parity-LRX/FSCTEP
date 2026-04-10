@@ -19,7 +19,7 @@ from molecular_force_field.models.ictd_irreps_cuda import (
     _project_transpose_reference,
 )
 from molecular_force_field.models.pure_cartesian_ictd_layers import PureCartesianICTDTransformerLayer
-from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDO3TransformerLayer
+from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import PureCartesianICTDO3TransformerLayer
 
 
 def _make_so3_inputs(batch: int, mul1: int, mul2: int, lmax: int, dtype: torch.dtype):
