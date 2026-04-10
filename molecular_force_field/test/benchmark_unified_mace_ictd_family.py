@@ -99,7 +99,7 @@ def build_models(device, dtype, *, channels: int, lmax: int, num_interaction: in
             ictd_config=ICTDConfig(
                 enabled=True,
                 internal_compute_dtype=dtype,
-                tp_backend="auto",
+                tp_backend="pytorch",
                 group="o3",
                 channelwise_scalar_gates=True,
             ),

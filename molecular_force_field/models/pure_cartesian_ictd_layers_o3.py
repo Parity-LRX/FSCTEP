@@ -38,6 +38,15 @@ from molecular_force_field.utils.fidelity import (
     zero_init_module_output,
 )
 
+try:
+    import torch._dynamo as _dynamo  # type: ignore
+
+    def _dynamo_disable(fn):  # pragma: no cover
+        return _dynamo.disable(fn)
+except Exception:  # pragma: no cover
+    def _dynamo_disable(fn):
+        return fn
+
 
 def _irrep_key(l: int, parity: int) -> tuple[int, int]:
     return (int(l), 1 if int(parity) >= 0 else -1)
@@ -170,20 +179,26 @@ def resolve_o3_active_irreps(
         return _o3_active_irreps(lmax)
     if preset_norm == "minimal":
         return required
-    if preset_norm == "auto":
+    if preset_norm in {"auto", "canonical"}:
+        return _canonical_o3_irreps(lmax)
+    if preset_norm in {"task_auto", "auto_required", "canonical_required"}:
         return _sorted_unique_irreps(_canonical_o3_irreps(lmax) + required)
     if preset_norm == "balanced":
         return _balanced_o3_irreps(
             lmax=lmax,
             seed_irreps=_sorted_unique_irreps(_canonical_o3_irreps(lmax) + required),
         )
-    raise ValueError(f"Unknown o3_irrep_preset={preset!r}; expected auto|minimal|balanced|full")
+    raise ValueError(
+        f"Unknown o3_irrep_preset={preset!r}; expected "
+        "auto|canonical|task_auto|minimal|balanced|full"
+    )
 
 
 def _irreps_total_dim_o3(channels: int, active_irreps: list[tuple[int, int]]) -> int:
     return int(channels) * sum(2 * int(l) + 1 for l, _ in active_irreps)
 
 
+@_dynamo_disable
 def _split_irreps_o3(
     x: torch.Tensor,
     channels: int,
@@ -518,9 +533,7 @@ class ICTDO3E3Conv(nn.Module):
                     scale = self.external_tensor_scale_by_irrep[self.active_irreps.index(key)]
                     f_in[key] = f_in[key] + t * scale
 
-        x2 = self._empty_blocks((edge_src.shape[0],), self.output_size, Ai.device, Ai.dtype)
-        x2[(0, 1)] = Ai[edge_dst].unsqueeze(-1)
-
+        x2 = {(0, 1): Ai[edge_dst].unsqueeze(-1)}
         emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
         emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=Ai.dtype)
         gates = self.fc(emb)
@@ -953,6 +966,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
         emb_base = soft_one_hot_linspace(
             edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True
         ).mul(self.number_of_basis ** 0.5)
+
         for tp2, fc2 in zip(self.tp2_layers, self.fc2_layers):
             f_prev = features[-1]
             emb = emb_base.to(dtype=f_prev.dtype)
