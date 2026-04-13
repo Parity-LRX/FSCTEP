@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from molecular_force_field.models.losses import weighted_mse_loss_stats
+
 
 _PER_FIDELITY_STAT_KEYS = {
     "graph_count": 0,
@@ -123,6 +125,16 @@ def smooth_l1_loss_stats(
     loss_sum = (loss * expanded_weights).sum()
     normalizer = expanded_weights.sum()
     return loss_sum / normalizer.clamp_min(1e-12), loss_sum, normalizer
+
+
+def mse_loss_stats(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward-compatible wrapper around the canonical weighted MSE helper."""
+    return weighted_mse_loss_stats(pred, target, weights=weights)
 
 
 def init_per_fidelity_metric_sums(

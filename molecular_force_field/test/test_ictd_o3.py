@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-import torch
+import math
 
-from molecular_force_field.models.ictd_irreps import HarmonicFullyConnectedTensorProductO3
+import torch
+from e3nn import o3
+
+from molecular_force_field.models.ictd_irreps import (
+    HarmonicFullyConnectedTensorProductO3,
+    direction_harmonics_fast,
+)
 from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import (
     PureCartesianICTDO3TransformerLayer,
     resolve_o3_active_irreps,
@@ -16,6 +22,34 @@ def _make_o3_blocks(batch: int = 2, mul: int = 1, dtype: torch.dtype = torch.flo
     for l, p in active:
         blocks[(l, p)] = torch.zeros(batch, mul, 2 * l + 1, dtype=dtype)
     return active, blocks
+
+
+def _e3_to_ictd_basis_cpu(l: int) -> torch.Tensor:
+    l = int(l)
+    dim = 2 * l + 1
+    if l == 0:
+        return torch.ones(1, 1, dtype=torch.float64)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(1729 + l)
+    xyz = torch.randn(max(128, 16 * dim), 3, generator=gen, dtype=torch.float64)
+    xyz = torch.nn.functional.normalize(xyz, dim=-1)
+    y_e3 = o3.spherical_harmonics(l, xyz, normalize=True, normalization="component")
+    y_ictd = direction_harmonics_fast(xyz, l)
+    return torch.linalg.lstsq(y_e3, y_ictd).solution.contiguous()
+
+
+def _ictd_to_e3_basis_cpu(l: int) -> torch.Tensor:
+    return torch.linalg.inv(_e3_to_ictd_basis_cpu(int(l))).contiguous()
+
+
+def _entry_e3_to_ictd(entry: torch.Tensor, l: int) -> torch.Tensor:
+    mat = _e3_to_ictd_basis_cpu(int(l)).to(device=entry.device, dtype=entry.dtype)
+    return torch.matmul(entry, mat)
+
+
+def _entry_ictd_to_e3(entry: torch.Tensor, l: int) -> torch.Tensor:
+    mat = _ictd_to_e3_basis_cpu(int(l)).to(device=entry.device, dtype=entry.dtype)
+    return torch.matmul(entry, mat)
 
 
 def test_o3_tp_respects_parity_multiplication_rule() -> None:
@@ -39,6 +73,70 @@ def test_o3_tp_respects_parity_multiplication_rule() -> None:
     nonzero_odd = sum(v.abs().sum().item() for (l, p), v in out.items() if p == -1)
     assert nonzero_odd > 0.0
     assert nonzero_even == 0.0
+
+
+def test_canonical_o3_scalar_rhs_multiplicity_scale_matches_e3nn() -> None:
+    torch.manual_seed(0)
+    dtype = torch.float64
+    batch = 4
+    hidden_mul = 8
+    attr_mul = 2
+    lmax = 3
+    hidden_irreps = o3.Irreps("8x0e + 8x1o + 8x2e + 8x3o")
+    attr_irreps = o3.Irreps("2x0e")
+    active_irreps = [(l, 1 if l % 2 == 0 else -1) for l in range(lmax + 1)]
+    allowed_paths = [(l, p, 0, 1, l, p) for l, p in active_irreps]
+
+    tp_ref = o3.FullyConnectedTensorProduct(
+        hidden_irreps,
+        attr_irreps,
+        hidden_irreps,
+        shared_weights=True,
+        internal_weights=True,
+    ).to(dtype=dtype)
+    tp_ictd = HarmonicFullyConnectedTensorProductO3(
+        mul_in1=hidden_mul,
+        mul_in2=attr_mul,
+        mul_out=hidden_mul,
+        lmax=lmax,
+        active_irreps=active_irreps,
+        internal_weights=True,
+        allowed_paths=allowed_paths,
+    ).to(dtype=dtype)
+    with torch.no_grad():
+        for idx, w_view in enumerate(tp_ref.weight_views()):
+            tp_ictd.weight[idx].copy_(w_view.permute(2, 0, 1))
+
+    x1_entries_e3 = []
+    x1_ictd = {}
+    for mul, ir in hidden_irreps:
+        entry = torch.randn(batch, mul, ir.dim, dtype=dtype)
+        x1_entries_e3.append(entry)
+        x1_ictd[(int(ir.l), int(ir.p))] = _entry_e3_to_ictd(entry, int(ir.l))
+    x1_e3 = torch.cat([entry.reshape(batch, -1) for entry in x1_entries_e3], dim=-1)
+
+    x2_entry_e3 = torch.randn(batch, attr_mul, 1, dtype=dtype)
+    x2_e3 = x2_entry_e3.reshape(batch, -1)
+    x2_ictd = {(0, 1): _entry_e3_to_ictd(x2_entry_e3, 0)}
+
+    y_ref_flat = tp_ref(x1_e3, x2_e3)
+    y_ref = {}
+    start = 0
+    for mul, ir in hidden_irreps:
+        width = mul * ir.dim
+        y_ref[(int(ir.l), int(ir.p))] = y_ref_flat[:, start : start + width].reshape(batch, mul, ir.dim)
+        start += width
+
+    y_ictd = {key: _entry_ictd_to_e3(val, key[0]) for key, val in tp_ictd(x1_ictd, x2_ictd).items()}
+
+    ref_norm_sq = 0.0
+    diff_sq = 0.0
+    for key, target in y_ref.items():
+        ref_norm_sq += float(target.square().sum().item())
+        diff_sq += float((y_ictd[key] - target).square().sum().item())
+    rel = math.sqrt(diff_sq / ref_norm_sq)
+
+    assert rel < 1.0e-6
 
 
 def test_o3_model_forward_external_and_physical_heads() -> None:

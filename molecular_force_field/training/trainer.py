@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import SequentialLR, LambdaLR, StepLR, CosineAnnea
 import copy
 
 from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
-from molecular_force_field.models.losses import RMSELoss
+from molecular_force_field.models.losses import RMSELoss, weighted_mse_loss_stats
 from molecular_force_field.utils.tensor_utils import (
     ALL_PHYSICAL_TENSOR_NAMES,
     build_physical_tensor_label_blocks,
@@ -138,6 +138,7 @@ class Trainer:
         delta_regularization_weight: float = 0.0,
         bec_derivative_weight: float = 1.0,
         bec_consistency_weight: float = 0.25,
+        loss_function: str = "smooth-l1",
     ):
         """
         Initialize trainer.
@@ -208,6 +209,11 @@ class Trainer:
         self.delta_regularization_weight = float(delta_regularization_weight)
         self.bec_derivative_weight = float(bec_derivative_weight)
         self.bec_consistency_weight = float(bec_consistency_weight)
+        self.loss_function = str(loss_function).lower()
+        if self.loss_function not in {"smooth-l1", "weighted-mse"}:
+            raise ValueError(
+                f"Unsupported loss_function={loss_function!r}; expected 'smooth-l1' or 'weighted-mse'"
+            )
 
         # Validation-only compile settings
         self.compile_val = str(compile_val)
@@ -327,6 +333,17 @@ class Trainer:
 
         # Clamp initial weights (and any user-provided weights) to bounds
         self._clamp_loss_weights()
+
+    def _regression_loss_stats(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.loss_function == "weighted-mse":
+            return weighted_mse_loss_stats(pred, target, weights=weights)
+        return smooth_l1_loss_stats(pred, target, beta=0.5, weights=weights)
         
         if atomic_energy_keys is None:
             self.keys = torch.tensor([1, 6, 7, 8]).to(device)
@@ -1318,10 +1335,9 @@ class Trainer:
                 batch_idx,
                 dtype=pos.dtype,
             )
-            force_loss, _, _ = smooth_l1_loss_stats(
+            force_loss, _, _ = self._regression_loss_stats(
                 f_pred,
                 force_ref_scaled,
-                beta=0.5,
                 weights=atom_fidelity_weights,
             )
             
@@ -1330,10 +1346,9 @@ class Trainer:
             
             # Stress loss
             if compute_stress:
-                stress_loss, _, _ = smooth_l1_loss_stats(
+                stress_loss, _, _ = self._regression_loss_stats(
                     stress_pred,
                     stress_ref,
-                    beta=0.5,
                     weights=graph_fidelity_weights,
                 )
                 with torch.no_grad():
@@ -1346,10 +1361,9 @@ class Trainer:
             num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
             E_avg_pred = E_mean / num_atoms_per_mol
             target_energy_avg = target_energies / num_atoms_per_mol
-            energy_loss, _, _ = smooth_l1_loss_stats(
+            energy_loss, _, _ = self._regression_loss_stats(
                 E_avg_pred,
                 target_energy_avg,
-                beta=0.5,
                 weights=graph_fidelity_weights,
             )
             
@@ -1751,16 +1765,14 @@ class Trainer:
                 batch_idx,
                 dtype=pos.dtype,
             )
-            _, batch_energy_loss_sum, batch_energy_loss_norm = smooth_l1_loss_stats(
+            _, batch_energy_loss_sum, batch_energy_loss_norm = self._regression_loss_stats(
                 E_avg_pred,
                 E_avg_target,
-                beta=0.5,
                 weights=graph_fidelity_weights,
             )
-            _, batch_force_loss_sum, batch_force_loss_norm = smooth_l1_loss_stats(
+            _, batch_force_loss_sum, batch_force_loss_norm = self._regression_loss_stats(
                 f_pred_final,
                 f_ref_final,
-                beta=0.5,
                 weights=atom_fidelity_weights,
             )
             val_energy_loss_sum += float(batch_energy_loss_sum.item())
@@ -1768,10 +1780,9 @@ class Trainer:
             val_force_loss_sum += float(batch_force_loss_sum.item())
             val_force_loss_norm += float(batch_force_loss_norm.item())
             if compute_stress:
-                _, batch_stress_loss_sum, batch_stress_loss_norm = smooth_l1_loss_stats(
+                _, batch_stress_loss_sum, batch_stress_loss_norm = self._regression_loss_stats(
                     stress_pred,
                     stress_ref,
-                    beta=0.5,
                     weights=graph_fidelity_weights,
                 )
                 val_stress_loss_sum += float(batch_stress_loss_sum.item())
@@ -2370,20 +2381,18 @@ class Trainer:
                 batch_idx,
                 dtype=pos.dtype,
             )
-            force_loss, force_loss_sum_batch, force_loss_norm_batch = smooth_l1_loss_stats(
+            force_loss, force_loss_sum_batch, force_loss_norm_batch = self._regression_loss_stats(
                 f_pred,
                 force_ref_scaled,
-                beta=0.5,
                 weights=atom_fidelity_weights,
             )
 
             num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
             E_avg_pred = E_mean / num_atoms_per_mol
             target_energy_avg = target_energies / num_atoms_per_mol
-            energy_loss, energy_loss_sum_batch, energy_loss_norm_batch = smooth_l1_loss_stats(
+            energy_loss, energy_loss_sum_batch, energy_loss_norm_batch = self._regression_loss_stats(
                 E_avg_pred,
                 target_energy_avg,
-                beta=0.5,
                 weights=graph_fidelity_weights,
             )
 
@@ -2405,10 +2414,9 @@ class Trainer:
             force_mae_sum += F.l1_loss(f_pred.view(-1), force_ref_scaled.view(-1), reduction='sum').item()
 
             if compute_stress:
-                _, stress_loss_sum_batch, stress_loss_norm_batch = smooth_l1_loss_stats(
+                _, stress_loss_sum_batch, stress_loss_norm_batch = self._regression_loss_stats(
                     stress_pred,
                     stress_ref,
-                    beta=0.5,
                     weights=graph_fidelity_weights,
                 )
                 stress_loss_sum += stress_loss_sum_batch.item()

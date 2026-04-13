@@ -302,6 +302,13 @@ def main():
         help="Training force loss weight forwarded to mff-train.",
     )
     parser.add_argument(
+        "--train-loss-function",
+        type=str,
+        choices=["smooth-l1", "weighted-mse"],
+        default=None,
+        help="Training loss function forwarded to mff-train.",
+    )
+    parser.add_argument(
         "--train-batch-size", type=int, default=None,
         help="Training batch size forwarded to mff-train.",
     )
@@ -1202,6 +1209,8 @@ def main():
         train_args.extend(["--dump-frequency", str(args.train_dump_frequency)])
     if args.train_update_param is not None:
         train_args.extend(["--update-param", str(args.train_update_param)])
+    if args.train_loss_function is not None:
+        train_args.extend(["--loss-function", args.train_loss_function])
     if args.device is not None:
         train_args.extend(["--device", args.device])
     if args.max_radius is not None:

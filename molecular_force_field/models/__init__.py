@@ -6,7 +6,7 @@ from molecular_force_field.models.e3nn_layers import (
     E3_TransformerLayer_multi,
 )
 from molecular_force_field.models.mlp import MainNet, MainNet2
-from molecular_force_field.models.losses import RMSELoss
+from molecular_force_field.models.losses import RMSELoss, weighted_mse_loss_stats
 from molecular_force_field.models.cartesian_e3_layers import (
     CartesianTransformerLayer,
     CartesianTransformerLayerLoose,
@@ -86,6 +86,7 @@ __all__ = [
     "PureCartesianICTDTransformerLayer",
     "PureCartesianSparseTransformerLayer",
     "PureCartesianSparseTransformerLayerSave",
+    "weighted_mse_loss_stats",
     "FastSymmetricSTF",
     "FastSymmetricTraceChain",
     "decompose_rank2_generic",

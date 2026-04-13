@@ -91,6 +91,7 @@ def _stack_group_weights(
     w_param: torch.Tensor,
     segments: List[Tuple[int, ...]],
     compute_dtype: torch.dtype,
+    mul_scale: float = 1.0,
 ) -> torch.Tensor:
     path_indices = [int(seg[0]) for seg in segments]
     start = path_indices[0]
@@ -101,6 +102,8 @@ def _stack_group_weights(
         stacked = w_param.index_select(0, idx_t)
     if stacked.dtype != compute_dtype:
         stacked = stacked.to(dtype=compute_dtype)
+    if abs(float(mul_scale) - 1.0) > 1e-12:
+        stacked = stacked * float(mul_scale)
     return stacked.contiguous().view(stacked.shape[0], stacked.shape[1], -1)
 
 
@@ -939,6 +942,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.lmax = lmax
         self.internal_weights = internal_weights
         self._normalization = normalization
+        self._mul_path_scale = 1.0
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
 
@@ -1027,6 +1031,9 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
         self._scalar_split_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
+
+    def _weight_to_compute(self, w: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
+        return w.to(dtype=compute_dtype) if w.dtype != compute_dtype else w
 
 
     @_dynamo_disable
@@ -1283,6 +1290,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                             w_param=w_param,
                             segments=bucket_segments,
                             compute_dtype=compute_dtype,
+                            mul_scale=self._mul_path_scale,
                         ).to(device=a_comp.device)
                         gates_bucket = None
                         if weights is not None:
@@ -1320,6 +1328,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                             w_param=w_param,
                             segments=segments,
                             compute_dtype=compute_dtype,
+                            mul_scale=self._mul_path_scale,
                         ).to(device=a_comp.device)
                         out_buf = _tp_fused_outer_proj_channel_mix(
                             a_flat, b_flat, U, W_stack, segments, k_total, self.mul_out, m1, m2
@@ -1358,7 +1367,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
                     ij = i * j
                     for p_idx, l3, s, e in segments:  # type: ignore[misc]
                         Wp = w_param[int(p_idx)]  # (o,i,j)
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         y_seg = y[..., :, :, int(s): int(e)]  # (..., i, j, kdim)
                         kdim = int(e) - int(s)
                         y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)  # (..., k, ij)
@@ -1599,6 +1608,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self.lmax = int(lmax)
         self.internal_weights = bool(internal_weights)
         self._normalization = normalization
+        self._mul_path_scale = 1.0 / math.sqrt(float(max(self.mul_in1 * self.mul_in2, 1)))
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
         self.active_irreps = (
@@ -1668,6 +1678,12 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         self._scalar_identity_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
         self._scalar_split_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Dict[str, object]]]] = {}
+
+    def _weight_to_compute(self, w: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
+        w_comp = w.to(dtype=compute_dtype) if w.dtype != compute_dtype else w
+        if abs(float(self._mul_path_scale) - 1.0) > 1e-12:
+            w_comp = w_comp * float(self._mul_path_scale)
+        return w_comp
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -1958,7 +1974,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                     ij = self.mul_in1 * self.mul_in2
                     for p_idx, l3, p3, s, e in segments:
                         Wp = w_param[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         y_seg = y[..., :, :, int(s): int(e)]
                         kdim = int(e) - int(s)
                         y2 = y_seg.movedim(-1, -3).contiguous().view(*y_seg.shape[:-3], kdim, ij)
@@ -2002,7 +2018,7 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
 
                 a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
                 b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
-                Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                 C = cg_list[p_idx]
                 out_l3 = torch.einsum("...im,...jn,mnk,...oij->...ok", a_comp, b_comp, C, Wp_comp)
                 out_l3 = out_l3.to(dtype=dtype) if out_l3.dtype != dtype else out_l3
@@ -2154,7 +2170,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         base = lhs.unsqueeze(-1) * b_comp
                 for p_idx, key_ir, alpha in scalar_meta["segments"]:  # type: ignore[index]
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     out_seg = torch.matmul(
                         (base * float(alpha)).movedim(-1, -2).contiguous(),
                         Wp_comp.transpose(0, 1),
@@ -2172,7 +2188,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                 base_scalar = (a_comp * b_comp).sum(dim=-1, keepdim=True)
                 for p_idx, key_ir, alpha in scalar_split_meta["scalar_entries"]:  # type: ignore[index]
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     out_seg = torch.matmul(
                         (base_scalar * float(alpha)).movedim(-1, -2).contiguous(),
                         Wp_comp.transpose(0, 1),
@@ -2287,6 +2303,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                                 w_param=self.weight,
                                 segments=segments,
                                 compute_dtype=compute_dtype,
+                                mul_scale=self._mul_path_scale,
                             )
                             out_stack = torch.einsum("...cm,...n,pmnk,poc->...pok", a_comp, b_rhs, seg2_stack, W_stack)
                             out_stack = out_stack.to(dtype=dtype) if out_stack.dtype != dtype else out_stack
@@ -2309,7 +2326,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                             p_idx, key_ir, _s, _e = seg  # type: ignore[misc]
                             l3 = int(key_ir[0])
                         Wp = self.weight[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         out_seg = torch.einsum("...cm,...n,mnk,oc->...ok", a_comp, b_rhs, U_seg, Wp_comp)
                         out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
                         if weights is not None:
@@ -2323,7 +2340,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                             p_idx, key_ir, _s, _e = seg  # type: ignore[misc]
                             l3 = int(key_ir[0])
                         Wp = self.weight[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         out_seg = torch.einsum("...cm,...cn,mnk,oc->...ok", a_comp, b_comp, U_seg, Wp_comp)
                         out_seg = out_seg.to(dtype=dtype) if out_seg.dtype != dtype else out_seg
                         if weights is not None:
@@ -2364,7 +2381,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         p_idx, key_ir, s, e = seg  # type: ignore[misc]
                         l3 = int(key_ir[0])
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     y_seg = y[..., :, int(s): int(e)]
                     out_seg = torch.matmul(
                         y_seg.movedim(-1, -2).contiguous(),
@@ -2453,7 +2470,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         base = lhs.unsqueeze(-1) * b_comp
                 for p_idx, key_ir, alpha in scalar_meta["segments"]:  # type: ignore[index]
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     out_seg = torch.matmul(
                         (base * float(alpha)).movedim(-1, -2).contiguous(),
                         Wp_comp.transpose(0, 1),
@@ -2470,7 +2487,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                 base_scalar = (a_comp * b_comp).sum(dim=-1, keepdim=True)
                 for p_idx, key_ir, alpha in scalar_split_meta["scalar_entries"]:  # type: ignore[index]
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     out_seg = torch.matmul(
                         (base_scalar * float(alpha)).movedim(-1, -2).contiguous(),
                         Wp_comp.transpose(0, 1),
@@ -2495,6 +2512,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         w_param=self.weight,
                         segments=segments,
                         compute_dtype=compute_dtype,
+                        mul_scale=self._mul_path_scale,
                     ).to(device=a_comp.device)
                     fused_segments = [(int(p_idx), int(l3), int(s), int(e)) for p_idx, l3, _p3, s, e in segments]
                     out_buf = _tp_fused_outer_proj_channel_mix(
@@ -2541,6 +2559,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                             w_param=self.weight,
                             segments=bucket_segments,
                             compute_dtype=compute_dtype,
+                            mul_scale=self._mul_path_scale,
                         ).to(device=a_comp.device)
                         gates_bucket = None
                         if gates_all is not None:
@@ -2581,7 +2600,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         else:
                             p_idx, key_ir, s, e = seg
                         Wp = self.weight[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         out_seg = torch.einsum(
                             "...cm,...n,mnk,oc->...ok",
                             a_comp,
@@ -2601,7 +2620,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         else:
                             p_idx, key_ir, s, e = seg
                         Wp = self.weight[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         out_seg = torch.einsum(
                             "...cm,...cn,mnk,oc->...ok",
                             a_comp,
@@ -2631,6 +2650,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
                         w_param=self.weight,
                         segments=bucket_segments,
                         compute_dtype=compute_dtype,
+                        mul_scale=self._mul_path_scale,
                     )
                     out_bucket = torch.einsum("...pck,poc->...pok", y_bucket, W_bucket)
                     out_bucket = out_bucket.to(dtype=dtype) if out_bucket.dtype != dtype else out_bucket
@@ -2646,7 +2666,7 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
             else:
                 for p_idx, l3, p3, s, e in active_segments:
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     y_seg = y[..., :, int(s): int(e)]
                     out_seg = torch.matmul(
                         y_seg.movedim(-1, -2).contiguous(),
@@ -2787,7 +2807,7 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                         base = lhs.unsqueeze(-1) * b_comp
                 for p_idx, key_ir, alpha in scalar_meta["segments"]:  # type: ignore[index]
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     out_seg = torch.matmul(
                         (base * float(alpha)).movedim(-1, -2).contiguous(),
                         Wp_comp.transpose(0, 1),
@@ -2914,7 +2934,7 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                     for seg, U_seg in seg_views:
                         p_idx, l3, s, e = seg  # type: ignore[misc]
                         Wp = self.weight[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         out_seg = torch.einsum(
                             "...cm,...n,mnk,oc->...ok",
                             a_comp,
@@ -2930,7 +2950,7 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                     for seg, U_seg in seg_views:
                         p_idx, l3, s, e = seg  # type: ignore[misc]
                         Wp = self.weight[int(p_idx)]
-                        Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                        Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                         out_seg = torch.einsum(
                             "...cm,...cn,mnk,oc->...ok",
                             a_comp,
@@ -2960,6 +2980,7 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
                         w_param=self.weight,
                         segments=bucket_segments,
                         compute_dtype=compute_dtype,
+                        mul_scale=self._mul_path_scale,
                     )
                     out_bucket = torch.einsum("...pck,poc->...pok", y_bucket, W_bucket)
                     out_bucket = out_bucket.to(dtype=dtype) if out_bucket.dtype != dtype else out_bucket
@@ -2971,7 +2992,7 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
             else:
                 for p_idx, l3, s, e in active_segments:  # type: ignore[misc]
                     Wp = self.weight[int(p_idx)]
-                    Wp_comp = Wp.to(dtype=compute_dtype) if Wp.dtype != compute_dtype else Wp
+                    Wp_comp = self._weight_to_compute(Wp, compute_dtype)
                     y_seg = y[..., :, int(s): int(e)]
                     out_seg = torch.matmul(
                         y_seg.movedim(-1, -2).contiguous(),

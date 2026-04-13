@@ -7,6 +7,7 @@ from molecular_force_field.utils.fidelity import (
     flatten_per_fidelity_metrics,
     get_graph_fidelity_weights,
     init_per_fidelity_metric_sums,
+    mse_loss_stats,
     parse_fidelity_loss_weights,
     smooth_l1_loss_stats,
     update_per_fidelity_metric_sums,
@@ -30,6 +31,21 @@ def test_weighted_smooth_l1_loss_respects_fidelity_weights():
     target = torch.zeros_like(pred)
     unweighted_mean, _, _ = smooth_l1_loss_stats(pred, target, beta=0.5, weights=None)
     weighted_mean, _, _ = smooth_l1_loss_stats(pred, target, beta=0.5, weights=graph_weights)
+    assert weighted_mean.item() > unweighted_mean.item()
+
+
+def test_weighted_mse_loss_respects_fidelity_weights():
+    fidelity_ids = torch.tensor([0, 1], dtype=torch.long)
+    graph_weights = get_graph_fidelity_weights(
+        fidelity_ids,
+        {1: 4.0},
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
+    pred = torch.tensor([0.0, 4.0], dtype=torch.float64)
+    target = torch.zeros_like(pred)
+    unweighted_mean, _, _ = mse_loss_stats(pred, target, weights=None)
+    weighted_mean, _, _ = mse_loss_stats(pred, target, weights=graph_weights)
     assert weighted_mean.item() > unweighted_mean.item()
 
 
