@@ -204,7 +204,7 @@ def main():
     parser.add_argument('--embedding-dim', type=int, default=None,
                         help='Atom embedding dimension. If not set, restore from checkpoint when available, else use 16.')
     parser.add_argument('--embed-size', type=int, nargs='+', default=None,
-                        help='Hidden layer sizes for readout MLP. If not set, restore from checkpoint when available, else use 128 128 128.')
+                        help='Hidden layer sizes for readout MLP. If not set, restore from checkpoint when available, else use 64.')
     parser.add_argument('--output-size', type=int, default=None,
                         help='Output size for atom readout MLP. If not set, restore from checkpoint when available, else use 8.')
     parser.add_argument('--lmax', type=int, default=None,
@@ -245,7 +245,8 @@ def main():
                         help='Per-interaction invariant readout channels used by product_3-style scalar invariant blocks. '
                              'If not set, restore from checkpoint when available, else use 32. '
                              'Applies to: spherical, spherical-save, partial-cartesian, partial-cartesian-loose, '
-                             'pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-save.')
+                             'pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd-save. '
+                             'Ignored by pure-cartesian-ictd / pure-cartesian-ictd-o3 full readout.')
     parser.add_argument('--o3-irrep-preset', type=str, default=None,
                         choices=['auto', 'minimal', 'balanced', 'full'],
                         help='Active-irrep preset for pure-cartesian-ictd-o3 / pure-cartesian-ictd-save-o3. If not set, restore from checkpoint when available, else use auto.')

@@ -44,6 +44,12 @@ def log_gradient_statistics(networks, batch_idx, logger):
         for name, param in net.named_parameters():
             if param.grad is not None:
                 grad = param.grad.data
+                if grad.numel() == 0:
+                    logger.debug(
+                        f"Gradient/Batch_{batch_idx}/Network_{net.__class__.__name__}/Layer_{name}:\n"
+                        "  Empty gradient tensor"
+                    )
+                    continue
                 grad_norm = torch.norm(grad).item()
                 grad_max = grad.max().item()
                 grad_min = grad.min().item()
@@ -334,33 +340,22 @@ class Trainer:
         # Clamp initial weights (and any user-provided weights) to bounds
         self._clamp_loss_weights()
 
-    def _regression_loss_stats(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        *,
-        weights: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.loss_function == "weighted-mse":
-            return weighted_mse_loss_stats(pred, target, weights=weights)
-        return smooth_l1_loss_stats(pred, target, beta=0.5, weights=weights)
-        
         if atomic_energy_keys is None:
             self.keys = torch.tensor([1, 6, 7, 8]).to(device)
         else:
             self.keys = atomic_energy_keys.to(device)
-            
+
         if atomic_energy_values is None:
             self.values = torch.tensor([
                 -430.53299511, -821.03326787, -1488.18856918, -2044.3509823
             ]).to(device)
         else:
             self.values = atomic_energy_values.to(device)
-        
+
         # Loss functions
         self.criterion = nn.SmoothL1Loss(beta=0.5)
         self.criterion_2 = RMSELoss()
-        
+
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             list(e3trans.parameters()) + list(model.parameters()),
@@ -370,15 +365,15 @@ class Trainer:
             weight_decay=1e-6,
             amsgrad=True
         )
-        
+
         # Learning rate scheduler: warmup + decay
         milestones = [warmup_batches]
-        
+
         def warmup_lambda(current_step):
             progress = min(current_step / warmup_batches, 1.0)
             initial_ratio = initial_learning_rate_for_weight
             return initial_ratio + (1 - initial_ratio) * progress
-        
+
         warmup_scheduler = LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
 
         if lr_scheduler_type == 'cosine':
@@ -401,7 +396,7 @@ class Trainer:
             schedulers=[warmup_scheduler, decay_scheduler],
             milestones=milestones
         )
-        
+
         # Wrap models with DDP if distributed training is enabled
         if self.distributed:
             # Enable find_unused_parameters for models with conditional computation paths
@@ -416,11 +411,11 @@ class Trainer:
             # Note: model (MainNet) is not used in forward pass, so we don't wrap it
             # But if it's used elsewhere, wrap it too:
             # self.model = DDP(self.model, ...)
-        
+
         # These will be overwritten if loading from checkpoint
         # Kept here for clarity of initialization sequence
         self.loss_out = []
-        
+
         # Log training configuration (only on main process)
         if self.is_main_process:
             logging.info("=" * 60)
@@ -448,17 +443,17 @@ class Trainer:
                     logging.info("    Will save EMA model in checkpoint")
             logging.info(f"  Validation Frequency: every {self.dump_frequency} batches")
             if self.train_eval_sample_ratio == 0.0:
-                logging.info(f"  Train Evaluation: Disabled (using current batch loss only)")
+                logging.info("  Train Evaluation: Disabled (using current batch loss only)")
             elif self.train_eval_sample_ratio < 1.0:
                 logging.info(f"  Train Evaluation: {self.train_eval_sample_ratio*100:.1f}% sampling (faster validation)")
             else:
-                logging.info(f"  Train Evaluation: Full dataset (100%)")
+                logging.info("  Train Evaluation: Full dataset (100%)")
             logging.info(f"  Energy Log Frequency: every {self.energy_log_frequency} batches")
             logging.info(f"  Early Stopping Patience: {self.patience} epochs")
             if self.distributed:
                 logging.info(f"  Distributed Training: {self.world_size} GPUs")
             logging.info("=" * 60)
-        
+
         # Load checkpoint if exists
         # Try original path first, then try checkpoint directory
         checkpoint_to_load = None
@@ -469,9 +464,29 @@ class Trainer:
             checkpoint_in_dir = os.path.join(self.checkpoint_dir, os.path.basename(checkpoint_path))
             if os.path.exists(checkpoint_in_dir):
                 checkpoint_to_load = checkpoint_in_dir
-        
+
         if checkpoint_to_load:
             self.load_checkpoint(checkpoint_to_load)
+        else:
+            # If no checkpoint exists, initialize a fresh loss.csv
+            if self.is_main_process:
+                df = pd.DataFrame(columns=[
+                    'epoch', 'train_rmse', 'val_rmse',
+                    'train_loss', 'val_loss', 'energy_train_rmse', 'energy_val_rmse',
+                    'force_train_rmse', 'force_val_rmse', 'a', 'b', 'c', 'learning_rate'
+                ])
+                df.to_csv(self.loss_csv_path, index=False)
+
+    def _regression_loss_stats(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.loss_function == "weighted-mse":
+            return weighted_mse_loss_stats(pred, target, weights=weights)
+        return smooth_l1_loss_stats(pred, target, beta=0.5, weights=weights)
 
     def _cudagraph_step_begin_if_available(self):
         try:
@@ -1133,18 +1148,28 @@ class Trainer:
                 (pos, A, batch_idx, force_ref, target_energies,
                  edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch_data
             
-            # Move to device
-            pos = pos.to(self.device)
+            # Move to device and normalize floating tensors to the model dtype
+            model_dtype = next(self.e3trans.parameters()).dtype
+            pos = pos.to(self.device, dtype=model_dtype)
             A = A.to(self.device)
             batch_idx = batch_idx.to(self.device)
-            force_ref = force_ref.to(self.device)
-            target_energies = target_energies.to(self.device)
+            force_ref = force_ref.to(self.device, dtype=model_dtype)
+            target_energies = target_energies.to(self.device, dtype=model_dtype)
             edge_src = edge_src.to(self.device)
             edge_dst = edge_dst.to(self.device)
-            edge_shifts = edge_shifts.to(self.device)
-            cell = cell.to(self.device)
-            stress_ref = stress_ref.to(self.device)
-            extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
+            edge_shifts = edge_shifts.to(self.device, dtype=model_dtype)
+            cell = cell.to(self.device, dtype=model_dtype)
+            stress_ref = stress_ref.to(self.device, dtype=model_dtype)
+            extras = {
+                k: (
+                    v.to(self.device, dtype=model_dtype)
+                    if torch.is_tensor(v) and torch.is_floating_point(v)
+                    else v.to(self.device)
+                    if torch.is_tensor(v)
+                    else v
+                )
+                for k, v in (extras or {}).items()
+            }
             
             pos.requires_grad_(True)
             
@@ -1203,7 +1228,12 @@ class Trainer:
                 # Continuous growth/decay (only if SWA not applied yet)
                 # Update weights on rank 0, then broadcast to all processes
                 weights_updated = False
-                if self.is_main_process and self.batch_count % self.update_param == 0:
+                if (
+                    self.is_main_process
+                    and self.update_param is not None
+                    and self.update_param > 0
+                    and self.batch_count % self.update_param == 0
+                ):
                     self.a *= self.weight_a_growth
                     self.b *= self.weight_b_decay
                     # Clamp weights to configured bounds
@@ -1640,17 +1670,27 @@ class Trainer:
                 (pos, A, batch_idx, force_ref, target_energies,
                  edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch
             
-            pos = pos.to(self.device)
+            model_dtype = next(self.e3trans.parameters()).dtype
+            pos = pos.to(self.device, dtype=model_dtype)
             A = A.to(self.device)
             batch_idx = batch_idx.to(self.device)
-            force_ref = force_ref.to(self.device)
-            target_energies = target_energies.to(self.device)
+            force_ref = force_ref.to(self.device, dtype=model_dtype)
+            target_energies = target_energies.to(self.device, dtype=model_dtype)
             edge_src = edge_src.to(self.device)
             edge_dst = edge_dst.to(self.device)
-            edge_shifts = edge_shifts.to(self.device)
-            cell = cell.to(self.device)
-            stress_ref = stress_ref.to(self.device)
-            extras = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in (extras or {}).items()}
+            edge_shifts = edge_shifts.to(self.device, dtype=model_dtype)
+            cell = cell.to(self.device, dtype=model_dtype)
+            stress_ref = stress_ref.to(self.device, dtype=model_dtype)
+            extras = {
+                k: (
+                    v.to(self.device, dtype=model_dtype)
+                    if torch.is_tensor(v) and torch.is_floating_point(v)
+                    else v.to(self.device)
+                    if torch.is_tensor(v)
+                    else v
+                )
+                for k, v in (extras or {}).items()
+            }
             
             pos.requires_grad = True
             

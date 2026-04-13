@@ -12,7 +12,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "dtype": "float64",
     "max_atomvalue": 10,
     "embedding_dim": 16,
-    "embed_size": [128, 128, 128],
+    "embed_size": [64],
     "output_size": 8,
     "lmax": 2,
     "irreps_output_conv_channels": None,

@@ -393,7 +393,7 @@ def main():
                         choices=['smooth-l1', 'weighted-mse'],
                         help='Regression loss for energy/force/stress terms (default: smooth-l1)')
     parser.add_argument('--update-param', type=int, default=1000,
-                        help='Interval (in batches) to update loss weights a and b (default: 1000)')
+                        help='Interval (in batches) to update loss weights a and b (default: 1000). Use 0 to disable dynamic weight updates.')
     parser.add_argument('--weight-a-growth', type=float, default=1.05,
                         help='Growth factor for energy weight a at each update (default: 1.05, meaning 5%% growth). '
                              'Recommended: 1.005 (slow), 1.01 (medium), 1.02 (fast), 1.05 (very fast)')
@@ -583,7 +583,7 @@ def main():
     parser.add_argument('--embedding-dim', type=int, default=None,
                         help='Atom embedding dimension. If not set, restore from checkpoint when available, else use 16.')
     parser.add_argument('--embed-size', type=int, nargs='+', default=None,
-                        help='Hidden layer sizes for readout MLP. If not set, restore from checkpoint when available, else use 128 128 128.')
+                        help='Hidden layer sizes for readout MLP. If not set, restore from checkpoint when available, else use 64.')
     parser.add_argument('--output-size', type=int, default=None,
                         help='Output size for atom readout MLP. If not set, restore from checkpoint when available, else use 8.')
     parser.add_argument('--lmax', type=int, default=None,
@@ -628,7 +628,8 @@ def main():
                         help='Per-interaction invariant readout channels used by product_3-style scalar invariant blocks. '
                              'If not set, restore from checkpoint when available, else use 32. '
                              'Applies to: spherical, spherical-save, partial-cartesian, partial-cartesian-loose, '
-                             'pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-save.')
+                             'pure-cartesian, pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd-save. '
+                             'Ignored by pure-cartesian-ictd / pure-cartesian-ictd-o3 full readout.')
 
     # ICTD path pruning controls (pure-cartesian-ictd and pure-cartesian-ictd-save)
     parser.add_argument('--ictd-tp-path-policy', type=str, default=None,

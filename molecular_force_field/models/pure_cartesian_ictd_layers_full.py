@@ -514,9 +514,9 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         # Internal computation dtype for ICTD operations (default: float64 for stability)
         internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "pytorch",
-        # Optional: allow per-l multiplicities for the "product_5-like" scalar invariant vector.
+        # Optional: allow per-l multiplicities for the readout elementwise product.
         # If None: keep current behavior (mul_l = channels for all l).
-        # If provided: dict l->mul_l for l=0..lmax; used only for the readout invariants.
+        # If provided: dict l->mul_l for l=0..lmax; used only for the readout product path.
         product5_muls_by_l: dict[int, int] | None = None,
         invariant_channels: int = 32,
         # Optional: physical tensor outputs (equivariant heads).
@@ -592,7 +592,10 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.num_interaction = int(num_interaction)
         if self.num_interaction < 2:
             raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
-        self.invariant_channels = int(invariant_channels)
+        # The full ICTD readout no longer injects an extra invariant branch into
+        # the product path. Keep the requested value only as metadata.
+        self.requested_invariant_channels = int(invariant_channels)
+        self.invariant_channels = 0
 
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
@@ -702,23 +705,14 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             self.tp2_layers.append(tp2)
             self.fc2_layers.append(fc2)
 
-        # Readout invariants:
-        #  - scalars: per-l channel Gram -> 32
-        #  - norms: per-l per-channel L2 over m
         combined_channels = self.channels * self.num_interaction
-        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
+        scalar_channels = 0
         self.W_read = nn.ParameterList([
-            nn.Parameter(torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02)
+            nn.Parameter(torch.empty(scalar_channels, combined_channels, combined_channels))
             for _ in range(self.lmax + 1)
         ])
-        self.readout_linear = nn.Sequential(
-            nn.Linear(scalar_channels + (self.lmax + 1) * combined_channels, embed_size[0]),
-            nn.SiLU(),
-            nn.Linear(embed_size[0], 17),
-        )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
-        # Match e3nn-style product_5:
-        # T = cat([f1..fn, scalars]); ElementwiseTensorProduct(T,T)->0e
+        # Pure elementwise readout over concatenated per-layer ICTD irreps.
         if product5_muls_by_l is None:
             self.product5_muls_by_l = {l: self.channels for l in range(self.lmax + 1)}
         else:
@@ -751,14 +745,14 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         )
 
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
-        self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+        self.proj_total = MainNet(self.num_interaction * sum_mul, embed_size, 17)
         self.delta_proj_total: nn.ModuleDict | None = None
         self.delta_weighted_sum: nn.ModuleDict | None = None
         if self.multi_fidelity_mode == "delta-baseline" and self.num_fidelity_levels > 1:
             self.delta_proj_total = nn.ModuleDict()
             self.delta_weighted_sum = nn.ModuleDict()
             for fid in range(1, self.num_fidelity_levels):
-                head = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+                head = MainNet(self.num_interaction * sum_mul, embed_size, 17)
                 zero_init_module_output(head)
                 self.delta_proj_total[str(fid)] = head
                 sum_head = RobustScalarWeightedSum(17)
@@ -767,7 +761,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 self.delta_weighted_sum[str(fid)] = sum_head
         self.long_range_module = build_long_range_module(
             mode=self.long_range_mode,
-            feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul + scalar_channels,
+            feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul,
             hidden_dim=self.long_range_hidden_dim,
             boundary=self.long_range_boundary,
             neutralize=self.long_range_neutralize,
@@ -800,7 +794,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.long_range_num_k = getattr(self.long_range_module, "num_k", None) if self.long_range_module is not None else None
         self.feature_spectral_module = build_feature_spectral_module(
             mode=self.feature_spectral_mode,
-            feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul + scalar_channels,
+            feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul,
             bottleneck_dim=self.feature_spectral_bottleneck_dim,
             mesh_size=self.feature_spectral_mesh_size,
             filter_hidden_dim=self.feature_spectral_filter_hidden_dim,

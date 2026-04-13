@@ -712,7 +712,10 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
         self.max_radius = main_max_radius
         self.number_of_basis = main_number_of_basis
         self.function_type = function_type_main
-        self.invariant_channels = int(invariant_channels)
+        # The full O3 ICTD readout no longer injects an extra invariant branch
+        # into the product path. Keep the requested value only as metadata.
+        self.requested_invariant_channels = int(invariant_channels)
+        self.invariant_channels = 0
 
         self.e3_conv_emb = ICTDO3E3Conv(
             max_radius=max_embed_radius,
@@ -763,17 +766,12 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
             self.fc2_layers.append(fc2)
 
         combined_channels = self.channels * self.num_interaction
-        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
+        scalar_channels = 0
         self.W_read = nn.ParameterDict()
         for l, p in self.active_irreps:
             self.W_read[_irrep_key_str(l, p)] = nn.Parameter(
-                torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02
+                torch.empty(scalar_channels, combined_channels, combined_channels)
             )
-        self.readout_linear = nn.Sequential(
-            nn.Linear(scalar_channels + combined_channels * len(self.active_irreps), embed_size[0]),
-            nn.SiLU(),
-            nn.Linear(embed_size[0], 17),
-        )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
 
         self._p5_adapt = nn.ModuleList()
@@ -791,14 +789,14 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
         )
 
         sum_mul = self.channels * len(self.active_irreps)
-        self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+        self.proj_total = MainNet(self.num_interaction * sum_mul, embed_size, 17)
         self.delta_proj_total: nn.ModuleDict | None = None
         self.delta_weighted_sum: nn.ModuleDict | None = None
         if self.multi_fidelity_mode == "delta-baseline" and self.num_fidelity_levels > 1:
             self.delta_proj_total = nn.ModuleDict()
             self.delta_weighted_sum = nn.ModuleDict()
             for fid in range(1, self.num_fidelity_levels):
-                head = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+                head = MainNet(self.num_interaction * sum_mul, embed_size, 17)
                 zero_init_module_output(head)
                 self.delta_proj_total[str(fid)] = head
                 sum_head = RobustScalarWeightedSum(17)
@@ -807,7 +805,7 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
                 self.delta_weighted_sum[str(fid)] = sum_head
         self.long_range_module = build_long_range_module(
             mode=self.long_range_mode,
-            feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul + scalar_channels,
+            feature_dim=self.proj_total.input_size if hasattr(self.proj_total, "input_size") else self.num_interaction * sum_mul,
             hidden_dim=self.long_range_hidden_dim,
             boundary=self.long_range_boundary,
             neutralize=self.long_range_neutralize,
@@ -1020,17 +1018,6 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
                         out_blocks[l] = yg
                 physical_out[name] = out_blocks
 
-        scalars = torch.zeros(
-            f_combine.shape[0],
-            (self.num_interaction - 1) * self.invariant_channels,
-            device=f_combine.device,
-            dtype=f_combine.dtype,
-        )
-        for l, p in self.active_irreps:
-            t = xb[(l, p)]
-            gram = torch.einsum("ncm,ndm->ncd", t, t) / math.sqrt(2 * l + 1)
-            scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[_irrep_key_str(l, p)], gram)
-
         T_blocks: dict[tuple[int, int], torch.Tensor] = {}
         splits = [_split_irreps_o3(f, self.channels, self.active_irreps) for f in features]
         for key in self.active_irreps:
@@ -1041,7 +1028,6 @@ class PureCartesianICTDO3TransformerLayer(nn.Module):
                 b_lp = _apply_channel_adapter_per_irrep(b_lp, self._p5_adapt[i][kstr])
                 parts.append(b_lp)
             T_blocks[key] = torch.cat(parts, dim=-2)
-        T_blocks[(0, 1)] = torch.cat([T_blocks[(0, 1)], scalars.unsqueeze(-1)], dim=-2)
         f_prod5 = self.product_5(T_blocks, T_blocks)
         feature_reciprocal_source = None
         if self.feature_spectral_module is not None:
