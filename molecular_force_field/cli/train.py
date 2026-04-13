@@ -52,8 +52,22 @@ from molecular_force_field.utils.fidelity import parse_fidelity_loss_weights
 from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
 
-def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, num_workers,
-                              input_file=None, train_input_file=None, valid_input_file=None, seed=42):
+def check_and_preprocess_data(
+    data_dir,
+    train_prefix,
+    val_prefix,
+    max_radius,
+    num_workers,
+    input_file=None,
+    train_input_file=None,
+    valid_input_file=None,
+    seed=42,
+    energy_key=None,
+    force_key=None,
+    species_key=None,
+    coord_key=None,
+    atomic_number_key=None,
+):
     """
     Ensure train/val data exist: use existing H5, run H5-only preprocessing, or full pipeline from XYZ.
 
@@ -107,8 +121,22 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
         import pandas as pd
         import numpy as np
         os.makedirs(data_dir, exist_ok=True)
-        train_blocks, train_energy, train_raw_energy, train_cells, train_pbcs, train_stresses = extract_data_blocks(train_input_file)
-        val_blocks, val_energy, val_raw_energy, val_cells, val_pbcs, val_stresses = extract_data_blocks(valid_input_file)
+        train_blocks, train_energy, train_raw_energy, train_cells, train_pbcs, train_stresses = extract_data_blocks(
+            train_input_file,
+            energy_key=energy_key,
+            force_key=force_key,
+            species_key=species_key,
+            coord_key=coord_key,
+            atomic_number_key=atomic_number_key,
+        )
+        val_blocks, val_energy, val_raw_energy, val_cells, val_pbcs, val_stresses = extract_data_blocks(
+            valid_input_file,
+            energy_key=energy_key,
+            force_key=force_key,
+            species_key=species_key,
+            coord_key=coord_key,
+            atomic_number_key=atomic_number_key,
+        )
         logging.info(f"Train frames: {len(train_blocks)}, Valid frames: {len(val_blocks)}")
         train_atoms = []
         for block in train_blocks:
@@ -146,7 +174,14 @@ def check_and_preprocess_data(data_dir, train_prefix, val_prefix, max_radius, nu
         import pandas as pd
 
         os.makedirs(data_dir, exist_ok=True)
-        all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs, all_stresses = extract_data_blocks(input_file)
+        all_blocks, all_energy, all_raw_energy, all_cells, all_pbcs, all_stresses = extract_data_blocks(
+            input_file,
+            energy_key=energy_key,
+            force_key=force_key,
+            species_key=species_key,
+            coord_key=coord_key,
+            atomic_number_key=atomic_number_key,
+        )
         logging.info(f"Total frames: {len(all_blocks)}")
 
         # 90/10 train/val split (fixed ratio)
@@ -455,6 +490,18 @@ def main():
     parser.add_argument('--atomic-energy-values', type=float, nargs='+', default=None,
                         help='Atomic reference energies (E0) in eV corresponding to --atomic-energy-keys. '
                              'Highest priority override. Example: --atomic-energy-values -430.53 -821.03 -1488.19 -2044.35')
+    parser.add_argument('--energy-key', type=str, default=None,
+                        help='Extended XYZ metadata key to read total energy from during on-the-fly preprocessing '
+                             '(for example REF_energy).')
+    parser.add_argument('--force-key', type=str, default=None,
+                        help='Extended XYZ per-atom key to read forces from during on-the-fly preprocessing '
+                             '(for example REF_forces).')
+    parser.add_argument('--species-key', type=str, default=None,
+                        help='Extended XYZ per-atom key to read species symbols from during on-the-fly preprocessing.')
+    parser.add_argument('--coord-key', type=str, default=None,
+                        help='Extended XYZ per-atom key to read coordinates from during on-the-fly preprocessing.')
+    parser.add_argument('--atomic-number-key', type=str, default=None,
+                        help='Extended XYZ per-atom key to read atomic numbers from during on-the-fly preprocessing.')
     parser.add_argument('--patience', type=int, default=20,
                         help='Early stopping patience in validation checks (not epochs; default: 20)')
     parser.add_argument('--vhat-clamp-interval', type=int, default=2000,
@@ -1371,7 +1418,12 @@ def main():
             input_file=args.input_file,
             train_input_file=args.train_input_file,
             valid_input_file=args.valid_input_file,
-            seed=args.seed
+            seed=args.seed,
+            energy_key=args.energy_key,
+            force_key=args.force_key,
+            species_key=args.species_key,
+            coord_key=args.coord_key,
+            atomic_number_key=args.atomic_number_key,
         )
         if not data_ready:
             logging.error("Data preparation failed. Exiting.")
