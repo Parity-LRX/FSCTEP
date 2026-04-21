@@ -55,6 +55,7 @@ class ModelLoadOptions:
     contraction_order: Optional[int] = None
     save_multiple_fusion_scheme: Optional[str] = None
     save_final_readout_mode: Optional[str] = None
+    save_multiple_mix_channels: Optional[int] = None
 
 
 def _infer_physical_tensor_outputs_from_state_dict(sd: dict) -> dict | None:
@@ -153,6 +154,7 @@ def _build_model(
     save_contraction_order: int = 3,
     save_multiple_fusion_scheme: str = "serial_lastmix",
     save_final_readout_mode: str = "direct-1",
+    save_multiple_mix_channels: int | None = None,
 ):
     if tensor_product_mode == "pure-cartesian":
         model = PureCartesianTransformerLayer(
@@ -256,6 +258,7 @@ def _build_model(
             save_contraction_order=save_contraction_order,
             save_multiple_fusion_scheme=save_multiple_fusion_scheme,
             save_final_readout_mode=save_final_readout_mode,
+            save_multiple_mix_channels=save_multiple_mix_channels,
             internal_compute_dtype=config.internal_compute_dtype,
             device=device,
         )
@@ -595,6 +598,16 @@ def load_model_and_calculator(options: ModelLoadOptions):
         or infer_ictd_save_final_readout_mode_from_state_dict(state_dict_ckpt)
         or "direct-1"
     )
+    save_multiple_mix_channels = (
+        options.save_multiple_mix_channels
+        if options.save_multiple_mix_channels is not None
+        else checkpoint.get("ictd_save_multiple_mix_channels")
+        or arch_meta.get("ictd_save_multiple_mix_channels")
+        or arch_meta.get("save_multiple_mix_channels")
+        or resolved_arch.get("save_multiple_mix_channels")
+    )
+    if save_multiple_mix_channels is not None:
+        save_multiple_mix_channels = int(save_multiple_mix_channels)
 
     model = _build_model(
         tensor_product_mode=tensor_product_mode,
@@ -645,6 +658,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
         save_contraction_order=save_contraction_order,
         save_multiple_fusion_scheme=save_multiple_fusion_scheme,
         save_final_readout_mode=save_final_readout_mode,
+        save_multiple_mix_channels=save_multiple_mix_channels,
     )
     if tensor_product_mode == "pure-cartesian-ictd-save-multiple":
         model_keys = set(model.state_dict().keys())

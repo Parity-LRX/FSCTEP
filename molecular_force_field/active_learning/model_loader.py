@@ -80,6 +80,14 @@ def build_e3trans_from_checkpoint(
         or infer_ictd_save_final_readout_mode_from_state_dict(selected_state_dict)
         or "direct-1"
     )
+    save_multiple_mix_channels = (
+        ckpt.get("ictd_save_multiple_mix_channels")
+        or arch_meta.get("ictd_save_multiple_mix_channels")
+        or arch_meta.get("save_multiple_mix_channels")
+        or resolved_arch.get("save_multiple_mix_channels")
+    )
+    if save_multiple_mix_channels is not None:
+        save_multiple_mix_channels = int(save_multiple_mix_channels)
     if external_tensor_rank is None:
         if "e3_conv_emb.external_tensor_scale_by_l" in selected_state_dict:
             external_tensor_rank = 1
@@ -421,6 +429,7 @@ def build_e3trans_from_checkpoint(
             save_contraction_order=save_contraction_order,
             save_multiple_fusion_scheme=save_multiple_fusion_scheme,
             save_final_readout_mode=save_final_readout_mode,
+            save_multiple_mix_channels=save_multiple_mix_channels,
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
             internal_compute_dtype=dtype,

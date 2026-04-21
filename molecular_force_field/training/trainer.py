@@ -205,7 +205,8 @@ class Trainer:
                 'partial-cartesian', 'partial-cartesian-loose',
                 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save',
                 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3',
-                'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-o3'
+                'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-o3',
+                'pure-cartesian-ictd-save-multiple'
         """
         self.distributed = distributed
         self.rank = rank
@@ -251,8 +252,14 @@ class Trainer:
             'pure-cartesian-ictd-o3': '_pure_cartesian_ictd_o3',
             'pure-cartesian-ictd-save': '_pure_cartesian_ictd_save',
             'pure-cartesian-ictd-save-o3': '_pure_cartesian_ictd_save_o3',
+            'pure-cartesian-ictd-save-multiple': '_pure_cartesian_ictd_save_multiple',
         }
-        self.tensor_product_suffix = mode_suffix_map.get(tensor_product_mode, '_spherical')
+        if tensor_product_mode in mode_suffix_map:
+            self.tensor_product_suffix = mode_suffix_map[tensor_product_mode]
+        elif tensor_product_mode:
+            self.tensor_product_suffix = f"_{tensor_product_mode.replace('-', '_')}"
+        else:
+            self.tensor_product_suffix = '_spherical'
         
         self.model = model
         self.e3trans = e3trans
@@ -730,6 +737,7 @@ class Trainer:
                 "save_contraction_order",
                 "save_multiple_fusion_scheme",
                 "save_final_readout_mode",
+                "save_multiple_mix_channels",
                 "long_range_mode",
                 "long_range_hidden_dim",
                 "long_range_boundary",

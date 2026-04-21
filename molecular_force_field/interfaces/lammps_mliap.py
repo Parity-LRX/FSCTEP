@@ -1082,6 +1082,13 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             or infer_ictd_save_final_readout_mode_from_state_dict(selected_state_dict)
             or "direct-1"
         )
+        save_multiple_mix_channels = (
+            ckpt.get("ictd_save_multiple_mix_channels")
+            or arch_meta.get("ictd_save_multiple_mix_channels")
+            or arch_meta.get("save_multiple_mix_channels")
+        )
+        if save_multiple_mix_channels is not None:
+            save_multiple_mix_channels = int(save_multiple_mix_channels)
 
         if mode == "pure-cartesian-ictd":
             model = PureCartesianICTDTransformerLayer(
@@ -1251,6 +1258,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 save_contraction_order=save_contraction_order,
                 save_multiple_fusion_scheme=save_multiple_fusion_scheme,
                 save_final_readout_mode=save_final_readout_mode,
+                save_multiple_mix_channels=save_multiple_mix_channels,
                 internal_compute_dtype=config.internal_compute_dtype,
                 device=torch.device(device),
                 long_range_mode=long_range_mode,

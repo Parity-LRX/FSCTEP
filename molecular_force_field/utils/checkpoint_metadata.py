@@ -33,6 +33,7 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "save_contraction_order": 3,
     "save_multiple_fusion_scheme": "serial_lastmix",
     "save_final_readout_mode": "direct-1",
+    "save_multiple_mix_channels": None,
     "long_range_mode": "none",
     "long_range_hidden_dim": 64,
     "long_range_boundary": "nonperiodic",
@@ -382,6 +383,16 @@ def resolve_model_architecture(
             checkpoint_key="ictd_save_final_readout_mode",
         )
     )
+    resolved["save_multiple_mix_channels"] = _resolve_value(
+        overrides,
+        checkpoint,
+        arch_meta,
+        "save_multiple_mix_channels",
+        arch_meta.get("channel_in", 64),
+        checkpoint_key="ictd_save_multiple_mix_channels",
+    )
+    if resolved["save_multiple_mix_channels"] is not None:
+        resolved["save_multiple_mix_channels"] = int(resolved["save_multiple_mix_channels"])
     resolved["long_range_mode"] = str(
         _resolve_value(overrides, checkpoint, arch_meta, "long_range_mode", DEFAULT_MODEL_ARCHITECTURE["long_range_mode"])
     )

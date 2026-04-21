@@ -27,9 +27,9 @@ from molecular_force_field.models.ictd_irreps import (
     HarmonicElementwiseProduct,
     HarmonicChannelWiseTensorProduct,
     HarmonicFullyConnectedTensorProduct,
-    HarmonicPathWeightedTensorProduct,
     EquivariantChannelLinearSO3,
     EquivariantChannelLinearSO3Rect,
+    MultipleContractionSO3,
     apply_channel_adapter_per_l,
     direction_harmonics,
     direction_harmonics_all,
@@ -586,85 +586,6 @@ def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, ch
     return torch.cat(outs, dim=-1)
 
 
-class MultipleContractionSO3(nn.Module):
-    """
-    A lightweight MACE-style product/contraction block for the flattened SO(3)
-    irreps layout used by ICTD-save.
-
-    Pipeline:
-      1) Concatenated cross-layer features are reduced equivariantly from
-         in_channels -> hidden_channels.
-      2) Repeated path-weighted tensor products with the reduced base features
-         build a low-width higher-order product basis.
-      3) Lower-order and higher-order terms are summed and projected back to the
-         same hidden irreps layout.
-
-    This is not an exact copy of MACE's symmetric contraction implementation;
-    it is an SO(3)-native analogue that keeps the same ICTD tensor-product
-    family, hidden irreps shape, and path-shared weighting style.
-    """
-
-    def __init__(
-        self,
-        *,
-        in_channels: int,
-        hidden_channels: int,
-        lmax: int,
-        correlation: int = 3,
-        ictd_tp_path_policy: str = "full",
-        ictd_tp_max_rank_other: int | None = None,
-        internal_compute_dtype: torch.dtype | None = None,
-        ictd_tp_backend: str = "pytorch",
-    ):
-        super().__init__()
-        self.in_channels = int(in_channels)
-        self.hidden_channels = int(hidden_channels)
-        self.lmax = int(lmax)
-        self.correlation = int(correlation)
-        if self.correlation < 1:
-            raise ValueError(f"correlation must be >= 1, got {self.correlation}")
-
-        self.reduce = EquivariantChannelLinearSO3Rect(
-            self.in_channels, self.hidden_channels, self.lmax, bias=False
-        )
-        self.order_mix = nn.ModuleList(
-            [
-                EquivariantChannelLinearSO3(self.hidden_channels, self.lmax, bias=False)
-                for _ in range(self.correlation)
-            ]
-        )
-        self.tp_layers = nn.ModuleList(
-            [
-                HarmonicPathWeightedTensorProduct(
-                    channels=self.hidden_channels,
-                    lmax=self.lmax,
-                    path_policy=ictd_tp_path_policy,
-                    max_rank_other=ictd_tp_max_rank_other,
-                    internal_compute_dtype=internal_compute_dtype,
-                )
-                for _ in range(max(self.correlation - 1, 0))
-            ]
-        )
-        self.out_linear = EquivariantChannelLinearSO3(
-            self.hidden_channels, self.lmax, bias=False
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = self.reduce(x)
-        accum = self.order_mix[0](base)
-        if self.correlation == 1:
-            return self.out_linear(accum)
-
-        base_blocks = _split_irreps(base, self.hidden_channels, self.lmax)
-        current_blocks = base_blocks
-        for order_idx, tp in enumerate(self.tp_layers, start=1):
-            current_blocks = tp(current_blocks, base_blocks)
-            current_flat = _merge_irreps(current_blocks, self.hidden_channels, self.lmax)
-            current_flat = self.order_mix[order_idx](current_flat)
-            accum = accum + current_flat
-        return self.out_linear(accum)
-
-
 def _run_in_stream(module: nn.Module, x: torch.Tensor, stream: torch.cuda.Stream | None) -> torch.Tensor:
     if stream is None:
         return module(x)
@@ -915,6 +836,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         save_contraction_order: int = 3,
         save_multiple_fusion_scheme: str = "serial_lastmix",
         save_final_readout_mode: str = "direct-1",
+        save_multiple_mix_channels: int | None = None,
     ):
         super().__init__()
         if embed_size is None:
@@ -938,6 +860,9 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.save_contraction_order = int(save_contraction_order)
         self.save_multiple_fusion_scheme = str(save_multiple_fusion_scheme)
         self.save_final_readout_mode = str(save_final_readout_mode)
+        self.save_multiple_mix_channels = (
+            self.channels if save_multiple_mix_channels is None else int(save_multiple_mix_channels)
+        )
         if self.save_readout_mode not in {"elementwise-scalar", "mace-contraction"}:
             raise ValueError(
                 f"save_readout_mode must be 'elementwise-scalar' or 'mace-contraction', got {self.save_readout_mode!r}"
@@ -955,6 +880,10 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         if self.save_contraction_order < 1:
             raise ValueError(
                 f"save_contraction_order must be >= 1, got {self.save_contraction_order}"
+            )
+        if self.save_multiple_mix_channels < 1:
+            raise ValueError(
+                f"save_multiple_mix_channels must be >= 1, got {self.save_multiple_mix_channels}"
             )
 
         self.max_radius = float(max_embed_radius)
@@ -1051,7 +980,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             )
             self.multiple_contraction_mix = MultipleContractionSO3(
                 in_channels=combined_channels,
-                hidden_channels=self.channels,
+                hidden_channels=self.save_multiple_mix_channels,
                 lmax=self.lmax,
                 correlation=self.save_contraction_order,
                 ictd_tp_path_policy=ictd_tp_path_policy,
@@ -1060,7 +989,10 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 ictd_tp_backend=ictd_tp_backend,
             )
             self.multiple_contract_fuse = EquivariantChannelLinearSO3Rect(
-                2 * self.channels, self.channels, self.lmax, bias=False
+                self.channels + self.save_multiple_mix_channels,
+                self.channels,
+                self.lmax,
+                bias=False,
             )
             self.product5_feature_blocks = self.num_interaction + 1
         # Match e3nn-style product_5:

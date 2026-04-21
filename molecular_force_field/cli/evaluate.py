@@ -281,6 +281,10 @@ def main():
                         choices=['serial_lastmix'],
                         help='Fusion scheme for pure-cartesian-ictd-save-multiple. '
                              'If not set, restore from checkpoint metadata when available, else use serial_lastmix.')
+    parser.add_argument('--ictd-save-multiple-mix-channels', type=int, default=None,
+                        help='Optional narrowed hidden width for the mix contraction branch in '
+                             'pure-cartesian-ictd-save-multiple. '
+                             'If not set, restore from checkpoint metadata when available, else use channel_in.')
     parser.add_argument('--ictd-save-final-readout-mode', type=str, default=None,
                         choices=['direct-1'],
                         help='Final energy readout mode for pure-cartesian-ictd-save and pure-cartesian-ictd-save-multiple. '
@@ -583,6 +587,16 @@ def main():
         or checkpoint.get("model_hyperparameters", {}).get("save_final_readout_mode")
         or resolved_arch["save_final_readout_mode"]
     )
+    args.ictd_save_multiple_mix_channels = (
+        args.ictd_save_multiple_mix_channels
+        if args.ictd_save_multiple_mix_channels is not None
+        else checkpoint.get("ictd_save_multiple_mix_channels")
+        or checkpoint.get("model_hyperparameters", {}).get("ictd_save_multiple_mix_channels")
+        or checkpoint.get("model_hyperparameters", {}).get("save_multiple_mix_channels")
+        or resolved_arch.get("save_multiple_mix_channels")
+    )
+    if args.ictd_save_multiple_mix_channels is not None:
+        args.ictd_save_multiple_mix_channels = int(args.ictd_save_multiple_mix_channels)
     args.long_range_mode = resolved_arch["long_range_mode"]
     args.long_range_hidden_dim = resolved_arch["long_range_hidden_dim"]
     args.long_range_boundary = resolved_arch["long_range_boundary"]
@@ -1156,9 +1170,10 @@ def main():
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
         if tensor_product_mode == 'pure-cartesian-ictd-save-multiple':
             logging.info(
-                "  save_readout_mode=mace-contraction, order=%d, fusion_scheme=%s, final_readout_mode=%s",
+                "  save_readout_mode=mace-contraction, order=%d, fusion_scheme=%s, mix_channels=%s, final_readout_mode=%s",
                 args.ictd_save_contraction_order,
                 args.ictd_save_multiple_fusion_scheme,
+                args.ictd_save_multiple_mix_channels if args.ictd_save_multiple_mix_channels is not None else config.channel_in,
                 args.ictd_save_final_readout_mode,
             )
         else:
@@ -1184,6 +1199,7 @@ def main():
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_fusion_scheme=args.ictd_save_multiple_fusion_scheme,
             save_final_readout_mode=args.ictd_save_final_readout_mode,
+            save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             internal_compute_dtype=config.internal_compute_dtype,
             device=device,
             **common_invariant_kwargs,

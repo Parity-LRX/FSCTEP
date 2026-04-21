@@ -783,6 +783,9 @@ def main():
     parser.add_argument('--contraction-order', dest='ictd_save_contraction_order', type=int, default=3,
                         help='Contraction order for the multi-branch contraction block used by '
                              '--tensor-product-mode pure-cartesian-ictd-save-multiple. Default: 3.')
+    parser.add_argument('--ictd-save-multiple-mix-channels', type=int, default=None,
+                        help='Hidden channel width for the mix contraction branch in '
+                             'pure-cartesian-ictd-save-multiple. Default: same as channels.')
     parser.add_argument('--ictd-save-multiple-fusion-scheme',
                         type=str,
                         default='serial_lastmix',
@@ -2064,7 +2067,8 @@ def main():
             logging.info(
                 "  save_readout_mode=mace-contraction, "
                 f"order={args.ictd_save_contraction_order}, "
-                f"fusion_scheme={args.ictd_save_multiple_fusion_scheme}"
+                f"fusion_scheme={args.ictd_save_multiple_fusion_scheme}, "
+                f"mix_channels={args.ictd_save_multiple_mix_channels or config.channel_in}"
             )
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
@@ -2088,6 +2092,7 @@ def main():
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_fusion_scheme=args.ictd_save_multiple_fusion_scheme,
             save_final_readout_mode=args.ictd_save_final_readout_mode,
+            save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             ictd_tp_path_policy=args.ictd_tp_path_policy,
             ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
             internal_compute_dtype=config.internal_compute_dtype,

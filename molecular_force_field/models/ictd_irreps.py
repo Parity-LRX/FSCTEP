@@ -166,6 +166,191 @@ class EquivariantChannelLinearSO3Rect(nn.Module):
         return merge_flat_irreps_so3(blocks, self.out_channels, self.lmax)
 
 
+class MultipleContractionSO3(nn.Module):
+    """
+    Lightweight higher-order contraction block for the flattened SO(3) irreps
+    layout used by ICTD-save-multiple.
+
+    Pipeline:
+      1) Equivariantly reduce concatenated features from in_channels to
+         hidden_channels.
+      2) Build higher-order product features by repeated path-weighted tensor
+         products against the reduced base features.
+      3) Mix the order-wise contributions and project back to the same hidden
+         irreps layout.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        hidden_channels: int,
+        lmax: int,
+        correlation: int = 3,
+        ictd_tp_path_policy: str = "full",
+        ictd_tp_max_rank_other: int | None = None,
+        internal_compute_dtype: torch.dtype | None = None,
+        ictd_tp_backend: str = "pytorch",
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_channels = int(hidden_channels)
+        self.lmax = int(lmax)
+        self.correlation = int(correlation)
+        if self.correlation < 1:
+            raise ValueError(f"correlation must be >= 1, got {self.correlation}")
+
+        self.reduce = EquivariantChannelLinearSO3Rect(
+            self.in_channels, self.hidden_channels, self.lmax, bias=False
+        )
+        self.order_mix = nn.ModuleList(
+            [
+                EquivariantChannelLinearSO3(self.hidden_channels, self.lmax, bias=False)
+                for _ in range(self.correlation)
+            ]
+        )
+        self.tp_layers = nn.ModuleList(
+            [
+                HarmonicPathWeightedTensorProduct(
+                    channels=self.hidden_channels,
+                    lmax=self.lmax,
+                    path_policy=ictd_tp_path_policy,
+                    max_rank_other=ictd_tp_max_rank_other,
+                    internal_compute_dtype=internal_compute_dtype,
+                )
+                for _ in range(max(self.correlation - 1, 0))
+            ]
+        )
+        self.out_linear = EquivariantChannelLinearSO3(
+            self.hidden_channels, self.lmax, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.reduce(x)
+        accum = self.order_mix[0](base)
+        if self.correlation == 1:
+            return self.out_linear(accum)
+
+        base_blocks = split_flat_irreps_so3(base, self.hidden_channels, self.lmax)
+        current_blocks = base_blocks
+        for order_idx, tp in enumerate(self.tp_layers, start=1):
+            current_blocks = tp(current_blocks, base_blocks)
+            current_flat = merge_flat_irreps_so3(current_blocks, self.hidden_channels, self.lmax)
+            current_flat = self.order_mix[order_idx](current_flat)
+            accum = accum + current_flat
+        return self.out_linear(accum)
+
+
+def split_flat_irreps_o3(
+    x: torch.Tensor,
+    channels: int,
+    active_irreps: List[Tuple[int, int]],
+) -> Dict[Tuple[int, int], torch.Tensor]:
+    """
+    Split a flattened O(3) irreps layout into per-(l, parity) blocks.
+    """
+    out: Dict[Tuple[int, int], torch.Tensor] = {}
+    idx = 0
+    for l, p in active_irreps:
+        d = int(channels) * (2 * int(l) + 1)
+        blk = x[..., idx : idx + d]
+        idx += d
+        out[_normalize_irrep_key(l, p)] = blk.view(*x.shape[:-1], int(channels), 2 * int(l) + 1)
+    return out
+
+
+def merge_flat_irreps_o3(
+    blocks: Dict[Tuple[int, int], torch.Tensor],
+    channels: int,
+    active_irreps: List[Tuple[int, int]],
+) -> torch.Tensor:
+    """
+    Merge per-(l, parity) O(3) irreps blocks back into the flattened layout.
+    """
+    parts = []
+    for l, p in active_irreps:
+        key = _normalize_irrep_key(l, p)
+        parts.append(blocks[key].reshape(*blocks[key].shape[:-2], int(channels) * (2 * int(l) + 1)))
+    return torch.cat(parts, dim=-1)
+
+
+def apply_channel_adapter_per_irrep_o3(x_lp: torch.Tensor, adapter: nn.Module) -> torch.Tensor:
+    """
+    Apply a channel adapter Linear/Identity to one O(3) irrep block.
+
+    x_lp: (..., Cin, 2l+1)
+    adapter: maps Cin -> Cout (or Identity)
+    returns: (..., Cout, 2l+1)
+    """
+    if isinstance(adapter, nn.Identity):
+        return x_lp
+    y = adapter(x_lp.movedim(-2, -1))
+    return y.movedim(-1, -2)
+
+
+class EquivariantChannelLinearO3(nn.Module):
+    """
+    Block-diagonal equivariant linear map for a flattened O(3) irreps layout.
+
+    Each (l, parity) block keeps its angular components untouched and only mixes
+    the channel dimension, so equivariance is preserved.
+    """
+
+    def __init__(self, channels: int, active_irreps: List[Tuple[int, int]], bias: bool = False):
+        super().__init__()
+        self.channels = int(channels)
+        self.active_irreps = [_normalize_irrep_key(l, p) for l, p in active_irreps]
+        self.adapters = nn.ModuleDict(
+            {
+                f"{l}{parity_sign_to_letter(p)}": nn.Linear(self.channels, self.channels, bias=bias)
+                for l, p in self.active_irreps
+            }
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = split_flat_irreps_o3(x, self.channels, self.active_irreps)
+        for key in self.active_irreps:
+            blocks[key] = apply_channel_adapter_per_irrep_o3(
+                blocks[key],
+                self.adapters[f"{key[0]}{parity_sign_to_letter(key[1])}"],
+            )
+        return merge_flat_irreps_o3(blocks, self.channels, self.active_irreps)
+
+
+class EquivariantChannelLinearO3Rect(nn.Module):
+    """
+    Block-diagonal equivariant linear map between two flattened O(3) irreps
+    layouts with the same active irreps but different channel counts.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        active_irreps: List[Tuple[int, int]],
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.active_irreps = [_normalize_irrep_key(l, p) for l, p in active_irreps]
+        self.adapters = nn.ModuleDict(
+            {
+                f"{l}{parity_sign_to_letter(p)}": nn.Linear(self.in_channels, self.out_channels, bias=bias)
+                for l, p in self.active_irreps
+            }
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = split_flat_irreps_o3(x, self.in_channels, self.active_irreps)
+        for key in self.active_irreps:
+            blocks[key] = apply_channel_adapter_per_irrep_o3(
+                blocks[key],
+                self.adapters[f"{key[0]}{parity_sign_to_letter(key[1])}"],
+            )
+        return merge_flat_irreps_o3(blocks, self.out_channels, self.active_irreps)
+
+
 def _segment_offsets_from_segments(segments: List[Tuple[int, ...]]) -> torch.Tensor:
     offsets = [int(seg[-2]) for seg in segments]
     offsets.append(int(segments[-1][-1]) if segments else 0)
@@ -1110,6 +1295,7 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         # Cache per-group projection matrices per (device,dtype) matching _groups:
         #   U_g: (m1*m2, K_total), where K_total = sum_{paths in group} (2*l3+1)
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+        self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
         # Sparse U per group when zero_frac >= _SPARSE_MIN_ZERO_FRAC: list of None or (d_idx, k_idx, vals)
         self._proj_sparse_cache_by_dev_dtype: Dict[Tuple[str, str], List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]] = {}
         # Packed same-kdim buckets for the custom CUDA backend.
@@ -1667,6 +1853,7 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
             )
 
         self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+        self._proj_group_view_cache_by_dev_dtype: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
 
     @_dynamo_disable
     def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
@@ -1740,7 +1927,6 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
             l1 = int(g["l1"])
             l2 = int(g["l2"])
             segments = g["segments"]
-            k_total = int(g["k_total"])
 
             a = x1.get(l1)
             b = x2.get(l2)
@@ -1757,7 +1943,6 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
                 a_comp.unsqueeze(-1) * b_comp.unsqueeze(-2)
             ).reshape(*batch_shape, self.channels, m1 * m2)
             y = torch.matmul(pair, U)
-
             for p_idx, l3, s, e in segments:
                 seg = y[..., int(s): int(e)]
                 seg = seg * w[int(p_idx)].view(*([1] * len(batch_shape)), self.channels, 1)
@@ -2295,6 +2480,87 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
                     out_l3 = out_l3 * gate[..., None, None]
                 out[(l3, p3)] = out[(l3, p3)] + out_l3
         return out
+
+
+class MultipleContractionO3(nn.Module):
+    """
+    Lightweight higher-order contraction block for the flattened O(3) irreps
+    layout used by parity-aware ICTD models.
+
+    This mirrors MultipleContractionSO3 but operates on (l, parity) blocks and
+    reuses the existing O(3) fully-connected ICTD tensor product.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        hidden_channels: int,
+        lmax: int,
+        active_irreps: List[Tuple[int, int]] | None = None,
+        correlation: int = 3,
+        ictd_tp_path_policy: str = "full",
+        ictd_tp_max_rank_other: int | None = None,
+        internal_compute_dtype: torch.dtype | None = None,
+        ictd_tp_backend: str = "pytorch",
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_channels = int(hidden_channels)
+        self.lmax = int(lmax)
+        self.active_irreps = (
+            [_normalize_irrep_key(l, p) for l, p in active_irreps]
+            if active_irreps is not None
+            else o3_irrep_keys(self.lmax)
+        )
+        self.correlation = int(correlation)
+        if self.correlation < 1:
+            raise ValueError(f"correlation must be >= 1, got {self.correlation}")
+
+        self.reduce = EquivariantChannelLinearO3Rect(
+            self.in_channels, self.hidden_channels, self.active_irreps, bias=False
+        )
+        self.order_mix = nn.ModuleList(
+            [
+                EquivariantChannelLinearO3(self.hidden_channels, self.active_irreps, bias=False)
+                for _ in range(self.correlation)
+            ]
+        )
+        self.tp_layers = nn.ModuleList(
+            [
+                HarmonicFullyConnectedTensorProductO3(
+                    mul_in1=self.hidden_channels,
+                    mul_in2=self.hidden_channels,
+                    mul_out=self.hidden_channels,
+                    lmax=self.lmax,
+                    active_irreps=self.active_irreps,
+                    internal_weights=True,
+                    path_policy=ictd_tp_path_policy,
+                    max_rank_other=ictd_tp_max_rank_other,
+                    internal_compute_dtype=internal_compute_dtype,
+                    ictd_tp_backend=ictd_tp_backend,
+                )
+                for _ in range(max(self.correlation - 1, 0))
+            ]
+        )
+        self.out_linear = EquivariantChannelLinearO3(
+            self.hidden_channels, self.active_irreps, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.reduce(x)
+        accum = self.order_mix[0](base)
+        if self.correlation == 1:
+            return self.out_linear(accum)
+
+        base_blocks = split_flat_irreps_o3(base, self.hidden_channels, self.active_irreps)
+        current_blocks = base_blocks
+        for order_idx, tp in enumerate(self.tp_layers, start=1):
+            current_blocks = tp(current_blocks, base_blocks)
+            current_flat = merge_flat_irreps_o3(current_blocks, self.hidden_channels, self.active_irreps)
+            current_flat = self.order_mix[order_idx](current_flat)
+            accum = accum + current_flat
+        return self.out_linear(accum)
 
 
 class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
