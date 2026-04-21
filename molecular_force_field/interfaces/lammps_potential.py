@@ -37,7 +37,7 @@ from typing import Dict, Tuple, Optional, Mapping, Any
 # Add parent directory to path to import molecular_force_field modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from molecular_force_field.models import E3_TransformerLayer_multi
+from molecular_force_field.active_learning.model_loader import build_e3trans_from_checkpoint
 from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.utils.graph_utils import radius_graph_pbc_gpu
 from molecular_force_field.utils.tensor_utils import map_tensor_values
@@ -114,54 +114,41 @@ class LAMMPSPotential:
         self.device = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
         self.max_radius = max_radius
         
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # Initialize config
+        # Load checkpoint and delegate model construction to the unified checkpoint
+        # loader so newer tensor-product modes stay consistent across interfaces.
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        tensor_product_mode = checkpoint.get("tensor_product_mode")
+        num_interaction = int(
+            checkpoint.get("num_interaction")
+            or checkpoint.get("model_hyperparameters", {}).get("num_interaction", 2)
+        )
+        self.model, loaded_config = build_e3trans_from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            device=self.device,
+            atomic_energy_file=atomic_energy_file,
+            tensor_product_mode=tensor_product_mode,
+            num_interaction=num_interaction,
+        )
+
+        # Keep backward compatibility for callers that pass an explicit config, but
+        # default to the resolved checkpoint config.
         if config is None:
-            # Try to infer dtype from checkpoint or use float64
-            dtype = checkpoint.get('dtype', torch.float64)
-            if isinstance(dtype, str):
-                dtype = torch.float64 if dtype in ['float64', 'double'] else torch.float32
-            
-            config = ModelConfig(dtype=dtype, embed_size=embed_size, output_size=output_size)
-        
-        # Load atomic energies
+            config = loaded_config
+
+        # Prefer the checkpoint cutoff for inference consistency.
+        self.max_radius = float(checkpoint.get("max_radius", max_radius))
+
+        # Runtime atomic-energy overrides affect only the wrapper energy offset.
         if atomic_energy_keys is not None and atomic_energy_values is not None:
             config.atomic_energy_keys = torch.tensor(atomic_energy_keys, dtype=torch.long)
             config.atomic_energy_values = torch.tensor(atomic_energy_values, dtype=config.dtype)
-        elif atomic_energy_file is not None:
+        elif atomic_energy_file is not None and (
+            config.atomic_energy_keys is None or config.atomic_energy_values is None
+        ):
             config.load_atomic_energies_from_file(atomic_energy_file)
-        else:
-            # Try default path
+        elif config.atomic_energy_keys is None or config.atomic_energy_values is None:
             config.load_atomic_energies_from_file('fitted_E0.csv')
-        
-        # Initialize model
-        self.model = E3_TransformerLayer_multi(
-            max_embed_radius=config.max_radius,
-            main_max_radius=config.max_radius_main,
-            main_number_of_basis=config.number_of_basis_main,
-            irreps_input=config.get_irreps_output_conv(),
-            irreps_query=config.get_irreps_query_main(),
-            irreps_key=config.get_irreps_key_main(),
-            irreps_value=config.get_irreps_value_main(),
-            irreps_output=config.get_irreps_output_conv_2(),
-            irreps_sh=config.get_irreps_sh_transformer(),
-            hidden_dim_sh=config.get_hidden_dim_sh(),
-            hidden_dim=config.emb_number_main_2,
-            channel_in2=config.channel_in2,
-            embedding_dim=config.embedding_dim,
-            max_atomvalue=config.max_atomvalue,
-            output_size=config.output_size,
-            embed_size=config.embed_size,
-            main_hidden_sizes3=config.main_hidden_sizes3,
-            num_layers=config.num_layers,
-            function_type_main=config.function_type,
-            device=self.device
-        ).to(self.device)
-        
-        # Load model weights
-        self.model.load_state_dict(checkpoint['e3trans_state_dict'])
+
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False

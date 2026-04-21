@@ -52,6 +52,51 @@ from molecular_force_field.utils.fidelity import parse_fidelity_loss_weights
 from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
 
+def _seed_worker(worker_id: int):
+    """Seed DataLoader workers deterministically from torch's worker seed."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
+def _configure_determinism(
+    seed: int,
+    *,
+    deterministic: bool,
+    strict_deterministic: bool,
+    allow_tf32_in_deterministic: bool,
+    matmul_precision: str,
+):
+    """Configure process-wide RNG and best-effort deterministic execution."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic:
+        # Required by cuBLAS for deterministic GEMM selection on CUDA.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = False
+        if deterministic:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32_in_deterministic
+            torch.backends.cudnn.allow_tf32 = allow_tf32_in_deterministic
+
+    effective_precision = "highest" if (deterministic and not allow_tf32_in_deterministic) else matmul_precision
+    torch.set_float32_matmul_precision(effective_precision)
+
+    if deterministic and strict_deterministic:
+        torch.use_deterministic_algorithms(True)
+
+    return effective_precision
+
+
 def check_and_preprocess_data(
     data_dir,
     train_prefix,
@@ -375,18 +420,32 @@ def main():
                         help='Number of epochs')
     parser.add_argument('--learning-rate', type=float, default=1e-3,
                         help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='adamw',
+                        choices=['adam', 'adamw'],
+                        help='Optimizer type (default: adamw)')
+    parser.add_argument('--optimizer-weight-decay', type=float, default=1e-6,
+                        help='Optimizer weight decay (default: 1e-6)')
+    parser.add_argument('--no-optimizer-amsgrad', dest='optimizer_amsgrad', action='store_false',
+                        help='Disable AMSGrad variant for Adam/AdamW.')
+    parser.set_defaults(optimizer_amsgrad=True)
     parser.add_argument('--min-learning-rate', type=float, default=2e-5,
                         help='Minimum learning rate (eta_min for cosine / hard floor for step, default: 2e-5)')
     parser.add_argument('--warmup-batches', type=int, default=1000,
                         help='Number of warmup batches for learning rate (default: 1000)')
     parser.add_argument('--lr-scheduler', type=str, default='step',
-                        choices=['cosine', 'step'],
+                        choices=['cosine', 'step', 'plateau'],
                         help='LR scheduler after warmup: "cosine" for CosineAnnealingLR, '
-                             '"step" for StepLR (default: cosine)')
+                             '"step" for StepLR, '
+                             '"plateau" for ReduceLROnPlateau (default: cosine)')
     parser.add_argument('--lr-decay-patience', type=int, default=1000,
                         help='Step size (in batches) for StepLR scheduler (default: 1000)')
     parser.add_argument('--lr-decay-factor', type=float, default=0.98,
                         help='Decay factor (gamma) for StepLR scheduler (default: 0.98)')
+    parser.add_argument('--lr-plateau-factor', type=float, default=0.8,
+                        help='Multiplicative LR drop factor for ReduceLROnPlateau (default: 0.8)')
+    parser.add_argument('--lr-plateau-patience', type=int, default=10,
+                        help='Validation-check patience for ReduceLROnPlateau. With dump-frequency every 5 epochs, '
+                             '10 checks ~= 50 epochs (default: 10)')
     parser.add_argument('--warmup-start-ratio', type=float, default=0.1,
                         help='Starting learning rate ratio during warmup (0.1 means start at 10%% of target LR, default: 0.1)')
     parser.add_argument('--checkpoint', type=str, default='combined_model.pth',
@@ -398,6 +457,11 @@ def main():
                              'Default: False (use checkpoint weights)')
     parser.add_argument('--num-workers', type=int, default=8,
                         help='Number of workers for data preprocessing')
+    parser.add_argument('--train-shuffle', dest='train_shuffle', action='store_true',
+                        help='Shuffle training samples in the DataLoader (default).')
+    parser.add_argument('--no-train-shuffle', dest='train_shuffle', action='store_false',
+                        help='Disable training-sample shuffling in the DataLoader.')
+    parser.set_defaults(train_shuffle=True)
     parser.add_argument('--mp-context', type=str, default='auto',
                         choices=['auto', 'fork', 'spawn'],
                         help='Multiprocessing start method for DataLoader workers. '
@@ -411,6 +475,16 @@ def main():
     parser.add_argument('--matmul-precision', type=str, default='high',
                         choices=['highest', 'high', 'medium'],
                         help='Float32 matmul precision. "high" (default) enables TF32 on Ampere+ GPUs for ~2x matmul speedup. Use "highest" for strict FP32.')
+    parser.add_argument('--deterministic', dest='deterministic', action=argparse.BooleanOptionalAction, default=False,
+                        help='Enable strict best-effort deterministic training behavior (default: False). '
+                             'This sets deterministic CUDA/cuDNN behavior, disables TF32, enables '
+                             'torch.use_deterministic_algorithms(True), and seeds DataLoader workers.')
+    parser.add_argument('--strict-deterministic', dest='strict_deterministic', action=argparse.BooleanOptionalAction, default=True,
+                        help='When --deterministic is enabled, also call torch.use_deterministic_algorithms(True). '
+                             'Disabling this keeps most reproducibility constraints while reducing overhead.')
+    parser.add_argument('--allow-tf32-in-deterministic', dest='allow_tf32_in_deterministic', action=argparse.BooleanOptionalAction, default=False,
+                        help='When --deterministic is enabled, allow TF32/high matmul paths for better speed. '
+                             'This weakens bitwise reproducibility but often preserves practical repeatability.')
     parser.add_argument('--dump-frequency', type=int, default=250,
                         help='Frequency (in batches) for validation and model saving (default: 250)')
     parser.add_argument('--train-eval-sample-ratio', type=float, default=0.0,
@@ -623,6 +697,14 @@ def main():
                         help='Distributed initialization method (default: env://)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility (default: 42)')
+    parser.add_argument('--skip-unused-mainnet', action=argparse.BooleanOptionalAction, default=True,
+                        help='Do not instantiate the legacy auxiliary MainNet module when it is unused by the '
+                             'training forward path. Enabled by default to keep RNG consumption and optimizer state '
+                             'aligned with external training loops such as taskbench. Use --no-skip-unused-mainnet '
+                             'only when explicitly testing the legacy behavior.')
+    parser.add_argument('--equivariant-post-linear', action=argparse.BooleanOptionalAction, default=False,
+                        help='Insert an equivariant channel-mixing linear layer after each ICTD convolution output '
+                             '(conv1 and subsequent interaction layers). Disabled by default for exact backward compatibility.')
     
     # Model architecture hyperparameters
     parser.add_argument('--max-atomvalue', type=int, default=None,
@@ -640,8 +722,11 @@ def main():
     parser.add_argument('--function-type', type=str, default=None,
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
+    parser.add_argument('--number-of-basis-main', type=int, default=None,
+                        help='Number of radial basis functions for the main message-passing stack. '
+                             'If not set, restore from checkpoint when available, else use 8.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-o3'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-o3'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
@@ -653,7 +738,8 @@ def main():
                              '"pure-cartesian-sparse-save" uses the same sparse pure-cartesian implementation under a dedicated save-mode name, '
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
                              '"pure-cartesian-ictd-o3" uses pure_cartesian_ictd_layers_full_o3 (strict parity-aware full O(3) ICTD). '
-                             '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, same readout, DDP supported). '
+                             '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD save readout, DDP supported). '
+                             '"pure-cartesian-ictd-save-multiple" uses pure_cartesian_ictd_layers with a multi-branch contraction block after concat(f1,f2). '
                              '"pure-cartesian-ictd-save-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware save O(3) ICTD). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--max-rank-other', type=int, default=None,
@@ -689,6 +775,29 @@ def main():
                         help='Used when --ictd-tp-path-policy=max_rank_other. '
                              'If not set, prefer checkpoint metadata when available. '
                              'Keeps only paths with min(l1,l2) <= this value (e.g. 1 keeps scalar/vector couplings).')
+    parser.add_argument('--ictd-save-tp-mode', type=str, default='fully-connected',
+                        choices=['fully-connected', 'channelwise'],
+                        help='Tensor-product parameterization inside pure-cartesian-ictd-save only. '
+                             '"fully-connected" is the current default; "channelwise" reverts to the older '
+                             'channelwise product style for conv1 and interaction layers.')
+    parser.add_argument('--contraction-order', dest='ictd_save_contraction_order', type=int, default=3,
+                        help='Contraction order for the multi-branch contraction block used by '
+                             '--tensor-product-mode pure-cartesian-ictd-save-multiple. Default: 3.')
+    parser.add_argument('--ictd-save-multiple-fusion-scheme',
+                        type=str,
+                        default='serial_lastmix',
+                        choices=['serial_lastmix'],
+                        help='Fusion scheme for pure-cartesian-ictd-save-multiple. '
+                             '"serial_lastmix": contraction(last layer), replace the last branch with it, then '
+                             'run the mixed contraction. This is the only retained fusion path.')
+    parser.add_argument('--ictd-save-final-readout-mode',
+                        type=str,
+                        default='direct-1',
+                        choices=['direct-1'],
+                        help='Final energy readout mode for pure-cartesian-ictd-save and '
+                             'pure-cartesian-ictd-save-multiple. '
+                             '"direct-1": MLP directly outputs a 1D atomic energy. '
+                             'This is the only retained final readout mode.')
     parser.add_argument('--long-range-mode', type=str, default=None,
                         choices=['none', 'latent-coulomb', 'isolated-far-field-v1', 'isolated-far-field-v2', 'reciprocal-spectral-v1'],
                         help='Optional long-range head. '
@@ -1281,17 +1390,14 @@ def main():
             logging.info("  Using EMA model for validation")
             logging.info("  Will save EMA model in checkpoint")
     
-    # --- Random seed ---
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-    
-    if torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        # TF32: faster float32 matmul on Ampere+ (removes inductor warning, ~2x matmul speed)
-        torch.set_float32_matmul_precision(args.matmul_precision)
+    # --- Random seed / deterministic execution ---
+    effective_matmul_precision = _configure_determinism(
+        args.seed,
+        deterministic=args.deterministic,
+        strict_deterministic=args.strict_deterministic,
+        allow_tf32_in_deterministic=args.allow_tf32_in_deterministic,
+        matmul_precision=args.matmul_precision,
+    )
     
     # --- Distributed training (DDP) ---
     if args.distributed:
@@ -1376,6 +1482,13 @@ def main():
         
         logging.info(f"Using device: {device}")
         logging.info(f"Data directory: {args.data_dir}")
+        logging.info(f"Deterministic mode: {args.deterministic}")
+        logging.info(f"Strict deterministic algorithms: {args.strict_deterministic}")
+        logging.info(f"Allow TF32 in deterministic mode: {args.allow_tf32_in_deterministic}")
+        logging.info(f"Float32 matmul precision: {effective_matmul_precision}")
+        if args.deterministic:
+            logging.info(f"CUBLAS_WORKSPACE_CONFIG={os.environ.get('CUBLAS_WORKSPACE_CONFIG')}")
+            logging.info("TF32 disabled for reproducibility" if not args.allow_tf32_in_deterministic else "TF32 enabled inside deterministic mode")
     
     # --- Data: resolve source (custom H5 paths vs data_dir + prefix) and preprocess if needed ---
     use_custom_data_paths = (args.train_data is not None and args.valid_data is not None)
@@ -1495,23 +1608,29 @@ def main():
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
-            drop_last=False
+            drop_last=False,
+            seed=args.seed,
         )
         val_sampler = DistributedSampler(
             val_dataset,
             num_replicas=world_size,
             rank=rank,
             shuffle=False,
-            drop_last=False
+            drop_last=False,
+            seed=args.seed,
         )
         shuffle = False
     else:
         train_sampler = None
         val_sampler = None
-        shuffle = True
+        shuffle = bool(args.train_shuffle)
     
-    train_num_workers = max(1, args.num_workers // 2)
-    val_num_workers = max(1, args.num_workers // 4)
+    if args.num_workers <= 0:
+        train_num_workers = 0
+        val_num_workers = 0
+    else:
+        train_num_workers = max(1, args.num_workers // 2)
+        val_num_workers = max(1, args.num_workers // 4)
     if args.mp_context == "spawn":
         mp_ctx = "spawn"
     elif args.mp_context == "fork":
@@ -1529,6 +1648,8 @@ def main():
         num_workers=train_num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
         multiprocessing_context=mp_ctx,
+        worker_init_fn=_seed_worker if train_num_workers > 0 else None,
+        generator=torch.Generator().manual_seed(args.seed),
     )
     
     val_loader = DataLoader(
@@ -1540,6 +1661,8 @@ def main():
         num_workers=val_num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
         multiprocessing_context=mp_ctx,
+        worker_init_fn=_seed_worker if val_num_workers > 0 else None,
+        generator=torch.Generator().manual_seed(args.seed + 1),
     )
     
     # --- Model config ---
@@ -1553,6 +1676,7 @@ def main():
         lmax=args.lmax,
         irreps_output_conv_channels=args.irreps_output_conv_channels,
         function_type=args.function_type,
+        number_of_basis_main=args.number_of_basis_main if args.number_of_basis_main is not None else 8,
         max_radius=args.max_radius
     )
     checkpoint_atomic_energies = get_checkpoint_atomic_energies(checkpoint_arch, dtype=config.dtype)
@@ -1641,11 +1765,17 @@ def main():
     common_invariant_kwargs = dict(invariant_channels=args.invariant_channels)
     
     # Initialize models
-    model = MainNet(
-        input_size=config.input_dim_weight,
-        hidden_sizes=config.main_hidden_sizes4,
-        output_size=1
-    ).to(device)
+    if args.skip_unused_mainnet:
+        model = torch.nn.Identity().to(device)
+        if rank == 0:
+            logging.info("Skipping auxiliary MainNet instantiation (--skip-unused-mainnet); "
+                         "optimizer will track only e3trans parameters.")
+    else:
+        model = MainNet(
+            input_size=config.input_dim_weight,
+            hidden_sizes=config.main_hidden_sizes4,
+            output_size=1
+        ).to(device)
     
     # Initialize model based on tensor product mode
     if args.tensor_product_mode == 'pure-cartesian':
@@ -1812,6 +1942,7 @@ def main():
             feature_spectral_neutralize=args.feature_spectral_neutralize,
             feature_spectral_include_k0=args.feature_spectral_include_k0,
             feature_spectral_gate_init=args.feature_spectral_gate_init,
+            equivariant_post_linear=args.equivariant_post_linear,
         ).to(device)
     elif args.tensor_product_mode in {'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save-o3'}:
         o3_model_cls = (
@@ -1922,10 +2053,19 @@ def main():
             feature_spectral_neutralize=args.feature_spectral_neutralize,
             feature_spectral_include_k0=args.feature_spectral_include_k0,
             feature_spectral_gate_init=args.feature_spectral_gate_init,
+            equivariant_post_linear=args.equivariant_post_linear,
         ).to(device)
-    elif args.tensor_product_mode == 'pure-cartesian-ictd-save':
+    elif args.tensor_product_mode in {'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-multiple'}:
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
         logging.info(f"  ictd_tp_path_policy={args.ictd_tp_path_policy}, ictd_tp_max_rank_other={args.ictd_tp_max_rank_other}")
+        logging.info(f"  ictd_save_tp_mode={args.ictd_save_tp_mode}")
+        logging.info(f"  final_readout_mode={args.ictd_save_final_readout_mode}")
+        if args.tensor_product_mode == 'pure-cartesian-ictd-save-multiple':
+            logging.info(
+                "  save_readout_mode=mace-contraction, "
+                f"order={args.ictd_save_contraction_order}, "
+                f"fusion_scheme={args.ictd_save_multiple_fusion_scheme}"
+            )
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -1943,6 +2083,11 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            ictd_save_tp_mode=args.ictd_save_tp_mode,
+            save_readout_mode='mace-contraction' if args.tensor_product_mode == 'pure-cartesian-ictd-save-multiple' else 'elementwise-scalar',
+            save_contraction_order=args.ictd_save_contraction_order,
+            save_multiple_fusion_scheme=args.ictd_save_multiple_fusion_scheme,
+            save_final_readout_mode=args.ictd_save_final_readout_mode,
             ictd_tp_path_policy=args.ictd_tp_path_policy,
             ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
             internal_compute_dtype=config.internal_compute_dtype,
@@ -2209,6 +2354,11 @@ def main():
         patience_opim=args.lr_decay_patience,
         gamma_value=args.lr_decay_factor,
         lr_scheduler_type=args.lr_scheduler,
+        plateau_factor=args.lr_plateau_factor,
+        plateau_patience=args.lr_plateau_patience,
+        optimizer_type=args.optimizer,
+        optimizer_weight_decay=args.optimizer_weight_decay,
+        optimizer_amsgrad=args.optimizer_amsgrad,
         epoch_numbers=args.epochs,
         checkpoint_path=args.checkpoint,
         use_checkpoint_loss_weights=not args.reset_loss_weights,

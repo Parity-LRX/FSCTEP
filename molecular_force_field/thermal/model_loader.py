@@ -28,6 +28,9 @@ from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
+    infer_ictd_save_final_readout_mode_from_state_dict,
+    infer_ictd_save_multiple_fusion_scheme_from_state_dict,
+    infer_ictd_save_multiple_order_from_state_dict,
 )
 
 
@@ -49,6 +52,9 @@ class ModelLoadOptions:
     irreps_output_conv_channels: Optional[int] = None
     function_type: Optional[str] = None
     num_interaction: Optional[int] = None
+    contraction_order: Optional[int] = None
+    save_multiple_fusion_scheme: Optional[str] = None
+    save_final_readout_mode: Optional[str] = None
 
 
 def _infer_physical_tensor_outputs_from_state_dict(sd: dict) -> dict | None:
@@ -115,11 +121,24 @@ def _build_model(
     long_range_slab_padding_factor: int,
     long_range_include_k0: bool,
     long_range_source_channels: int,
+    long_range_backend: str,
     long_range_reciprocal_backend: str,
     long_range_energy_partition: str,
     long_range_green_mode: str,
     long_range_assignment: str,
     long_range_mesh_fft_full_ewald: bool,
+    long_range_theta: float,
+    long_range_leaf_size: int,
+    long_range_multipole_order: int,
+    long_range_far_source_dim: int,
+    long_range_far_num_shells: int,
+    long_range_far_shell_growth: float,
+    long_range_far_tail: bool,
+    long_range_far_tail_bins: int,
+    long_range_far_stats: str,
+    long_range_far_max_radius_multiplier: float,
+    long_range_far_source_norm: bool,
+    long_range_far_gate_init: float,
     feature_spectral_mode: str,
     feature_spectral_bottleneck_dim: int,
     feature_spectral_mesh_size: int,
@@ -131,6 +150,9 @@ def _build_model(
     feature_spectral_assignment: str,
     feature_spectral_gate_init: float,
     invariant_channels: int,
+    save_contraction_order: int = 3,
+    save_multiple_fusion_scheme: str = "serial_lastmix",
+    save_final_readout_mode: str = "direct-1",
 ):
     if tensor_product_mode == "pure-cartesian":
         model = PureCartesianTransformerLayer(
@@ -211,7 +233,7 @@ def _build_model(
             feature_spectral_assignment=feature_spectral_assignment,
             feature_spectral_gate_init=feature_spectral_gate_init,
         )
-    elif tensor_product_mode == "pure-cartesian-ictd-save":
+    elif tensor_product_mode in {"pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple"}:
         model = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -230,6 +252,10 @@ def _build_model(
             invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            save_readout_mode="mace-contraction" if tensor_product_mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
+            save_contraction_order=save_contraction_order,
+            save_multiple_fusion_scheme=save_multiple_fusion_scheme,
+            save_final_readout_mode=save_final_readout_mode,
             internal_compute_dtype=config.internal_compute_dtype,
             device=device,
         )
@@ -435,6 +461,7 @@ def load_model_and_calculator(options: ModelLoadOptions):
     checkpoint = torch.load(options.checkpoint, map_location=device, weights_only=False)
     state_dict_ckpt = checkpoint.get("e3trans_state_dict", {})
     arch_meta = checkpoint.get("model_hyperparameters", {})
+    tensor_product_mode = str(options.tensor_product_mode or checkpoint.get("tensor_product_mode", "spherical"))
 
     dtype = (
         _resolve_dtype(options.dtype)
@@ -536,13 +563,38 @@ def load_model_and_calculator(options: ModelLoadOptions):
     feature_spectral_assignment = str(_get_resolved_option(None, arch_meta, "feature_spectral_assignment", "cic"))
     feature_spectral_gate_init = float(_get_resolved_option(None, arch_meta, "feature_spectral_gate_init", 0.0))
 
-    tensor_product_mode = options.tensor_product_mode or checkpoint.get("tensor_product_mode", "spherical")
     if checkpoint.get("tensor_product_mode") and options.tensor_product_mode and options.tensor_product_mode != checkpoint.get("tensor_product_mode"):
         logging.info(
             "Using user-specified tensor_product_mode=%s instead of checkpoint mode=%s",
             options.tensor_product_mode,
             checkpoint.get("tensor_product_mode"),
         )
+
+    save_contraction_order = int(
+        options.contraction_order
+        if options.contraction_order is not None
+        else checkpoint.get("ictd_save_contraction_order")
+        or arch_meta.get("ictd_save_contraction_order")
+        or arch_meta.get("save_contraction_order")
+        or infer_ictd_save_multiple_order_from_state_dict(state_dict_ckpt)
+        or 3
+    )
+    save_multiple_fusion_scheme = str(
+        options.save_multiple_fusion_scheme
+        or checkpoint.get("ictd_save_multiple_fusion_scheme")
+        or arch_meta.get("ictd_save_multiple_fusion_scheme")
+        or arch_meta.get("save_multiple_fusion_scheme")
+        or infer_ictd_save_multiple_fusion_scheme_from_state_dict(state_dict_ckpt)
+        or "serial_lastmix"
+    )
+    save_final_readout_mode = str(
+        options.save_final_readout_mode
+        or checkpoint.get("ictd_save_final_readout_mode")
+        or arch_meta.get("ictd_save_final_readout_mode")
+        or arch_meta.get("save_final_readout_mode")
+        or infer_ictd_save_final_readout_mode_from_state_dict(state_dict_ckpt)
+        or "direct-1"
+    )
 
     model = _build_model(
         tensor_product_mode=tensor_product_mode,
@@ -590,7 +642,13 @@ def load_model_and_calculator(options: ModelLoadOptions):
         feature_spectral_assignment=feature_spectral_assignment,
         feature_spectral_gate_init=feature_spectral_gate_init,
         invariant_channels=int(_get_resolved_option(None, arch_meta, "invariant_channels", 32)),
+        save_contraction_order=save_contraction_order,
+        save_multiple_fusion_scheme=save_multiple_fusion_scheme,
+        save_final_readout_mode=save_final_readout_mode,
     )
+    if tensor_product_mode == "pure-cartesian-ictd-save-multiple":
+        model_keys = set(model.state_dict().keys())
+        state_dict_ckpt = {k: v for k, v in state_dict_ckpt.items() if k in model_keys}
 
     if tensor_product_mode == "spherical-save-cue":
         load_result = model.load_state_dict(state_dict_ckpt, strict=False)

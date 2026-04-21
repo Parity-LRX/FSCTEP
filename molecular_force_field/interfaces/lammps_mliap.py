@@ -75,6 +75,9 @@ from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
     get_checkpoint_e3_state_dict,
     infer_external_tensor_rank_from_state_dict,
+    infer_ictd_save_final_readout_mode_from_state_dict,
+    infer_ictd_save_multiple_fusion_scheme_from_state_dict,
+    infer_ictd_save_multiple_order_from_state_dict,
     infer_physical_tensor_outputs_from_state_dict,
 )
 from molecular_force_field.utils.external_tensor_specs import normalize_external_tensor_specs
@@ -936,6 +939,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         - "pure-cartesian-sparse-save": PureCartesianSparseTransformerLayerSave
         - "pure-cartesian-ictd": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers_full)
         - "pure-cartesian-ictd-save": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers)
+        - "pure-cartesian-ictd-save-multiple": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers, multi-branch contraction)
         - "pure-cartesian-ictd-save-o3": PureCartesianICTDSaveO3TransformerLayer (pure_cartesian_ictd_layers_o3)
         """
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -951,7 +955,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         else:
             dtype = dtype_raw
 
-        mode = tensor_product_mode or ckpt.get("tensor_product_mode", "spherical")
+        mode = str(tensor_product_mode or ckpt.get("tensor_product_mode", "spherical"))
         # Use max_radius from checkpoint if saved; otherwise use CLI override; finally fall back to 5.0.
         radius = float(ckpt.get("max_radius", max_radius if max_radius is not None else 5.0))
         if "max_radius" in ckpt:
@@ -1057,6 +1061,27 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         feature_spectral_include_k0 = bool(arch_meta.get("feature_spectral_include_k0", False))
         feature_spectral_assignment = str(arch_meta.get("feature_spectral_assignment", "cic"))
         feature_spectral_gate_init = float(arch_meta.get("feature_spectral_gate_init", 0.0))
+        save_contraction_order = int(
+            ckpt.get("ictd_save_contraction_order")
+            or arch_meta.get("ictd_save_contraction_order")
+            or arch_meta.get("save_contraction_order")
+            or infer_ictd_save_multiple_order_from_state_dict(selected_state_dict)
+            or 3
+        )
+        save_multiple_fusion_scheme = str(
+            ckpt.get("ictd_save_multiple_fusion_scheme")
+            or arch_meta.get("ictd_save_multiple_fusion_scheme")
+            or arch_meta.get("save_multiple_fusion_scheme")
+            or infer_ictd_save_multiple_fusion_scheme_from_state_dict(selected_state_dict)
+            or "serial_lastmix"
+        )
+        save_final_readout_mode = str(
+            ckpt.get("ictd_save_final_readout_mode")
+            or arch_meta.get("ictd_save_final_readout_mode")
+            or arch_meta.get("save_final_readout_mode")
+            or infer_ictd_save_final_readout_mode_from_state_dict(selected_state_dict)
+            or "direct-1"
+        )
 
         if mode == "pure-cartesian-ictd":
             model = PureCartesianICTDTransformerLayer(
@@ -1195,7 +1220,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
-        elif mode == "pure-cartesian-ictd-save":
+        elif mode in {"pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple"}:
             ictd_tp_path_policy = ictd_tp_path_policy or ckpt.get("ictd_tp_path_policy") or arch_meta.get("ictd_tp_path_policy", "full")
             ictd_tp_max_rank_other = (
                 ictd_tp_max_rank_other
@@ -1222,7 +1247,11 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 lmax=config.lmax,
                 ictd_tp_path_policy=ictd_tp_path_policy,
                 ictd_tp_max_rank_other=ictd_tp_max_rank_other,
-            internal_compute_dtype=config.internal_compute_dtype,
+                save_readout_mode="mace-contraction" if mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
+                save_contraction_order=save_contraction_order,
+                save_multiple_fusion_scheme=save_multiple_fusion_scheme,
+                save_final_readout_mode=save_final_readout_mode,
+                internal_compute_dtype=config.internal_compute_dtype,
                 device=torch.device(device),
                 long_range_mode=long_range_mode,
                 long_range_hidden_dim=long_range_hidden_dim,
@@ -1531,6 +1560,10 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 feature_spectral_assignment=feature_spectral_assignment,
                 feature_spectral_gate_init=feature_spectral_gate_init,
             ).to(device)
+        if mode == "pure-cartesian-ictd-save-multiple":
+            model_keys = set(model.state_dict().keys())
+            selected_state_dict = {k: v for k, v in selected_state_dict.items() if k in model_keys}
+
         if mode == "spherical-save-cue":
             load_result = model.load_state_dict(selected_state_dict, strict=False)
             if load_result.unexpected_keys or load_result.missing_keys:
@@ -1563,7 +1596,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         # Optional TorchScript tracing
         use_ts = bool(torchscript) or (os.environ.get("MLIAP_USE_TORCHSCRIPT", "").lower() in ("1", "true", "yes"))
         if use_ts:
-            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-o3", "spherical-save-cue")
+            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple", "pure-cartesian-ictd-save-o3", "spherical-save-cue")
             if mode not in _ts_supported:
                 raise ValueError(f"TorchScript export is only supported for {_ts_supported}, got {mode!r}")
             model = _maybe_torchscript_trace_model(

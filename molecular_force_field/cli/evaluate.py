@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import numpy as np
+import h5py
 from torch.utils.data import DataLoader
 
 from molecular_force_field.models import (
@@ -28,13 +29,16 @@ from molecular_force_field.models.e3nn_layers_channelwise import (
 )
 from molecular_force_field.data import OnTheFlyDataset, H5Dataset
 from molecular_force_field.data.collate import on_the_fly_collate, collate_fn_h5
-from molecular_force_field.data.preprocessing import extract_data_blocks, compute_correction, save_set
+from molecular_force_field.data.preprocessing import extract_data_blocks, compute_correction, save_set, save_to_h5_parallel
 from molecular_force_field.evaluation.evaluator import Evaluator
 from molecular_force_field.evaluation.calculator import MyE3NNCalculator, DDPCalculator
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
     get_checkpoint_e3_state_dict,
     get_checkpoint_atomic_energies,
+    infer_ictd_save_final_readout_mode_from_state_dict,
+    infer_ictd_save_multiple_fusion_scheme_from_state_dict,
+    infer_ictd_save_multiple_order_from_state_dict,
     maybe_load_checkpoint,
     resolve_model_architecture,
 )
@@ -48,6 +52,15 @@ from molecular_force_field.models.zbl import maybe_wrap_model_with_zbl
 
 def main():
     """Main evaluation function."""
+    def _read_h5_uses_variable_length_samples(path: str | None) -> bool:
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with h5py.File(path, "r") as f:
+                return any(str(k).startswith("sample_") for k in f.keys())
+        except Exception:
+            return False
+
     parser = argparse.ArgumentParser(
         description='Evaluate molecular force field model. Model-structure hyperparameters default to '
                     'checkpoint metadata and explicit CLI values override.'
@@ -215,7 +228,7 @@ def main():
                         choices=['gaussian', 'bessel', 'fourier', 'cosine', 'smooth_finite'],
                         help='Basis function type for radial basis. If not set, restore from checkpoint when available, else use gaussian.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-o3'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-o3'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params). '
@@ -227,7 +240,8 @@ def main():
                              '"pure-cartesian-sparse-save" uses the same sparse pure-cartesian implementation under a dedicated save-mode name, '
                              '"pure-cartesian-ictd" uses pure_cartesian_ictd_layers_full (ICTD, DDP supported). '
                              '"pure-cartesian-ictd-o3" uses pure_cartesian_ictd_layers_full_o3 (strict parity-aware full O(3) ICTD). '
-                             '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD, DDP supported). '
+                             '"pure-cartesian-ictd-save" uses pure_cartesian_ictd_layers (original ICTD save readout, DDP supported). '
+                             '"pure-cartesian-ictd-save-multiple" uses pure_cartesian_ictd_layers with the retained multi-branch contraction path. '
                              '"pure-cartesian-ictd-save-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware save O(3) ICTD). '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--max-rank-other', type=int, default=None,
@@ -260,6 +274,17 @@ def main():
     parser.add_argument('--ictd-tp-max-rank-other', type=int, default=None,
                         help='Used when --ictd-tp-path-policy=max_rank_other. '
                              'If not set, prefer checkpoint metadata when available.')
+    parser.add_argument('--contraction-order', dest='ictd_save_contraction_order', type=int, default=None,
+                        help='Contraction order for --tensor-product-mode pure-cartesian-ictd-save-multiple. '
+                             'If not set, restore from checkpoint metadata when available, else use 3.')
+    parser.add_argument('--ictd-save-multiple-fusion-scheme', type=str, default=None,
+                        choices=['serial_lastmix'],
+                        help='Fusion scheme for pure-cartesian-ictd-save-multiple. '
+                             'If not set, restore from checkpoint metadata when available, else use serial_lastmix.')
+    parser.add_argument('--ictd-save-final-readout-mode', type=str, default=None,
+                        choices=['direct-1'],
+                        help='Final energy readout mode for pure-cartesian-ictd-save and pure-cartesian-ictd-save-multiple. '
+                             'If not set, restore from checkpoint metadata when available, else use direct-1.')
     parser.add_argument('--long-range-mode', type=str, default=None,
                         choices=['none', 'latent-coulomb', 'isolated-far-field-v1', 'isolated-far-field-v2', 'reciprocal-spectral-v1'],
                         help='Optional long-range head. '
@@ -470,6 +495,9 @@ def main():
             "k_policy": args.k_policy,
             "ictd_tp_path_policy": args.ictd_tp_path_policy,
             "ictd_tp_max_rank_other": args.ictd_tp_max_rank_other,
+            "save_contraction_order": args.ictd_save_contraction_order,
+            "save_multiple_fusion_scheme": args.ictd_save_multiple_fusion_scheme,
+            "save_final_readout_mode": args.ictd_save_final_readout_mode,
             "long_range_mode": args.long_range_mode,
             "long_range_hidden_dim": args.long_range_hidden_dim,
             "long_range_boundary": args.long_range_boundary,
@@ -533,6 +561,28 @@ def main():
     args.k_policy = resolved_arch["k_policy"]
     args.ictd_tp_path_policy = resolved_arch["ictd_tp_path_policy"]
     args.ictd_tp_max_rank_other = resolved_arch["ictd_tp_max_rank_other"]
+    args.ictd_save_contraction_order = (
+        args.ictd_save_contraction_order
+        if args.ictd_save_contraction_order is not None
+        else checkpoint.get("ictd_save_contraction_order")
+        or checkpoint.get("model_hyperparameters", {}).get("ictd_save_contraction_order")
+        or checkpoint.get("model_hyperparameters", {}).get("save_contraction_order")
+        or resolved_arch["save_contraction_order"]
+    )
+    args.ictd_save_multiple_fusion_scheme = (
+        args.ictd_save_multiple_fusion_scheme
+        or checkpoint.get("ictd_save_multiple_fusion_scheme")
+        or checkpoint.get("model_hyperparameters", {}).get("ictd_save_multiple_fusion_scheme")
+        or checkpoint.get("model_hyperparameters", {}).get("save_multiple_fusion_scheme")
+        or resolved_arch["save_multiple_fusion_scheme"]
+    )
+    args.ictd_save_final_readout_mode = (
+        args.ictd_save_final_readout_mode
+        or checkpoint.get("ictd_save_final_readout_mode")
+        or checkpoint.get("model_hyperparameters", {}).get("ictd_save_final_readout_mode")
+        or checkpoint.get("model_hyperparameters", {}).get("save_final_readout_mode")
+        or resolved_arch["save_final_readout_mode"]
+    )
     args.long_range_mode = resolved_arch["long_range_mode"]
     args.long_range_hidden_dim = resolved_arch["long_range_hidden_dim"]
     args.long_range_boundary = resolved_arch["long_range_boundary"]
@@ -728,6 +778,37 @@ def main():
     if checkpoint is None:
         checkpoint = torch.load(args.checkpoint, map_location=device)
     state_dict_ckpt, checkpoint_weight_source = get_checkpoint_e3_state_dict(checkpoint)
+    arch_meta = checkpoint.get("model_hyperparameters", {})
+    has_saved_order = any(
+        checkpoint.get(key) is not None or arch_meta.get(key) is not None
+        for key in ("ictd_save_contraction_order", "save_contraction_order")
+    )
+    has_saved_fusion = any(
+        checkpoint.get(key) is not None or arch_meta.get(key) is not None
+        for key in ("ictd_save_multiple_fusion_scheme", "save_multiple_fusion_scheme")
+    )
+    has_saved_final = any(
+        checkpoint.get(key) is not None or arch_meta.get(key) is not None
+        for key in ("ictd_save_final_readout_mode", "save_final_readout_mode")
+    )
+    if not has_saved_order:
+        args.ictd_save_contraction_order = int(
+            infer_ictd_save_multiple_order_from_state_dict(state_dict_ckpt)
+            or args.ictd_save_contraction_order
+            or 3
+        )
+    if not has_saved_fusion:
+        args.ictd_save_multiple_fusion_scheme = str(
+            infer_ictd_save_multiple_fusion_scheme_from_state_dict(state_dict_ckpt)
+            or args.ictd_save_multiple_fusion_scheme
+            or "serial_lastmix"
+        )
+    if not has_saved_final:
+        args.ictd_save_final_readout_mode = str(
+            infer_ictd_save_final_readout_mode_from_state_dict(state_dict_ckpt)
+            or args.ictd_save_final_readout_mode
+            or "direct-1"
+        )
     if checkpoint_weight_source == "ema":
         logging.info("Using EMA weights stored in checkpoint for evaluation.")
     physical_tensor_outputs_ckpt = resolved_arch["physical_tensor_outputs"]
@@ -814,6 +895,14 @@ def main():
         function_type=args.function_type,
         max_radius=args.max_radius
     )
+    arch_meta = checkpoint.get("model_hyperparameters", {})
+    config.number_of_basis_main = int(
+        checkpoint.get("number_of_basis_main")
+        or arch_meta.get("number_of_basis_main")
+        or config.number_of_basis_main
+    )
+    config.max_radius_main = args.max_radius
+    config.function_type_main = args.function_type
     checkpoint_atomic_energies = get_checkpoint_atomic_energies(checkpoint, dtype=config.dtype)
     
     # Atomic reference energies (E0)
@@ -1063,8 +1152,17 @@ def main():
             **common_invariant_kwargs,
             **common_long_range_kwargs,
         ).to(device)
-    elif tensor_product_mode == 'pure-cartesian-ictd-save':
+    elif tensor_product_mode in {'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-multiple'}:
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
+        if tensor_product_mode == 'pure-cartesian-ictd-save-multiple':
+            logging.info(
+                "  save_readout_mode=mace-contraction, order=%d, fusion_scheme=%s, final_readout_mode=%s",
+                args.ictd_save_contraction_order,
+                args.ictd_save_multiple_fusion_scheme,
+                args.ictd_save_final_readout_mode,
+            )
+        else:
+            logging.info("  final_readout_mode=%s", args.ictd_save_final_readout_mode)
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
@@ -1082,6 +1180,10 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
+            save_readout_mode='mace-contraction' if tensor_product_mode == 'pure-cartesian-ictd-save-multiple' else 'elementwise-scalar',
+            save_contraction_order=args.ictd_save_contraction_order,
+            save_multiple_fusion_scheme=args.ictd_save_multiple_fusion_scheme,
+            save_final_readout_mode=args.ictd_save_final_readout_mode,
             internal_compute_dtype=config.internal_compute_dtype,
             device=device,
             **common_invariant_kwargs,
@@ -1418,9 +1520,22 @@ def main():
             extra_label_paths["fidelity_id"] = args.fidelity_id_file
         extra_label_paths = extra_label_paths if extra_label_paths else None
 
-        if args.use_h5:
+        auto_use_h5 = False
+        processed_file_path = os.path.join(args.data_dir, f'processed_{args.test_prefix}.h5')
+        if not args.use_h5:
+            read_file_for_probe = args.read_file or os.path.join(args.data_dir, f'read_{args.test_prefix}.h5')
+            if _read_h5_uses_variable_length_samples(read_file_for_probe):
+                logging.info(
+                    "Detected variable-length read_%s.h5; generating processed_%s.h5 and switching to H5Dataset.",
+                    args.test_prefix,
+                    args.test_prefix,
+                )
+                save_to_h5_parallel(args.test_prefix, args.max_radius, num_workers=0, data_dir=args.data_dir)
+                auto_use_h5 = True
+
+        if args.use_h5 or auto_use_h5:
             dataset = H5Dataset(
-                args.test_prefix, data_dir=args.data_dir,
+                args.test_prefix, data_dir=args.data_dir, file_path=processed_file_path,
                 extra_label_paths=extra_label_paths,
                 extra_per_node_label_path=args.extra_per_node_file,
             )

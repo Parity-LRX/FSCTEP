@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from molecular_force_field.utils.scatter import scatter
-from torch.optim.lr_scheduler import SequentialLR, LambdaLR, StepLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import SequentialLR, LambdaLR, StepLR, CosineAnnealingLR, ReduceLROnPlateau
 import copy
 
 from molecular_force_field.models import E3_TransformerLayer_multi, MainNet
@@ -94,6 +94,11 @@ class Trainer:
         patience_opim=1000,
         gamma_value=0.98,
         lr_scheduler_type='step',
+        plateau_factor=0.8,
+        plateau_patience=10,
+        optimizer_type="adamw",
+        optimizer_weight_decay=1e-6,
+        optimizer_amsgrad=True,
         max_vhat_growth_factor=5,
         max_norm_value=0.5,
         gradient_log_interval=100,
@@ -269,6 +274,9 @@ class Trainer:
         self.warmup_batches = warmup_batches
         self.patience_opim = patience_opim
         self.gamma_value = gamma_value
+        self.lr_scheduler_type = lr_scheduler_type
+        self.plateau_factor = float(plateau_factor)
+        self.plateau_patience = int(plateau_patience)
         self.max_vhat_growth_factor = max_vhat_growth_factor
         self.max_norm_value = max_norm_value
         self.gradient_log_interval = gradient_log_interval
@@ -356,46 +364,81 @@ class Trainer:
         self.criterion = nn.SmoothL1Loss(beta=0.5)
         self.criterion_2 = RMSELoss()
 
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            list(e3trans.parameters()) + list(model.parameters()),
-            lr=learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=1e-6,
-            amsgrad=True
-        )
+        optimizer_type = str(optimizer_type).lower()
+        optimizer_params = list(e3trans.parameters()) + list(model.parameters())
+        if optimizer_type == "adam":
+            self.optimizer = torch.optim.Adam(
+                optimizer_params,
+                lr=learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=optimizer_weight_decay,
+                amsgrad=bool(optimizer_amsgrad),
+            )
+        elif optimizer_type == "adamw":
+            self.optimizer = torch.optim.AdamW(
+                optimizer_params,
+                lr=learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=optimizer_weight_decay,
+                amsgrad=bool(optimizer_amsgrad),
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer_type={optimizer_type!r}; expected 'adam' or 'adamw'")
 
         # Learning rate scheduler: warmup + decay
-        milestones = [warmup_batches]
-
         def warmup_lambda(current_step):
+            if warmup_batches <= 0:
+                return 1.0
             progress = min(current_step / warmup_batches, 1.0)
             initial_ratio = initial_learning_rate_for_weight
             return initial_ratio + (1 - initial_ratio) * progress
 
         warmup_scheduler = LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
+        self.warmup_batches = int(warmup_batches)
 
         if lr_scheduler_type == 'cosine':
             total_steps = epoch_numbers * len(train_loader)
-            cosine_steps = max(1, total_steps - warmup_batches)
+            cosine_steps = max(1, total_steps - max(0, warmup_batches))
             decay_scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=cosine_steps,
                 eta_min=min_learning_rate
             )
-        else:
+            if self.warmup_batches > 0:
+                self.scheduler = SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, decay_scheduler],
+                    milestones=[warmup_batches]
+                )
+            else:
+                self.scheduler = decay_scheduler
+        elif lr_scheduler_type == 'step':
             decay_scheduler = StepLR(
                 self.optimizer,
                 step_size=patience_opim,
                 gamma=gamma_value
             )
-
-        self.scheduler = SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_scheduler, decay_scheduler],
-            milestones=milestones
-        )
+            if self.warmup_batches > 0:
+                self.scheduler = SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, decay_scheduler],
+                    milestones=[warmup_batches]
+                )
+            else:
+                self.scheduler = decay_scheduler
+        elif lr_scheduler_type == 'plateau':
+            self.warmup_scheduler = warmup_scheduler
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=self.plateau_factor,
+                patience=self.plateau_patience,
+                min_lr=min_learning_rate,
+            )
+        else:
+            raise ValueError(f"Unsupported lr_scheduler_type={lr_scheduler_type!r}")
 
         # Wrap models with DDP if distributed training is enabled
         if self.distributed:
@@ -424,6 +467,9 @@ class Trainer:
             logging.info(f"  Learning Rate: {self.learning_rate}")
             logging.info(f"  Min Learning Rate: {self.min_learning_rate}")
             logging.info(f"  LR Scheduler: {lr_scheduler_type}")
+            if lr_scheduler_type == 'plateau':
+                logging.info(f"  Plateau Factor: {self.plateau_factor}")
+                logging.info(f"  Plateau Patience (validation checks): {self.plateau_patience}")
             logging.info(f"  Training Samples: {len(self.train_dataset)}")
             logging.info(f"  Validation Samples: {len(self.val_dataset)}")
             logging.info(f"  Energy Loss Weight (a): {self.a}")
@@ -679,6 +725,11 @@ class Trainer:
                 "k_policy",
                 "ictd_tp_path_policy",
                 "ictd_tp_max_rank_other",
+                "ictd_save_tp_mode",
+                "save_readout_mode",
+                "save_contraction_order",
+                "save_multiple_fusion_scheme",
+                "save_final_readout_mode",
                 "long_range_mode",
                 "long_range_hidden_dim",
                 "long_range_boundary",
@@ -1455,7 +1506,8 @@ class Trainer:
             self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
             
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(all_parameters, max_norm=self.max_norm_value, norm_type=2.0)
+            if self.max_norm_value is not None and self.max_norm_value > 0:
+                torch.nn.utils.clip_grad_norm_(all_parameters, max_norm=self.max_norm_value, norm_type=2.0)
             
             if self.batch_count % self.gradient_log_interval == 0:
                 log_gradient_statistics(all_nets, self.batch_count, logging)
@@ -1483,7 +1535,11 @@ class Trainer:
                             current_max = state['v_hat'].max().item()
                             state['v_hat'].clamp_(max=current_max * self.max_vhat_growth_factor)
             
-            self.scheduler.step()
+            if self.lr_scheduler_type == 'plateau':
+                if self.batch_count <= self.warmup_batches:
+                    self.warmup_scheduler.step()
+            else:
+                self.scheduler.step()
             
             total_batch_loss.append(total_loss.item())
             total_batch_energy_loss.append(energy_loss.item())
@@ -2066,9 +2122,16 @@ class Trainer:
             val_metric_tensor = torch.tensor([current_val_metric], device=self.device)
             dist.broadcast(val_metric_tensor, src=0)
             current_val_metric_synced = val_metric_tensor.item()
+            val_loss_tensor = torch.tensor([current_val_loss], device=self.device)
+            dist.broadcast(val_loss_tensor, src=0)
+            current_val_loss_synced = val_loss_tensor.item()
         else:
             current_val_metric_synced = current_val_metric
-        
+            current_val_loss_synced = current_val_loss
+
+        if self.lr_scheduler_type == 'plateau' and self.batch_count > self.warmup_batches:
+            self.scheduler.step(current_val_loss_synced)
+
         if current_val_metric_synced < self.best_val_loss:
             self.best_val_loss = current_val_metric_synced
             self.patience_counter = 0

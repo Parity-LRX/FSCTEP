@@ -29,6 +29,10 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "k_policy": "k0",
     "ictd_tp_path_policy": "full",
     "ictd_tp_max_rank_other": None,
+    "ictd_save_tp_mode": "fully-connected",
+    "save_contraction_order": 3,
+    "save_multiple_fusion_scheme": "serial_lastmix",
+    "save_final_readout_mode": "direct-1",
     "long_range_mode": "none",
     "long_range_hidden_dim": 64,
     "long_range_boundary": "nonperiodic",
@@ -75,7 +79,6 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "zbl_energy_scale": 1.0,
     "external_tensor_specs": None,
 }
-
 
 def derive_long_range_far_max_radius_multiplier(
     far_num_shells: int,
@@ -130,6 +133,53 @@ def get_arch_metadata(checkpoint: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     arch_meta = checkpoint.get("model_hyperparameters", {})
     return arch_meta if isinstance(arch_meta, Mapping) else {}
+
+
+def normalize_tensor_product_mode_name(mode: Any) -> str:
+    return str(mode or DEFAULT_MODEL_ARCHITECTURE["tensor_product_mode"])
+
+
+def infer_ictd_save_multiple_order_from_state_dict(state_dict: Mapping[str, Any]) -> int | None:
+    order_mix_pat = re.compile(
+        r"^multiple_contraction(?:_(?:last|mix))?\.order_mix\.(\d+)\."
+    )
+    tp_layers_pat = re.compile(
+        r"^multiple_contraction(?:_(?:last|mix))?\.tp_layers\.(\d+)\."
+    )
+    max_order_mix = -1
+    max_tp_layers = -1
+    for key in state_dict.keys():
+        match = order_mix_pat.match(key)
+        if match:
+            max_order_mix = max(max_order_mix, int(match.group(1)))
+        match = tp_layers_pat.match(key)
+        if match:
+            max_tp_layers = max(max_tp_layers, int(match.group(1)))
+    if max_order_mix >= 0:
+        return max_order_mix + 1
+    if max_tp_layers >= 0:
+        return max_tp_layers + 1
+    return None
+
+
+def infer_ictd_save_multiple_fusion_scheme_from_state_dict(state_dict: Mapping[str, Any]) -> str | None:
+    keys = state_dict.keys()
+    has_last = any(key.startswith("multiple_contraction_last.") for key in keys)
+    has_mix = any(key.startswith("multiple_contraction_mix.") for key in keys)
+    has_fuse = any(key.startswith("multiple_contract_fuse.") for key in keys)
+    if has_last and has_mix and has_fuse:
+        return "serial_lastmix"
+    if any(key.startswith("multiple_contraction.") for key in keys):
+        return "single"
+    return None
+
+
+def infer_ictd_save_final_readout_mode_from_state_dict(state_dict: Mapping[str, Any]) -> str | None:
+    if any(key.startswith("weighted_sum.") for key in state_dict.keys()):
+        return "weighted-17"
+    if any(key.startswith("proj_total.") for key in state_dict.keys()):
+        return "direct-1"
+    return None
 
 
 def normalize_dtype_name(value: Any) -> str | None:
@@ -236,7 +286,7 @@ def resolve_model_architecture(
         DEFAULT_MODEL_ARCHITECTURE["irreps_output_conv_channels"],
     )
     resolved["function_type"] = str(_resolve_value(overrides, checkpoint, arch_meta, "function_type", DEFAULT_MODEL_ARCHITECTURE["function_type"]))
-    resolved["tensor_product_mode"] = str(
+    resolved["tensor_product_mode"] = normalize_tensor_product_mode_name(
         _resolve_value(
             overrides,
             checkpoint,
@@ -301,6 +351,36 @@ def resolve_model_architecture(
         arch_meta,
         "ictd_tp_max_rank_other",
         DEFAULT_MODEL_ARCHITECTURE["ictd_tp_max_rank_other"],
+    )
+    resolved["save_contraction_order"] = int(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "save_contraction_order",
+            DEFAULT_MODEL_ARCHITECTURE["save_contraction_order"],
+            checkpoint_key="ictd_save_contraction_order",
+        )
+    )
+    resolved["save_multiple_fusion_scheme"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "save_multiple_fusion_scheme",
+            DEFAULT_MODEL_ARCHITECTURE["save_multiple_fusion_scheme"],
+            checkpoint_key="ictd_save_multiple_fusion_scheme",
+        )
+    )
+    resolved["save_final_readout_mode"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "save_final_readout_mode",
+            DEFAULT_MODEL_ARCHITECTURE["save_final_readout_mode"],
+            checkpoint_key="ictd_save_final_readout_mode",
+        )
     )
     resolved["long_range_mode"] = str(
         _resolve_value(overrides, checkpoint, arch_meta, "long_range_mode", DEFAULT_MODEL_ARCHITECTURE["long_range_mode"])

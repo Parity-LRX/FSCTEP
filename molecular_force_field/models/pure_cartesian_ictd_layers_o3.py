@@ -17,7 +17,7 @@ from e3nn.math import soft_one_hot_linspace
 
 from molecular_force_field.models.long_range import build_feature_spectral_module, build_long_range_module
 from molecular_force_field.models.ictd_irreps import (
-    HarmonicChannelWiseTensorProductO3,
+    HarmonicFullyConnectedTensorProductO3,
     HarmonicElementwiseProductO3,
     canonical_irrep_parity_sign,
     parity_letter_to_sign,
@@ -237,6 +237,34 @@ def _apply_channel_adapter_per_irrep(x_lp: torch.Tensor, adapter: nn.Module) -> 
     return y.movedim(-1, -2)
 
 
+class EquivariantChannelLinearO3(nn.Module):
+    """
+    Block-diagonal equivariant linear map for the flattened O(3) irreps layout.
+
+    Each (l, parity) block mixes channels only, leaving the m components untouched.
+    """
+
+    def __init__(self, channels: int, active_irreps: list[tuple[int, int]], bias: bool = False):
+        super().__init__()
+        self.channels = int(channels)
+        self.active_irreps = [tuple(map(int, key)) for key in active_irreps]
+        self.adapters = nn.ModuleDict(
+            {
+                _irrep_key_str(l, p): nn.Linear(self.channels, self.channels, bias=bias)
+                for l, p in self.active_irreps
+            }
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = _split_irreps_o3(x, self.channels, self.active_irreps)
+        for key in self.active_irreps:
+            blocks[key] = _apply_channel_adapter_per_irrep(
+                blocks[key],
+                self.adapters[_irrep_key_str(*key)],
+            )
+        return _merge_irreps_o3(blocks, self.channels, self.active_irreps)
+
+
 def _normalize_external_tensor_irrep(
     *,
     rank: int | None,
@@ -356,9 +384,9 @@ class ICTDO3E3Conv(nn.Module):
         self.fidelity_embedding = (
             nn.Embedding(self.num_fidelity_levels, output_size) if self.num_fidelity_levels > 0 else None
         )
-        self.tp2 = HarmonicChannelWiseTensorProductO3(
+        self.tp2 = HarmonicFullyConnectedTensorProductO3(
             mul_in1=output_size,
-            mul_in2=output_size,
+            mul_in2=1,
             mul_out=channels_out,
             lmax=self.lmax,
             active_irreps=self.active_irreps,
@@ -370,6 +398,8 @@ class ICTDO3E3Conv(nn.Module):
         )
         self.fc = nn.Sequential(
             nn.Linear(number_of_basis, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
             nn.SiLU(),
             nn.Linear(64, 64),
             nn.SiLU(),
@@ -472,6 +502,7 @@ class ICTDO3E3Conv(nn.Module):
         Ai = apply_fidelity_embedding(Ai, batch, fidelity_ids, self.fidelity_embedding)
         n = n.to(dtype=Ai.dtype)
         edge_length = edge_length.to(dtype=Ai.dtype)
+        edge_mask = (edge_length <= self.max_radius).to(dtype=Ai.dtype).unsqueeze(-1)
 
         if precomputed_Y_list is None:
             Y_list = direction_harmonics_all(n, self.lmax)
@@ -533,15 +564,22 @@ class ICTDO3E3Conv(nn.Module):
                     scale = self.external_tensor_scale_by_irrep[self.active_irreps.index(key)]
                     f_in[key] = f_in[key] + t * scale
 
-        x2 = {(0, 1): Ai[edge_dst].unsqueeze(-1)}
+        # Match the save-so3 conv1 semantics: the second TP operand is the
+        # edge-direction harmonics (mul=1), not a scalar receiver embedding.
+        x2 = self._empty_blocks((edge_src.shape[0],), 1, Ai.device, Ai.dtype)
+        for l in range(self.lmax + 1):
+            key = (l, canonical_irrep_parity_sign(l))
+            if key in self.active_irrep_set:
+                x2[key] = Y_list[l].to(dtype=Ai.dtype).unsqueeze(-2)
         emb = soft_one_hot_linspace(edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True)
         emb = emb.mul(self.number_of_basis ** 0.5).to(dtype=Ai.dtype)
         gates = self.fc(emb)
         out_blocks = self.tp2(f_in, x2, gates)
         edge_features = _merge_irreps_o3(out_blocks, self.channels_out, self.active_irreps)
+        edge_features = edge_features * edge_mask
         num_nodes = pos.size(0)
         neighbor_count = scatter(torch.ones_like(edge_dst), edge_dst, dim=0, dim_size=num_nodes).clamp(min=1).to(edge_features.dtype)
-        out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+        out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.sqrt().unsqueeze(-1))
         return out
 
 
@@ -621,6 +659,7 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
         feature_spectral_include_k0: bool = False,
         feature_spectral_assignment: str = "cic",
         feature_spectral_gate_init: float = 0.0,
+        equivariant_post_linear: bool = False,
     ):
         super().__init__()
         if embed_size is None:
@@ -713,6 +752,7 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
         self.number_of_basis = main_number_of_basis
         self.function_type = function_type_main
         self.invariant_channels = int(invariant_channels)
+        self.equivariant_post_linear = bool(equivariant_post_linear)
 
         self.e3_conv_emb = ICTDO3E3Conv(
             max_radius=max_embed_radius,
@@ -737,10 +777,18 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
             num_fidelity_levels=self.num_fidelity_levels,
             external_tensor_scale_init=external_tensor_scale_init,
         )
+        self.post_conv_linears = nn.ModuleList()
+        for _ in range(self.num_interaction):
+            if self.equivariant_post_linear:
+                self.post_conv_linears.append(
+                    EquivariantChannelLinearO3(self.channels, self.active_irreps, bias=False)
+                )
+            else:
+                self.post_conv_linears.append(nn.Identity())
         self.tp2_layers = nn.ModuleList()
         self.fc2_layers = nn.ModuleList()
         for _ in range(self.num_interaction - 1):
-            tp2 = HarmonicChannelWiseTensorProductO3(
+            tp2 = HarmonicFullyConnectedTensorProductO3(
                 mul_in1=self.channels,
                 mul_in2=1,
                 mul_out=self.channels,
@@ -757,6 +805,8 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
                 nn.SiLU(),
                 nn.Linear(64, 64),
                 nn.SiLU(),
+                nn.Linear(64, 64),
+                nn.SiLU(),
                 nn.Linear(64, tp2.num_paths),
             )
             self.tp2_layers.append(tp2)
@@ -764,13 +814,14 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
 
         combined_channels = self.channels * self.num_interaction
         scalar_channels = (self.num_interaction - 1) * self.invariant_channels
-        self._scalar_readout_adapt = nn.ModuleDict()
-        for l, p in self.active_irreps:
-            key = _irrep_key_str(l, p)
-            if scalar_channels == combined_channels:
-                self._scalar_readout_adapt[key] = nn.Identity()
-            else:
-                self._scalar_readout_adapt[key] = nn.Linear(combined_channels, scalar_channels, bias=False)
+        self.W_read = nn.ParameterDict(
+            {
+                _irrep_key_str(l, p): nn.Parameter(
+                    torch.randn(scalar_channels, combined_channels, combined_channels) * 0.02
+                )
+                for l, p in self.active_irreps
+            }
+        )
         self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
 
         self._p5_adapt = nn.ModuleList()
@@ -941,9 +992,10 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
             edge_batch_idx = batch[edge_src]
             edge_cells = cell[edge_batch_idx]
             shift_vecs = torch.einsum("ni,nij->nj", edge_shifts, edge_cells)
-            edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
+        edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
         n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)
+        edge_mask = (edge_length <= self.max_radius).to(dtype=dtype).unsqueeze(-1)
 
         Y_list = direction_harmonics_all(n.to(dtype=dtype), self.lmax)
         f1 = self.e3_conv_emb(
@@ -954,6 +1006,7 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
             external_tensor=external_tensor,
             fidelity_ids=fidelity_ids,
         )
+        f1 = self.post_conv_linears[0](f1)
         if sync_after_scatter is not None:
             f1 = sync_after_scatter(f1)
         features = [f1]
@@ -964,7 +1017,7 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
             edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True
         ).mul(self.number_of_basis ** 0.5)
 
-        for tp2, fc2 in zip(self.tp2_layers, self.fc2_layers):
+        for layer_idx, (tp2, fc2) in enumerate(zip(self.tp2_layers, self.fc2_layers), start=1):
             f_prev = features[-1]
             emb = emb_base.to(dtype=f_prev.dtype)
             gates = fc2(emb)
@@ -977,8 +1030,10 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
                     Y[key] = Y_list[l].to(dtype=f_prev.dtype).unsqueeze(-2)
             edge_blocks = tp2(x1e, Y, gates)
             edge_flat = _merge_irreps_o3(edge_blocks, self.channels, self.active_irreps)
+            edge_flat = edge_flat * edge_mask.to(dtype=edge_flat.dtype)
             neighbor_count = neighbor_count.to(edge_flat.dtype)
-            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.unsqueeze(-1))
+            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes).div(neighbor_count.sqrt().unsqueeze(-1))
+            f_next = self.post_conv_linears[layer_idx](f_next)
             if sync_after_scatter is not None:
                 f_next = sync_after_scatter(f_next)
             features.append(f_next)
@@ -1025,8 +1080,8 @@ class PureCartesianICTDSaveO3TransformerLayer(nn.Module):
         )
         for l, p in self.active_irreps:
             t = xb[(l, p)]
-            t = _apply_channel_adapter_per_irrep(t, self._scalar_readout_adapt[_irrep_key_str(l, p)])
-            scalars = scalars + (t * t).sum(dim=-1) / math.sqrt(2 * l + 1)
+            gram = torch.einsum("ncm,ndm->ncd", t, t) / math.sqrt(2 * l + 1)
+            scalars = scalars + torch.einsum("ocd,ncd->no", self.W_read[_irrep_key_str(l, p)], gram)
 
         T_blocks: dict[tuple[int, int], torch.Tensor] = {}
         splits = [_split_irreps_o3(f, self.channels, self.active_irreps) for f in features]

@@ -80,6 +80,92 @@ def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) 
     return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
 
 
+def split_flat_irreps_so3(x: torch.Tensor, channels: int, lmax: int) -> Dict[int, torch.Tensor]:
+    """
+    Split a flattened SO(3) irreps layout into per-l blocks.
+
+    x: (..., channels * (lmax+1)^2)
+    returns: dict l -> (..., channels, 2l+1)
+    """
+    out: Dict[int, torch.Tensor] = {}
+    idx = 0
+    for l in range(int(lmax) + 1):
+        d = int(channels) * (2 * l + 1)
+        blk = x[..., idx : idx + d]
+        idx += d
+        out[l] = blk.view(*x.shape[:-1], int(channels), 2 * l + 1)
+    return out
+
+
+def merge_flat_irreps_so3(blocks: Dict[int, torch.Tensor], channels: int, lmax: int) -> torch.Tensor:
+    """
+    Merge per-l SO(3) irreps blocks back into the flattened layout.
+    """
+    parts = []
+    for l in range(int(lmax) + 1):
+        parts.append(blocks[l].reshape(*blocks[l].shape[:-2], int(channels) * (2 * l + 1)))
+    return torch.cat(parts, dim=-1)
+
+
+def apply_channel_adapter_per_l(x_l: torch.Tensor, adapter: nn.Module) -> torch.Tensor:
+    """
+    Apply a channel adapter Linear/Identity to one irreps block.
+
+    x_l: (..., Cin, 2l+1)
+    adapter: maps Cin -> Cout (or Identity)
+    returns: (..., Cout, 2l+1)
+    """
+    if isinstance(adapter, nn.Identity):
+        return x_l
+    y = adapter(x_l.movedim(-2, -1))
+    return y.movedim(-1, -2)
+
+
+class EquivariantChannelLinearSO3(nn.Module):
+    """
+    Block-diagonal equivariant linear map for a flattened SO(3) irreps layout.
+
+    Each l-block keeps its (2l+1) angular components untouched and only mixes the
+    channel/multiplicity dimension, so equivariance is preserved.
+    """
+
+    def __init__(self, channels: int, lmax: int, bias: bool = False):
+        super().__init__()
+        self.channels = int(channels)
+        self.lmax = int(lmax)
+        self.adapters = nn.ModuleDict(
+            {str(l): nn.Linear(self.channels, self.channels, bias=bias) for l in range(self.lmax + 1)}
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = split_flat_irreps_so3(x, self.channels, self.lmax)
+        for l in range(self.lmax + 1):
+            blocks[l] = apply_channel_adapter_per_l(blocks[l], self.adapters[str(l)])
+        return merge_flat_irreps_so3(blocks, self.channels, self.lmax)
+
+
+class EquivariantChannelLinearSO3Rect(nn.Module):
+    """
+    Block-diagonal equivariant linear map between two flattened SO(3) irreps
+    layouts with the same lmax but different channel counts.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, lmax: int, bias: bool = False):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.lmax = int(lmax)
+        self.adapters = nn.ModuleDict(
+            {str(l): nn.Linear(self.in_channels, self.out_channels, bias=bias) for l in range(self.lmax + 1)}
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = split_flat_irreps_so3(x, self.in_channels, self.lmax)
+        for l in range(self.lmax + 1):
+            blocks[l] = apply_channel_adapter_per_l(blocks[l], self.adapters[str(l)])
+        return merge_flat_irreps_so3(blocks, self.out_channels, self.lmax)
+
+
 def _segment_offsets_from_segments(segments: List[Tuple[int, ...]]) -> torch.Tensor:
     offsets = [int(seg[-2]) for seg in segments]
     offsets.append(int(segments[-1][-1]) if segments else 0)
@@ -1500,6 +1586,187 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         return out
 
 
+class HarmonicPathWeightedTensorProduct(nn.Module):
+    """
+    Lightweight path-weighted tensor product in the ICTD SO(3) basis.
+
+    Compared with HarmonicFullyConnectedTensorProduct, this module does not learn
+    a full `(mul_out, mul_in1, mul_in2)` kernel per path. Instead, it:
+
+    - assumes aligned input/output channels (`mul_in = mul_out = channels`)
+    - reuses the CG / projection cache already available in ICTD irreps
+    - learns only one scalar weight per `(path, channel)`
+
+    This matches the "few path weights + fixed coupling basis" idea used by
+    MACE-style symmetric contractions while staying fully within the ICTD
+    operator family.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        lmax: int,
+        *,
+        allowed_paths: List[Tuple[int, int, int]] | None = None,
+        path_policy: str = "full",
+        max_rank_other: int | None = None,
+        normalization: str = "component",
+        internal_compute_dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.lmax = int(lmax)
+        self._normalization = normalization
+        self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
+
+        all_paths: List[Tuple[int, int, int]] = []
+        for l1 in range(self.lmax + 1):
+            for l2 in range(self.lmax + 1):
+                for l3 in range(abs(l1 - l2), min(l1 + l2, self.lmax) + 1):
+                    if (l1 + l2 + l3) % 2 == 1:
+                        continue
+                    all_paths.append((l1, l2, l3))
+
+        if allowed_paths is not None:
+            allowed_set = set(allowed_paths)
+            self.paths = [p for p in all_paths if p in allowed_set]
+        else:
+            if path_policy == "full":
+                self.paths = all_paths
+            elif path_policy == "max_rank_other":
+                if max_rank_other is None:
+                    raise ValueError("path_policy='max_rank_other' requires max_rank_other")
+                self.paths = [p for p in all_paths if min(p[0], p[1]) <= int(max_rank_other)]
+            else:
+                raise ValueError(f"Unknown path_policy={path_policy!r}")
+
+        self.num_paths = len(self.paths)
+        self.weight = nn.Parameter(torch.randn(self.num_paths, self.channels) * 0.02)
+
+        self._cg_cpu_f64: List[torch.Tensor] | None = None
+        self._cg_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+
+        self._groups: List[Dict[str, object]] = []
+        groups_tmp: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        for p_idx, (l1, l2, l3) in enumerate(self.paths):
+            groups_tmp.setdefault((l1, l2), []).append((p_idx, l3))
+        for (l1, l2), items in sorted(groups_tmp.items()):
+            segments = []
+            start = 0
+            for p_idx, l3 in items:
+                kdim = 2 * l3 + 1
+                segments.append((p_idx, l3, start, start + kdim))
+                start += kdim
+            self._groups.append(
+                {
+                    "l1": l1,
+                    "l2": l2,
+                    "segments": segments,
+                    "k_total": start,
+                }
+            )
+
+        self._proj_group_cache_by_dev_dtype: Dict[Tuple[str, str], List[torch.Tensor]] = {}
+
+    @_dynamo_disable
+    def _get_cg_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._cg_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+
+        if self._cg_cpu_f64 is None:
+            self._cg_cpu_f64 = []
+            for (l1, l2, l3) in self.paths:
+                C = build_cg_tensor(l1, l2, l3)
+                C_fn = C.norm().item()
+                if self._normalization == "component" and C_fn > 1e-30:
+                    C = C * (math.sqrt(2 * l3 + 1) / C_fn)
+                elif self._normalization == "norm" and C_fn > 1e-30:
+                    C = C * (1.0 / C_fn)
+                self._cg_cpu_f64.append(C)
+
+        cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
+        self._cg_cache_by_dev_dtype[key] = cg_list
+        return cg_list
+
+    @_dynamo_disable
+    def _get_proj_group_list(self, device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
+        compute_dtype = self.internal_compute_dtype
+        key = (str(device), str(compute_dtype))
+        cached = self._proj_group_cache_by_dev_dtype.get(key)
+        if cached is not None:
+            return cached
+
+        cg_list = self._get_cg_list(device=device, dtype=dtype)
+        proj_list: List[torch.Tensor] = []
+        for g in self._groups:
+            l1 = int(g["l1"])
+            l2 = int(g["l2"])
+            segments = g["segments"]
+            k_total = int(g["k_total"])
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = torch.zeros(m1 * m2, k_total, device=device, dtype=compute_dtype)
+            for p_idx, _l3, s, e in segments:
+                C = cg_list[int(p_idx)]
+                U[:, int(s): int(e)] = C.reshape(m1 * m2, int(e) - int(s))
+            proj_list.append(U)
+
+        self._proj_group_cache_by_dev_dtype[key] = proj_list
+        return proj_list
+
+    def forward(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+    ) -> Dict[int, torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+
+        out: Dict[int, torch.Tensor] = {
+            l: torch.zeros(*batch_shape, self.channels, 2 * l + 1, device=device, dtype=dtype)
+            for l in range(self.lmax + 1)
+        }
+
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        w = self.weight.to(device=device, dtype=compute_dtype)
+
+        for g_idx, g in enumerate(self._groups):
+            l1 = int(g["l1"])
+            l2 = int(g["l2"])
+            segments = g["segments"]
+            k_total = int(g["k_total"])
+
+            a = x1.get(l1)
+            b = x2.get(l2)
+            if a is None or b is None:
+                continue
+
+            a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+            b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = proj_list[g_idx]
+
+            pair = (
+                a_comp.unsqueeze(-1) * b_comp.unsqueeze(-2)
+            ).reshape(*batch_shape, self.channels, m1 * m2)
+            y = torch.matmul(pair, U)
+
+            for p_idx, l3, s, e in segments:
+                seg = y[..., int(s): int(e)]
+                seg = seg * w[int(p_idx)].view(*([1] * len(batch_shape)), self.channels, 1)
+                seg = seg.to(dtype=dtype) if seg.dtype != dtype else seg
+                out[int(l3)] = out[int(l3)] + seg
+
+        return out
+
+
 def _normalize_irrep_key(l: int, parity: int) -> Tuple[int, int]:
     return (int(l), 1 if int(parity) >= 0 else -1)
 
@@ -1608,7 +1875,9 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self.lmax = int(lmax)
         self.internal_weights = bool(internal_weights)
         self._normalization = normalization
-        self._mul_path_scale = 1.0 / math.sqrt(float(max(self.mul_in1 * self.mul_in2, 1)))
+        # Keep O(3) on the same effective weight parameterization as the SO(3)
+        # save path for an apples-to-apples training comparison.
+        self._mul_path_scale = 1.0
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
         self.active_irreps = (

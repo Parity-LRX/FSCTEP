@@ -9,7 +9,11 @@ import torch
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
     get_checkpoint_e3_state_dict,
+    infer_ictd_save_final_readout_mode_from_state_dict,
+    infer_ictd_save_multiple_fusion_scheme_from_state_dict,
+    infer_ictd_save_multiple_order_from_state_dict,
     infer_physical_tensor_outputs_from_state_dict,
+    resolve_model_architecture,
 )
 from molecular_force_field.utils.external_tensor_specs import normalize_external_tensor_specs
 from molecular_force_field.utils.config import ModelConfig
@@ -40,6 +44,13 @@ def build_e3trans_from_checkpoint(
         )
     max_radius = float(ckpt.get("max_radius", 5.0))
     arch_meta = ckpt.get("model_hyperparameters", {})
+    resolved_arch = resolve_model_architecture(
+        ckpt,
+        overrides={
+            "tensor_product_mode": mode,
+            "num_interaction": num_interaction,
+        },
+    )
 
     external_tensor_rank = ckpt.get("external_tensor_rank")
     external_tensor_irrep = ckpt.get("external_tensor_irrep", arch_meta.get("external_tensor_irrep"))
@@ -48,6 +59,27 @@ def build_e3trans_from_checkpoint(
     multi_fidelity_mode = str(arch_meta.get("multi_fidelity_mode", "conditioning") or "conditioning")
     o3_irrep_preset = str(arch_meta.get("o3_irrep_preset", "auto"))
     o3_active_irreps = arch_meta.get("o3_active_irreps")
+    save_contraction_order = int(
+        ckpt.get("ictd_save_contraction_order")
+        or arch_meta.get("ictd_save_contraction_order")
+        or arch_meta.get("save_contraction_order")
+        or infer_ictd_save_multiple_order_from_state_dict(selected_state_dict)
+        or 3
+    )
+    save_multiple_fusion_scheme = str(
+        ckpt.get("ictd_save_multiple_fusion_scheme")
+        or arch_meta.get("ictd_save_multiple_fusion_scheme")
+        or arch_meta.get("save_multiple_fusion_scheme")
+        or infer_ictd_save_multiple_fusion_scheme_from_state_dict(selected_state_dict)
+        or "serial_lastmix"
+    )
+    save_final_readout_mode = str(
+        ckpt.get("ictd_save_final_readout_mode")
+        or arch_meta.get("ictd_save_final_readout_mode")
+        or arch_meta.get("save_final_readout_mode")
+        or infer_ictd_save_final_readout_mode_from_state_dict(selected_state_dict)
+        or "direct-1"
+    )
     if external_tensor_rank is None:
         if "e3_conv_emb.external_tensor_scale_by_l" in selected_state_dict:
             external_tensor_rank = 1
@@ -63,7 +95,24 @@ def build_e3trans_from_checkpoint(
     if physical_tensor_outputs is None:
         physical_tensor_outputs = infer_physical_tensor_outputs_from_state_dict(selected_state_dict)
 
-    config = ModelConfig(dtype=torch.float64, max_radius=max_radius)
+    config = ModelConfig(
+        dtype=resolved_arch["dtype"],
+        max_radius=resolved_arch["max_radius"],
+        max_atomvalue=resolved_arch["max_atomvalue"],
+        embedding_dim=resolved_arch["embedding_dim"],
+        embed_size=resolved_arch["embed_size"],
+        output_size=resolved_arch["output_size"],
+        lmax=resolved_arch["lmax"],
+        irreps_output_conv_channels=resolved_arch["irreps_output_conv_channels"],
+        function_type=resolved_arch["function_type"],
+    )
+    config.number_of_basis_main = int(
+        ckpt.get("number_of_basis_main")
+        or arch_meta.get("number_of_basis_main")
+        or config.number_of_basis_main
+    )
+    config.max_radius_main = resolved_arch["max_radius"]
+    config.function_type_main = resolved_arch["function_type"]
     if atomic_energy_file:
         if os.path.exists(atomic_energy_file):
             config.load_atomic_energies_from_file(atomic_energy_file)
@@ -365,9 +414,13 @@ def build_e3trans_from_checkpoint(
             multi_fidelity_mode=multi_fidelity_mode,
             **ictd_kwargs,
         )
-    elif mode == "pure-cartesian-ictd-save":
+    elif mode in {"pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple"}:
         e3trans = PureCartesianICTDTransformerLayer(
             **k_cartesian,
+            save_readout_mode="mace-contraction" if mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
+            save_contraction_order=save_contraction_order,
+            save_multiple_fusion_scheme=save_multiple_fusion_scheme,
+            save_final_readout_mode=save_final_readout_mode,
             ictd_tp_path_policy="full",
             ictd_tp_max_rank_other=None,
             internal_compute_dtype=dtype,
@@ -377,7 +430,7 @@ def build_e3trans_from_checkpoint(
             f"Unsupported tensor_product_mode: {mode}. "
             "Supported: spherical, spherical-save, spherical-save-cue, "
             "partial-cartesian, partial-cartesian-loose, pure-cartesian, "
-            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-ictd-save"
+            "pure-cartesian-sparse, pure-cartesian-sparse-save, pure-cartesian-ictd, pure-cartesian-ictd-o3, pure-cartesian-ictd-save-o3, pure-cartesian-ictd-save, pure-cartesian-ictd-save-multiple"
         )
 
     e3trans = e3trans.to(device=device, dtype=dtype)

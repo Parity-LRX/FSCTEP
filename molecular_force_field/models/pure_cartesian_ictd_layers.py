@@ -24,8 +24,13 @@ import math
 from functools import lru_cache
 
 from molecular_force_field.models.ictd_irreps import (
-    HarmonicChannelWiseTensorProduct,
     HarmonicElementwiseProduct,
+    HarmonicChannelWiseTensorProduct,
+    HarmonicFullyConnectedTensorProduct,
+    HarmonicPathWeightedTensorProduct,
+    EquivariantChannelLinearSO3,
+    EquivariantChannelLinearSO3Rect,
+    apply_channel_adapter_per_l,
     direction_harmonics,
     direction_harmonics_all,
     build_harmonic_projectors,
@@ -365,11 +370,11 @@ class PhysicalTensorICTDEmbedding(nn.Module):
                 # (..., Cin, D) x (2l+1, D) -> (..., Cin, 2l+1)
                 c = torch.einsum("...cd,md->...cm", t_comp, P)
                 c = c.to(dtype=dtype) if c.dtype != dtype else c
-                c = _apply_channel_adapter_per_l(c, self._adapters[str(l)])  # (..., Cout, 2l+1)
+                c = apply_channel_adapter_per_l(c, self._adapters[str(l)])  # (..., Cout, 2l+1)
                 out_blocks[l] = c
             elif l == 1 and antisym_block is not None:
                 c = antisym_block.to(dtype=dtype) if antisym_block.dtype != dtype else antisym_block
-                c = _apply_channel_adapter_per_l(c, self._adapters[str(l)])
+                c = apply_channel_adapter_per_l(c, self._adapters[str(l)])
                 out_blocks[l] = c
             else:
                 out_blocks[l] = torch.zeros(*batch_shape, self.channels_out, 2 * l + 1, device=device, dtype=dtype)
@@ -581,20 +586,90 @@ def _irreps_elementwise_tensor_product_0e(x1: torch.Tensor, x2: torch.Tensor, ch
     return torch.cat(outs, dim=-1)
 
 
-def _apply_channel_adapter_per_l(x_l: torch.Tensor, adapter: nn.Module) -> torch.Tensor:
+class MultipleContractionSO3(nn.Module):
     """
-    Apply a channel adapter Linear/Identity to an irreps block.
+    A lightweight MACE-style product/contraction block for the flattened SO(3)
+    irreps layout used by ICTD-save.
 
-    x_l: (..., Cin, 2l+1)
-    adapter: maps Cin -> Cout (or Identity)
-    Returns: (..., Cout, 2l+1)
+    Pipeline:
+      1) Concatenated cross-layer features are reduced equivariantly from
+         in_channels -> hidden_channels.
+      2) Repeated path-weighted tensor products with the reduced base features
+         build a low-width higher-order product basis.
+      3) Lower-order and higher-order terms are summed and projected back to the
+         same hidden irreps layout.
+
+    This is not an exact copy of MACE's symmetric contraction implementation;
+    it is an SO(3)-native analogue that keeps the same ICTD tensor-product
+    family, hidden irreps shape, and path-shared weighting style.
     """
-    if isinstance(adapter, nn.Identity):
-        return x_l
-    # move channel to last dim for nn.Linear
-    # (..., Cin, m) -> (..., m, Cin) -> Linear -> (..., m, Cout) -> (..., Cout, m)
-    y = adapter(x_l.movedim(-2, -1))
-    return y.movedim(-1, -2)
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        hidden_channels: int,
+        lmax: int,
+        correlation: int = 3,
+        ictd_tp_path_policy: str = "full",
+        ictd_tp_max_rank_other: int | None = None,
+        internal_compute_dtype: torch.dtype | None = None,
+        ictd_tp_backend: str = "pytorch",
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_channels = int(hidden_channels)
+        self.lmax = int(lmax)
+        self.correlation = int(correlation)
+        if self.correlation < 1:
+            raise ValueError(f"correlation must be >= 1, got {self.correlation}")
+
+        self.reduce = EquivariantChannelLinearSO3Rect(
+            self.in_channels, self.hidden_channels, self.lmax, bias=False
+        )
+        self.order_mix = nn.ModuleList(
+            [
+                EquivariantChannelLinearSO3(self.hidden_channels, self.lmax, bias=False)
+                for _ in range(self.correlation)
+            ]
+        )
+        self.tp_layers = nn.ModuleList(
+            [
+                HarmonicPathWeightedTensorProduct(
+                    channels=self.hidden_channels,
+                    lmax=self.lmax,
+                    path_policy=ictd_tp_path_policy,
+                    max_rank_other=ictd_tp_max_rank_other,
+                    internal_compute_dtype=internal_compute_dtype,
+                )
+                for _ in range(max(self.correlation - 1, 0))
+            ]
+        )
+        self.out_linear = EquivariantChannelLinearSO3(
+            self.hidden_channels, self.lmax, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.reduce(x)
+        accum = self.order_mix[0](base)
+        if self.correlation == 1:
+            return self.out_linear(accum)
+
+        base_blocks = _split_irreps(base, self.hidden_channels, self.lmax)
+        current_blocks = base_blocks
+        for order_idx, tp in enumerate(self.tp_layers, start=1):
+            current_blocks = tp(current_blocks, base_blocks)
+            current_flat = _merge_irreps(current_blocks, self.hidden_channels, self.lmax)
+            current_flat = self.order_mix[order_idx](current_flat)
+            accum = accum + current_flat
+        return self.out_linear(accum)
+
+
+def _run_in_stream(module: nn.Module, x: torch.Tensor, stream: torch.cuda.Stream | None) -> torch.Tensor:
+    if stream is None:
+        return module(x)
+    with torch.cuda.stream(stream):
+        return module(x)
 
 
 def _elementwise_tensor_product_0e_blocks(
@@ -640,6 +715,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         output_size: int = 8,
         lmax: int = 2,
         function_type: str = "gaussian",
+        tp_mode: str = "fully-connected",
         # ICTD tensor-product path control (e3nn-instructions-like)
         ictd_tp_path_policy: str = "full",
         ictd_tp_max_rank_other: int | None = None,
@@ -657,6 +733,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         self.lmax = lmax
         self.function_type = function_type
         self.avg_num_neighbors = avg_num_neighbors
+        self.tp_mode = str(tp_mode)
 
         self.atom_embedding = nn.Embedding(max_atomvalue, embedding_dim)
         self.atom_mlp = nn.Sequential(
@@ -666,7 +743,8 @@ class ICTDIrrepsE3Conv(nn.Module):
         )
 
         # Channelwise: (node ⊗ edge_Y) only; second input has mul=1 (edge geometry)
-        self.tp2 = HarmonicChannelWiseTensorProduct(
+        tp_cls = HarmonicChannelWiseTensorProduct if self.tp_mode == "channelwise" else HarmonicFullyConnectedTensorProduct
+        self.tp2 = tp_cls(
             mul_in1=output_size,
             mul_in2=1,
             mul_out=channels_out,
@@ -679,6 +757,8 @@ class ICTDIrrepsE3Conv(nn.Module):
         )
         self.fc = nn.Sequential(
             nn.Linear(number_of_basis, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
             nn.SiLU(),
             nn.Linear(64, 64),
             nn.SiLU(),
@@ -707,6 +787,7 @@ class ICTDIrrepsE3Conv(nn.Module):
         Ai = self.atom_mlp(self.atom_embedding(A.long()))  # (N, output_size)
         n = n.to(dtype=Ai.dtype)
         edge_length = edge_length.to(dtype=Ai.dtype)
+        edge_mask = (edge_length <= self.max_radius).to(dtype=Ai.dtype).unsqueeze(-1)
 
         if precomputed_Y_list is None:
             Y_list = direction_harmonics_all(n, self.lmax)
@@ -728,11 +809,21 @@ class ICTDIrrepsE3Conv(nn.Module):
         gates = self.fc(emb)
         out_blocks = self.tp2(f_in, x2, gates)
         edge_features = _merge_irreps(out_blocks, self.channels_out, self.lmax)
+        edge_features = edge_features * edge_mask
 
         num_nodes = pos.size(0)
         out = scatter(edge_features, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
-        avg = self.avg_num_neighbors if self.avg_num_neighbors is not None else (float(edge_src.numel()) / float(max(num_nodes, 1)))
-        out = out / max(avg, 1e-8)
+        if self.avg_num_neighbors is not None:
+            out = out / max(self.avg_num_neighbors, 1e-8)
+        else:
+            neighbor_count = scatter(
+                torch.ones_like(edge_dst, dtype=edge_features.dtype),
+                edge_dst,
+                dim=0,
+                dim_size=num_nodes,
+                reduce="sum",
+            ).clamp(min=1.0)
+            out = out / neighbor_count.sqrt().unsqueeze(-1)
         return out
 
 
@@ -818,6 +909,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         feature_spectral_include_k0: bool = False,
         feature_spectral_assignment: str = "cic",
         feature_spectral_gate_init: float = 0.0,
+        equivariant_post_linear: bool = False,
+        ictd_save_tp_mode: str = "fully-connected",
+        save_readout_mode: str = "elementwise-scalar",
+        save_contraction_order: int = 3,
+        save_multiple_fusion_scheme: str = "serial_lastmix",
+        save_final_readout_mode: str = "direct-1",
     ):
         super().__init__()
         if embed_size is None:
@@ -835,6 +932,30 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         if self.num_interaction < 2:
             raise ValueError(f"num_interaction must be >= 2, got {self.num_interaction}")
         self.invariant_channels = int(invariant_channels)
+        self.equivariant_post_linear = bool(equivariant_post_linear)
+        self.ictd_save_tp_mode = str(ictd_save_tp_mode)
+        self.save_readout_mode = str(save_readout_mode)
+        self.save_contraction_order = int(save_contraction_order)
+        self.save_multiple_fusion_scheme = str(save_multiple_fusion_scheme)
+        self.save_final_readout_mode = str(save_final_readout_mode)
+        if self.save_readout_mode not in {"elementwise-scalar", "mace-contraction"}:
+            raise ValueError(
+                f"save_readout_mode must be 'elementwise-scalar' or 'mace-contraction', got {self.save_readout_mode!r}"
+            )
+        if self.save_multiple_fusion_scheme not in {"serial_lastmix"}:
+            raise ValueError(
+                "save_multiple_fusion_scheme must be 'serial_lastmix', "
+                f"got {self.save_multiple_fusion_scheme!r}"
+            )
+        if self.save_final_readout_mode not in {"direct-1"}:
+            raise ValueError(
+                "save_final_readout_mode must be 'direct-1', "
+                f"got {self.save_final_readout_mode!r}"
+            )
+        if self.save_contraction_order < 1:
+            raise ValueError(
+                f"save_contraction_order must be >= 1, got {self.save_contraction_order}"
+            )
 
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
@@ -850,17 +971,27 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             output_size=output_size,
             lmax=self.lmax,
             function_type=function_type_main,
+            tp_mode=self.ictd_save_tp_mode,
             ictd_tp_path_policy=ictd_tp_path_policy,
             ictd_tp_max_rank_other=ictd_tp_max_rank_other,
             internal_compute_dtype=internal_compute_dtype,
             ictd_tp_backend=ictd_tp_backend,
         )
+        self.post_conv_linears = nn.ModuleList()
+        for _ in range(self.num_interaction):
+            if self.equivariant_post_linear:
+                self.post_conv_linears.append(
+                    EquivariantChannelLinearSO3(self.channels, self.lmax, bias=False)
+                )
+            else:
+                self.post_conv_linears.append(nn.Identity())
 
         # conv2..convN: node irreps (mul=C) x edge Y_l (mul=1) -> node irreps (mul=C), per-edge weights
         self.tp2_layers = nn.ModuleList()
         self.fc2_layers = nn.ModuleList()
+        tp_cls = HarmonicChannelWiseTensorProduct if self.ictd_save_tp_mode == "channelwise" else HarmonicFullyConnectedTensorProduct
         for _ in range(self.num_interaction - 1):
-            tp2 = HarmonicChannelWiseTensorProduct(
+            tp2 = tp_cls(
                 mul_in1=self.channels,
                 mul_in2=1,
                 mul_out=self.channels,
@@ -876,24 +1007,62 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 nn.SiLU(),
                 nn.Linear(64, 64),
                 nn.SiLU(),
+                nn.Linear(64, 64),
+                nn.SiLU(),
                 nn.Linear(64, tp2.num_paths),
             )
             self.tp2_layers.append(tp2)
             self.fc2_layers.append(fc2)
 
-        # Readout invariants:
-        #  - project each l-block to scalar_channels
-        #  - build 0e invariants with an elementwise product instead of an
-        #    internally weighted tensor product / Gram readout
         combined_channels = self.channels * self.num_interaction
-        scalar_channels = (self.num_interaction - 1) * self.invariant_channels
-        self._scalar_readout_adapt = nn.ModuleDict()
-        for l in range(self.lmax + 1):
-            if scalar_channels == combined_channels:
-                self._scalar_readout_adapt[str(l)] = nn.Identity()
-            else:
-                self._scalar_readout_adapt[str(l)] = nn.Linear(combined_channels, scalar_channels, bias=False)
-        self.weighted_sum = RobustScalarWeightedSum(17, init_weights="zero")
+        self.combined_channels = combined_channels
+        if self.save_readout_mode == "elementwise-scalar":
+            # product3-style scalar readout:
+            #   F (combined interaction features) -> elementwise self product,
+            #   filtered to 0e only.
+            # HarmonicElementwiseProduct(..., irreps_out="0e") returns one scalar
+            # per channel for each l block, i.e. combined_channels * (lmax+1).
+            scalar_channels = combined_channels * (self.lmax + 1)
+            self.scalar_channels = scalar_channels
+            self.product_3 = HarmonicElementwiseProduct(
+                lmax=self.lmax,
+                mul=combined_channels,
+                irreps_out="0e",
+                internal_compute_dtype=internal_compute_dtype,
+            )
+            self.multiple_contraction = None
+            self.multiple_contraction_last = None
+            self.multiple_contraction_mix = None
+            self.multiple_contract_fuse = None
+            self.product5_feature_blocks = self.num_interaction
+        else:
+            self.scalar_channels = 0
+            self.product_3 = None
+            self.multiple_contraction = None
+            self.multiple_contraction_last = MultipleContractionSO3(
+                in_channels=self.channels,
+                hidden_channels=self.channels,
+                lmax=self.lmax,
+                correlation=self.save_contraction_order,
+                ictd_tp_path_policy=ictd_tp_path_policy,
+                ictd_tp_max_rank_other=ictd_tp_max_rank_other,
+                internal_compute_dtype=internal_compute_dtype,
+                ictd_tp_backend=ictd_tp_backend,
+            )
+            self.multiple_contraction_mix = MultipleContractionSO3(
+                in_channels=combined_channels,
+                hidden_channels=self.channels,
+                lmax=self.lmax,
+                correlation=self.save_contraction_order,
+                ictd_tp_path_policy=ictd_tp_path_policy,
+                ictd_tp_max_rank_other=ictd_tp_max_rank_other,
+                internal_compute_dtype=internal_compute_dtype,
+                ictd_tp_backend=ictd_tp_backend,
+            )
+            self.multiple_contract_fuse = EquivariantChannelLinearSO3Rect(
+                2 * self.channels, self.channels, self.lmax, bias=False
+            )
+            self.product5_feature_blocks = self.num_interaction + 1
         # Match e3nn-style product_5:
         # T = cat([f1..fn, scalars]); ElementwiseTensorProduct(T,T)->0e
         if product5_muls_by_l is None:
@@ -906,6 +1075,11 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                     raise ValueError(f"product5_muls_by_l missing l={l} (must cover 0..lmax)")
                 if self.product5_muls_by_l[l] <= 0:
                     raise ValueError(f"product5_muls_by_l[{l}] must be positive, got {self.product5_muls_by_l[l]}")
+        self._p5_base_mul = self.product5_muls_by_l[0]
+        if any(self.product5_muls_by_l[l] != self._p5_base_mul for l in range(self.lmax + 1)):
+            raise ValueError(
+                "PureCartesianICTDTransformerLayer currently requires uniform product5_muls_by_l across l"
+            )
 
         # Optional per-l channel adapters for f1..fn to match desired muls_by_l.
         self._p5_adapt = nn.ModuleList()
@@ -918,19 +1092,32 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 else:
                     layer_adapt[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
             self._p5_adapt.append(layer_adapt)
+        self._p5_contract_adapt = nn.ModuleDict()
+        if self.save_readout_mode == "mace-contraction":
+            for l in range(self.lmax + 1):
+                out_ch = self.product5_muls_by_l[l]
+                if out_ch == self.channels:
+                    self._p5_contract_adapt[str(l)] = nn.Identity()
+                else:
+                    self._p5_contract_adapt[str(l)] = nn.Linear(self.channels, out_ch, bias=False)
         # HarmonicElementwiseProduct replaces manual _irreps_elementwise_tensor_product_0e.
         self.product_5 = HarmonicElementwiseProduct(
             lmax=self.lmax,
-            mul=combined_channels,
+            mul=self.product5_feature_blocks * self._p5_base_mul,
             irreps_out="0e",
             internal_compute_dtype=internal_compute_dtype,
         )
 
         sum_mul = sum(self.product5_muls_by_l[l] for l in range(self.lmax + 1))
-        self.proj_total = MainNet(self.num_interaction * sum_mul + scalar_channels, embed_size, 17)
+        if self.save_readout_mode == "elementwise-scalar":
+            proj_in_dim = self.num_interaction * sum_mul + self.scalar_channels
+        else:
+            proj_in_dim = self.product5_feature_blocks * sum_mul
+        self.proj_total = MainNet(proj_in_dim, embed_size, 1)
+        self.weighted_sum = None
         configure_long_range_modules(
             self,
-            feature_dim=self.num_interaction * sum_mul + scalar_channels,
+            feature_dim=proj_in_dim,
             cutoff_radius=self.max_radius,
             long_range_mode=long_range_mode,
             long_range_hidden_dim=long_range_hidden_dim,
@@ -1009,6 +1196,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             edge_vec = pos[edge_dst] - pos[edge_src] + shift_vecs
         edge_length = edge_vec.norm(dim=1)
         n = edge_vec / edge_length.clamp(min=1e-8).unsqueeze(-1)
+        edge_mask = (edge_length <= self.max_radius).to(dtype=pos.dtype).unsqueeze(-1)
 
         # conv1
         # compute Y_l once and reuse
@@ -1019,13 +1207,13 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             precomputed_edge_length=edge_length,
             precomputed_Y_list=Y_list,
         )  # (N, C*(lmax+1)^2)
+        f1 = self.post_conv_linears[0](f1)
         if sync_after_scatter is not None:
             f1 = sync_after_scatter(f1)
         features = [f1]
 
-        # conv2..convN: node irreps x edge Y_l -> node irreps (channelwise); scatter_sum then / avg_num_neighbors
+        # conv2..convN: node irreps x edge Y_l -> node irreps; scatter_sum then / per-node neighbor count
         num_nodes = pos.size(0)
-        avg_num_neighbors = float(edge_src.numel()) / float(max(num_nodes, 1))
         emb_base = soft_one_hot_linspace(
             edge_length,
             0.0,
@@ -1034,54 +1222,62 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             basis=self.function_type,
             cutoff=True,
         ).mul(self.number_of_basis ** 0.5)
-        for tp2, fc2 in zip(self.tp2_layers, self.fc2_layers):
+        neighbor_count = scatter(
+            torch.ones_like(edge_dst, dtype=f1.dtype),
+            edge_dst,
+            dim=0,
+            dim_size=num_nodes,
+            reduce="sum",
+        ).clamp(min=1.0)
+        for layer_idx, (tp2, fc2) in enumerate(zip(self.tp2_layers, self.fc2_layers), start=1):
             f_prev = features[-1]
             emb = emb_base.to(dtype=f_prev.dtype)
             gates = fc2(emb)
 
             Y = {l: Y_list[l].to(dtype=f_prev.dtype).unsqueeze(-2) for l in range(self.lmax + 1)}  # (E,1,2l+1)
             x1 = _split_irreps(f_prev, self.channels, self.lmax)
-            x1e = {l: x1[l].index_select(0, edge_src) for l in range(self.lmax + 1)}
+            x1e = {l: x1[l][edge_src] for l in range(self.lmax + 1)}
             edge_blocks = tp2(x1e, Y, gates)  # dict l -> (E, C, 2l+1)
             edge_flat = _merge_irreps(edge_blocks, self.channels, self.lmax)
-            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes, reduce="sum") / max(avg_num_neighbors, 1e-8)
+            edge_flat = edge_flat * edge_mask.to(dtype=edge_flat.dtype)
+            f_next = scatter(edge_flat, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
+            f_next = f_next / neighbor_count.to(dtype=edge_flat.dtype).sqrt().unsqueeze(-1)
+            f_next = self.post_conv_linears[layer_idx](f_next)
             if sync_after_scatter is not None:
                 f_next = sync_after_scatter(f_next)
             features.append(f_next)
 
         f_combine = torch.cat(features, dim=-1)  # (N, nC*(lmax+1)^2)
 
-        xb = _split_irreps(f_combine, self.channels * self.num_interaction, self.lmax)
-        scalars = torch.zeros(
-            f_combine.shape[0],
-            (self.num_interaction - 1) * self.invariant_channels,
-            device=f_combine.device,
-            dtype=f_combine.dtype,
-        )
-        for l in range(self.lmax + 1):
-            t = xb[l]  # (N,nC,2l+1)
-            t = _apply_channel_adapter_per_l(t, self._scalar_readout_adapt[str(l)])
-            # e3nn-style component normalization: divide by sqrt(2l+1)
-            scalars = scalars + (t * t).sum(dim=-1) / math.sqrt(2 * l + 1)
+        if self.save_readout_mode == "elementwise-scalar":
+            xb = _split_irreps(f_combine, self.channels * self.num_interaction, self.lmax)
+            scalars = self.product_3(xb, xb)
+            combined_features = f_combine
+        else:
+            g_last = self.multiple_contraction_last(features[-1])
+            mix_inputs = torch.cat(features[:-1] + [g_last], dim=-1)
+            g_mix = self.multiple_contraction_mix(mix_inputs)
+            fused_input = torch.cat([g_last, g_mix], dim=-1)
+            f_contract = self.multiple_contract_fuse(fused_input)
+            contract_blocks = _split_irreps(f_contract, self.channels, self.lmax)
+            combined_features = torch.cat(features + [f_contract], dim=-1)
 
         # Build T = cat(features, scalars) per l, then product_5(T, T) → 0e.
         # Scalars are appended to the l=0 block so they also go through normalized EWP.
-        all_identity = all(
-            isinstance(self._p5_adapt[i][str(l)], nn.Identity)
-            for i in range(self.num_interaction)
-            for l in range(self.lmax + 1)
-        )
         splits = [_split_irreps(f, self.channels, self.lmax) for f in features]
         T_blocks: dict[int, torch.Tensor] = {}
         for l in range(self.lmax + 1):
             parts = []
             for i in range(len(features)):
-                b_l = splits[i][l]
-                if not all_identity:
-                    b_l = _apply_channel_adapter_per_l(b_l, self._p5_adapt[i][str(l)])
+                b_l = apply_channel_adapter_per_l(splits[i][l], self._p5_adapt[i][str(l)])
                 parts.append(b_l)
             T_blocks[l] = torch.cat(parts, dim=-2)
-        T_blocks[0] = torch.cat([T_blocks[0], scalars.unsqueeze(-1)], dim=-2)
+        if self.save_readout_mode == "elementwise-scalar":
+            T_blocks[0] = torch.cat([T_blocks[0], scalars.unsqueeze(-1)], dim=-2)
+        else:
+            for l in range(self.lmax + 1):
+                c_l = apply_channel_adapter_per_l(contract_blocks[l], self._p5_contract_adapt[str(l)])
+                T_blocks[l] = torch.cat([T_blocks[l], c_l], dim=-2)
         f_prod5 = self.product_5(T_blocks, T_blocks)
         f_prod5, long_range_energy, reciprocal_source, defer_long_range_to_runtime = apply_long_range_modules(
             self,
@@ -1094,8 +1290,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             return_reciprocal_source=return_reciprocal_source,
         )
 
-        product_proj = self.proj_total(f_prod5)
-        e_out = self.weighted_sum(product_proj)
+        e_out = self.proj_total(f_prod5)
         out = e_out.sum(dim=-1, keepdim=True)
         if long_range_energy is not None and not defer_long_range_to_runtime:
             out = out + long_range_energy
@@ -1103,8 +1298,8 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             if return_reciprocal_source:
                 if reciprocal_source is None:
                     reciprocal_source = out.new_empty((out.size(0), 0))
-                return out, f_combine, reciprocal_source
-            return out, f_combine
+                return out, combined_features, reciprocal_source
+            return out, combined_features
         if return_reciprocal_source:
             if reciprocal_source is None:
                 reciprocal_source = out.new_empty((out.size(0), 0))
