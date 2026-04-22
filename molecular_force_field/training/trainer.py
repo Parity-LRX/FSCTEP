@@ -2259,45 +2259,8 @@ class Trainer:
             df = pd.DataFrame(self.loss_records)
             df.to_csv(self.loss_csv_path, index=False)
             
-            # Save model (only save e3trans as MainNet is not used in inference)
-            # Extract state_dict from DDP model if needed
-            if self.distributed:
-                e3trans_state_dict = self.e3trans.module.state_dict()
-            else:
-                e3trans_state_dict = self.e3trans.state_dict()
-            
-            checkpoint_dict = {
-                'e3trans_state_dict': e3trans_state_dict,
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'optimizer_lrs': [pg.get('lr', None) for pg in self.optimizer.param_groups],
-                'a': self.a,
-                'b': self.b,
-                'c': self.c,
-                'batch_count': self.batch_count,
-                'epoch': epoch,
-                'best_val_loss': self.best_val_loss,
-                'patience_counter': self.patience_counter,
-                'swa_applied': self.swa_applied,
-                'ema_enabled': self.ema_enabled,
-                'tensor_product_mode': self.tensor_product_mode,
-                'inference_output_physical_tensors': self.inference_output_physical_tensors,
-                'physical_tensor_weights': self.physical_tensor_weights,
-                'fidelity_loss_weights': self.fidelity_loss_weights,
-                'delta_regularization_weight': self.delta_regularization_weight,
-                'atomic_energy_keys': self.keys.detach().cpu(),
-                'atomic_energy_values': self.values.detach().cpu(),
-            }
-            checkpoint_dict.update(self.e3_arch_metadata)
-            if self.config is not None:
-                checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
-
-            if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
-                checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
-
-            # Add tensor product mode suffix to checkpoint filename
-            base_filename = f'combined_model_epoch{epoch}_batch_count{self.batch_count}'
-            checkpoint_filename = f'{base_filename}{self.tensor_product_suffix}.pth'
-            checkpoint_filepath = os.path.join(self.checkpoint_dir, checkpoint_filename)
+            checkpoint_dict = self._build_checkpoint_dict(epoch=epoch, include_scheduler=True)
+            checkpoint_filepath = self._epoch_checkpoint_filepath(epoch=epoch)
             torch.save(checkpoint_dict, checkpoint_filepath)
 
         if self.distributed:
@@ -2305,6 +2268,60 @@ class Trainer:
 
         self.model.train()
         self.e3trans.train()
+
+    def _current_e3trans_state_dict(self):
+        if self.distributed:
+            return self.e3trans.module.state_dict()
+        return self.e3trans.state_dict()
+
+    def _build_checkpoint_dict(self, epoch, include_scheduler=True):
+        checkpoint_dict = {
+            'e3trans_state_dict': self._current_e3trans_state_dict(),
+            'optimizer_lrs': [pg.get('lr', None) for pg in self.optimizer.param_groups],
+            'a': self.a,
+            'b': self.b,
+            'c': self.c,
+            'batch_count': self.batch_count,
+            'epoch': epoch,
+            'best_val_loss': self.best_val_loss,
+            'patience_counter': self.patience_counter,
+            'swa_applied': self.swa_applied,
+            'ema_enabled': self.ema_enabled,
+            'tensor_product_mode': self.tensor_product_mode,
+            'inference_output_physical_tensors': self.inference_output_physical_tensors,
+            'physical_tensor_weights': self.physical_tensor_weights,
+            'fidelity_loss_weights': self.fidelity_loss_weights,
+            'delta_regularization_weight': self.delta_regularization_weight,
+            'atomic_energy_keys': self.keys.detach().cpu(),
+            'atomic_energy_values': self.values.detach().cpu(),
+        }
+        if include_scheduler:
+            checkpoint_dict['scheduler_state_dict'] = self.scheduler.state_dict()
+        checkpoint_dict.update(self.e3_arch_metadata)
+        if self.config is not None:
+            checkpoint_dict['max_radius'] = getattr(self.config, 'max_radius', 5.0)
+        if self.save_ema_model and self.ema_enabled and self.e3trans_ema is not None:
+            checkpoint_dict['e3trans_ema_state_dict'] = self.e3trans_ema.state_dict()
+        return checkpoint_dict
+
+    def _epoch_checkpoint_filepath(self, epoch, batch_count=None):
+        if batch_count is None:
+            batch_count = self.batch_count
+        base_filename = f'combined_model_epoch{epoch}_batch_count{batch_count}'
+        checkpoint_filename = f'{base_filename}{self.tensor_product_suffix}.pth'
+        return os.path.join(self.checkpoint_dir, checkpoint_filename)
+
+    def _save_epoch0_checkpoint(self):
+        if not self.is_main_process:
+            return
+        if self.resumed_from_checkpoint or self.start_epoch != 1 or self.batch_count != 0:
+            return
+        checkpoint_filepath = self._epoch_checkpoint_filepath(epoch=0, batch_count=0)
+        if os.path.exists(checkpoint_filepath):
+            logging.info(f"Epoch 0 checkpoint already exists, skipping save: {checkpoint_filepath}")
+            return
+        logging.info(f"Saving epoch 0 checkpoint to: {checkpoint_filepath}")
+        torch.save(self._build_checkpoint_dict(epoch=0, include_scheduler=True), checkpoint_filepath)
 
     def compute_full_train_metrics(self, epoch):
         """Run a full pass (or sampled pass) over the training set to compute accurate train loss."""
@@ -2647,6 +2664,10 @@ class Trainer:
                 logging.info(f"Model is already at epoch {self.start_epoch - 1}")
                 logging.info("No further training needed.")
             return
+
+        self._save_epoch0_checkpoint()
+        if self.distributed:
+            dist.barrier()
         
         last_epoch = self.start_epoch - 1  # Track the last completed epoch
         for epoch in range(self.start_epoch, self.epoch_numbers + 1):

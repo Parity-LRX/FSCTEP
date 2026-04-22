@@ -8,11 +8,12 @@ import torch.nn.functional as F
 class MainNet(nn.Module):
     """Main MLP network with layer normalization and SiLU activation."""
     
-    def __init__(self, input_size, hidden_sizes, output_size):
+    def __init__(self, input_size, hidden_sizes, output_size, output_init_std=0.01):
         super(MainNet, self).__init__()
         self.layers = nn.ModuleList()
         self.layer_norms = nn.ModuleList()
         self.input_norm = nn.LayerNorm(input_size)
+        self.output_init_std = float(output_init_std)
         
         # Build hidden layers
         # Input layer to first hidden layer
@@ -43,7 +44,7 @@ class MainNet(nn.Module):
                 # Check if current layer is output layer
                 if m == self.output:
                     # Output layer: initialize with small values
-                    torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                    torch.nn.init.normal_(m.weight, mean=0.0, std=self.output_init_std)
                     if m.bias is not None:
                         torch.nn.init.zeros_(m.bias)
                 else:

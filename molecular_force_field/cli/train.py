@@ -2068,7 +2068,7 @@ def main():
                 "  save_readout_mode=mace-contraction, "
                 f"order={args.ictd_save_contraction_order}, "
                 f"fusion_scheme={args.ictd_save_multiple_fusion_scheme}, "
-                f"mix_channels={args.ictd_save_multiple_mix_channels or config.channel_in}"
+                f"mix_channels={args.ictd_save_multiple_mix_channels or config.channel_in}, "
             )
         e3trans = PureCartesianICTDTransformerLayer(
             max_embed_radius=config.max_radius,

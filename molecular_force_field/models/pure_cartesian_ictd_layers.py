@@ -65,6 +65,29 @@ def _merge_irreps(blocks: dict[int, torch.Tensor], channels: int, lmax: int) -> 
     return torch.cat(parts, dim=-1)
 
 
+class EquivariantScalarReadoutSO3(nn.Module):
+    """
+    Strictly equivariant linear readout to 0e from a flattened SO(3) feature.
+
+    A linear SO(3)-equivariant map to 0e can only act on the l=0 block, so this
+    head extracts the scalar block and mixes channels linearly to produce one
+    scalar per node.
+    """
+
+    def __init__(self, channels: int, lmax: int, output_init_std: float = 0.003):
+        super().__init__()
+        self.channels = int(channels)
+        self.lmax = int(lmax)
+        self.readout = nn.Linear(self.channels, 1, bias=True)
+        nn.init.normal_(self.readout.weight, mean=0.0, std=float(output_init_std))
+        nn.init.zeros_(self.readout.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = _split_irreps(x, self.channels, self.lmax)
+        scalar_block = blocks[0].squeeze(-1)  # (..., C)
+        return self.readout(scalar_block)
+
+
 def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
     return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
 
@@ -863,6 +886,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         self.save_multiple_mix_channels = (
             self.channels if save_multiple_mix_channels is None else int(save_multiple_mix_channels)
         )
+        self.g_last_gate = None
         if self.save_readout_mode not in {"elementwise-scalar", "mace-contraction"}:
             raise ValueError(
                 f"save_readout_mode must be 'elementwise-scalar' or 'mace-contraction', got {self.save_readout_mode!r}"
@@ -885,7 +909,6 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             raise ValueError(
                 f"save_multiple_mix_channels must be >= 1, got {self.save_multiple_mix_channels}"
             )
-
         self.max_radius = float(max_embed_radius)
         self.number_of_basis = int(main_number_of_basis)
         self.function_type = str(function_type_main)
@@ -994,6 +1017,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
                 self.lmax,
                 bias=False,
             )
+            self.g_last_gate = nn.Parameter(torch.tensor(0.2, dtype=torch.get_default_dtype()))
             self.product5_feature_blocks = self.num_interaction + 1
         # Match e3nn-style product_5:
         # T = cat([f1..fn, scalars]); ElementwiseTensorProduct(T,T)->0e
@@ -1045,7 +1069,13 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             proj_in_dim = self.num_interaction * sum_mul + self.scalar_channels
         else:
             proj_in_dim = self.product5_feature_blocks * sum_mul
-        self.proj_total = MainNet(proj_in_dim, embed_size, 1)
+        self.proj_total = MainNet(proj_in_dim, embed_size, 1, output_init_std=0.003)
+        self.layer_energy_readouts = nn.ModuleList(
+            [EquivariantScalarReadoutSO3(self.channels, self.lmax, output_init_std=0.003) for _ in range(self.num_interaction)]
+        )
+        self.layer_energy_gates = nn.Parameter(
+            0.1 * torch.ones(self.num_interaction, dtype=torch.get_default_dtype())
+        )
         self.weighted_sum = None
         configure_long_range_modules(
             self,
@@ -1186,7 +1216,7 @@ class PureCartesianICTDTransformerLayer(nn.Module):
             scalars = self.product_3(xb, xb)
             combined_features = f_combine
         else:
-            g_last = self.multiple_contraction_last(features[-1])
+            g_last = self.g_last_gate * self.multiple_contraction_last(features[-1])
             mix_inputs = torch.cat(features[:-1] + [g_last], dim=-1)
             g_mix = self.multiple_contraction_mix(mix_inputs)
             fused_input = torch.cat([g_last, g_mix], dim=-1)
@@ -1223,6 +1253,12 @@ class PureCartesianICTDTransformerLayer(nn.Module):
         )
 
         e_out = self.proj_total(f_prod5)
+        aux_energy = None
+        for idx, (readout, feat) in enumerate(zip(self.layer_energy_readouts, features)):
+            e_layer = self.layer_energy_gates[idx] * readout(feat)
+            aux_energy = e_layer if aux_energy is None else (aux_energy + e_layer)
+        if aux_energy is not None:
+            e_out = e_out + aux_energy
         out = e_out.sum(dim=-1, keepdim=True)
         if long_range_energy is not None and not defer_long_range_to_runtime:
             out = out + long_range_energy
