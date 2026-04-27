@@ -37,6 +37,18 @@ from molecular_force_field.models.pure_cartesian_layers import (
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     PureCartesianICTDTransformerLayer,
 )
+from molecular_force_field.models.pure_cartesian_ictd_fix import (
+    PureCartesianICTDFix,
+)
+from molecular_force_field.models.spherical_fix import (
+    SphericalFix,
+)
+from molecular_force_field.models.pure_cartesian_ictd_layers_nocross import (
+    PureCartesianICTDTransformerLayerNoCrossFusion,
+)
+from molecular_force_field.models.pure_cartesian_ictd_layers_noshallowreadout import (
+    PureCartesianICTDTransformerLayerNoShallowReadout,
+)
 try:
     from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import (
         PureCartesianICTDO3TransformerLayer,
@@ -51,6 +63,24 @@ try:
     )
 except ImportError:  # pragma: no cover
     PureCartesianICTDSaveO3TransformerLayer = None  # type: ignore[assignment]
+try:
+    from molecular_force_field.models.pure_cartesian_ictd_layers_so2 import (
+        PureCartesianICTDSO2TransformerLayer,
+    )
+except ImportError:  # pragma: no cover
+    PureCartesianICTDSO2TransformerLayer = None  # type: ignore[assignment]
+try:
+    from molecular_force_field.models.pure_cartesian_ictd_layers_o2 import (
+        PureCartesianICTDO2TransformerLayer,
+    )
+except ImportError:  # pragma: no cover
+    PureCartesianICTDO2TransformerLayer = None  # type: ignore[assignment]
+try:
+    from molecular_force_field.models.pure_cartesian_ictd_layers_node_so2 import (
+        PureCartesianICTDNodeSO2TransformerLayer,
+    )
+except ImportError:  # pragma: no cover
+    PureCartesianICTDNodeSO2TransformerLayer = None  # type: ignore[assignment]
 from molecular_force_field.models.pure_cartesian_sparse_layers import (
     PureCartesianSparseTransformerLayer,
 )
@@ -84,6 +114,10 @@ __all__ = [
     "EquivariantTensorProduct",
     "PureCartesianTransformerLayer",
     "PureCartesianICTDTransformerLayer",
+    "PureCartesianICTDFix",
+    "SphericalFix",
+    "PureCartesianICTDTransformerLayerNoCrossFusion",
+    "PureCartesianICTDTransformerLayerNoShallowReadout",
     "PureCartesianSparseTransformerLayer",
     "PureCartesianSparseTransformerLayerSave",
     "weighted_mse_loss_stats",
@@ -105,3 +139,9 @@ if PureCartesianICTDFullO3TransformerLayer is not None:
     __all__.append("PureCartesianICTDFullO3TransformerLayer")
 if PureCartesianICTDSaveO3TransformerLayer is not None:
     __all__.append("PureCartesianICTDSaveO3TransformerLayer")
+if PureCartesianICTDSO2TransformerLayer is not None:
+    __all__.append("PureCartesianICTDSO2TransformerLayer")
+if PureCartesianICTDO2TransformerLayer is not None:
+    __all__.append("PureCartesianICTDO2TransformerLayer")
+if PureCartesianICTDNodeSO2TransformerLayer is not None:
+    __all__.append("PureCartesianICTDNodeSO2TransformerLayer")

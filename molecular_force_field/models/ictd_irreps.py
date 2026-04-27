@@ -80,6 +80,74 @@ def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) 
     return torch.get_default_dtype() if internal_compute_dtype is None else internal_compute_dtype
 
 
+def _resolve_irrep_normalization(
+    irrep_normalization: str | None,
+    legacy_normalization: str | None,
+) -> str:
+    value = irrep_normalization if irrep_normalization is not None else legacy_normalization
+    value = "component" if value is None else str(value)
+    if value not in ("component", "norm", "none"):
+        raise ValueError(
+            "irrep_normalization/normalization must be one of "
+            f"'component', 'norm', or 'none', got {value!r}"
+        )
+    return value
+
+
+def _resolve_path_normalization(path_normalization: str | None) -> str:
+    value = "element" if path_normalization is None else str(path_normalization)
+    if value not in ("element", "path", "none"):
+        raise ValueError(
+            "path_normalization must be one of 'element', 'path', or 'none', "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _path_normalization_scales(
+    paths: List[Tuple[int, ...]],
+    *,
+    output_key_index: int | Tuple[int, ...],
+    num_elements: float,
+    path_normalization: str,
+) -> List[float]:
+    """e3nn-style path normalization, separate from irrep/CG normalization."""
+    if path_normalization == "none":
+        return [1.0 for _ in paths]
+    if isinstance(output_key_index, int):
+        def out_key(path: Tuple[int, ...]) -> Tuple[int, ...]:
+            return (int(path[output_key_index]),)
+    else:
+        def out_key(path: Tuple[int, ...]) -> Tuple[int, ...]:
+            return tuple(int(path[i]) for i in output_key_index)
+
+    count_by_out: Dict[Tuple[int, ...], int] = {}
+    element_sum_by_out: Dict[Tuple[int, ...], float] = {}
+    for path in paths:
+        key = out_key(path)
+        count_by_out[key] = count_by_out.get(key, 0) + 1
+        element_sum_by_out[key] = element_sum_by_out.get(key, 0.0) + float(num_elements)
+
+    scales: List[float] = []
+    for path in paths:
+        key = out_key(path)
+        if path_normalization == "element":
+            denom = element_sum_by_out[key]
+        else:
+            denom = float(num_elements) * float(count_by_out[key])
+        scales.append(1.0 / math.sqrt(denom) if denom > 1e-30 else 1.0)
+    return scales
+
+
+def _apply_cg_normalization(C: torch.Tensor, l_out: int, irrep_normalization: str) -> torch.Tensor:
+    C_fn = C.norm().item()
+    if irrep_normalization == "component" and C_fn > 1e-30:
+        return C * (math.sqrt(2 * int(l_out) + 1) / C_fn)
+    if irrep_normalization == "norm" and C_fn > 1e-30:
+        return C * (1.0 / C_fn)
+    return C
+
+
 def split_flat_irreps_so3(x: torch.Tensor, channels: int, lmax: int) -> Dict[int, torch.Tensor]:
     """
     Split a flattened SO(3) irreps layout into per-l blocks.
@@ -536,6 +604,24 @@ def _gaussian_moment(n: int) -> float:
     return float(_double_factorial(n - 1))
 
 
+def _sphere_monomial_moment_3d(a: int, b: int, c: int) -> float:
+    """Moment E[x^a y^b z^c] for a uniform unit vector on S^2."""
+    a = int(a)
+    b = int(b)
+    c = int(c)
+    if (a % 2) or (b % 2) or (c % 2):
+        return 0.0
+    p = a // 2
+    q = b // 2
+    r = c // 2
+    return float(
+        _double_factorial(2 * p - 1)
+        * _double_factorial(2 * q - 1)
+        * _double_factorial(2 * r - 1)
+        / _double_factorial(2 * (p + q + r) + 1)
+    )
+
+
 @lru_cache(maxsize=None)
 def _gram_gaussian(L: int) -> torch.Tensor:
     """
@@ -692,7 +778,7 @@ def direction_harmonics(n: torch.Tensor, l: int) -> torch.Tensor:
     # coords under Gram: c = B^T G t
     G = _gram_gaussian(l).to(device=n.device, dtype=n.dtype)  # (Dsym, Dsym)
     c = torch.einsum("...d,md,mc->...c", t, G, B)
-    return c
+    return c * _direction_component_scale_cpu_f64(l)
 
 
 @lru_cache(maxsize=None)
@@ -729,9 +815,41 @@ def _dir_proj_cpu_f64(l: int) -> torch.Tensor:
     return (G @ B).contiguous()  # (Dsym, 2l+1)
 
 
+@lru_cache(maxsize=None)
+def _direction_component_scale_cpu_f64(l: int) -> float:
+    """
+    Scale ICTD direction harmonics to e3nn's component normalization.
+
+    The ICTD harmonic basis is orthonormal under isotropic Gaussian polynomial
+    moments. MACE/e3nn edge spherical harmonics use component normalization,
+    i.e. each component has RMS 1 over directions on the unit sphere.
+    """
+    l = int(l)
+    if l == 0:
+        return 1.0
+    counts = _counts_list(l)
+    coefs = [
+        math.factorial(l) / (math.factorial(a) * math.factorial(b) * math.factorial(c))
+        for a, b, c in counts
+    ]
+    d = len(counts)
+    sphere_gram = torch.zeros(d, d, dtype=torch.float64)
+    for i, (a, b, c) in enumerate(counts):
+        for j, (a2, b2, c2) in enumerate(counts):
+            sphere_gram[i, j] = (
+                float(coefs[i])
+                * float(coefs[j])
+                * _sphere_monomial_moment_3d(a + a2, b + b2, c + c2)
+            )
+    P = _dir_proj_cpu_f64(l)
+    mean_square = torch.trace(P.T @ sphere_gram @ P) / float(2 * l + 1)
+    return float(mean_square.clamp_min(1e-30).rsqrt().item())
+
+
 _dir_proj_cache_by_dev_dtype: Dict[Tuple[str, str, int], torch.Tensor] = {}
 _dir_exps_cache_by_dev: Dict[Tuple[str, int], torch.Tensor] = {}
 _dir_coefs_cache_by_dev_dtype: Dict[Tuple[str, str, int], torch.Tensor] = {}
+_dir_component_scale_cache_by_dev_dtype: Dict[Tuple[str, str, int], torch.Tensor] = {}
 
 
 def _integer_power_table(x: torch.Tensor, max_power: int) -> torch.Tensor:
@@ -802,8 +920,17 @@ def direction_harmonics_fast(n: torch.Tensor, l: int) -> torch.Tensor:
     # (..., Dsym) with integer-power lookup instead of generic pow backward
     t = x_pows[..., a] * y_pows[..., b] * z_pows[..., c]
     t = t * coefs
+    scale_key = (str(n.device), str(n.dtype), int(l))
+    scale = _dir_component_scale_cache_by_dev_dtype.get(scale_key)
+    if scale is None:
+        scale = torch.tensor(
+            _direction_component_scale_cpu_f64(l),
+            device=n.device,
+            dtype=n.dtype,
+        )
+        _dir_component_scale_cache_by_dev_dtype[scale_key] = scale
     # (..., 2l+1)
-    return t @ P
+    return (t @ P) * scale
 
 
 def parity_letter_to_sign(parity: str) -> int:
@@ -929,13 +1056,22 @@ def direction_harmonics_all(n: torch.Tensor, lmax: int) -> List[torch.Tensor]:
         if coefs is None:
             coefs = _dir_monomial_exps_coefs(l)[1].to(device=n.device, dtype=n.dtype)
             _dir_coefs_cache_by_dev_dtype[coefs_key] = coefs
+        scale_key = (dev_key, dtype_key, l)
+        scale = _dir_component_scale_cache_by_dev_dtype.get(scale_key)
+        if scale is None:
+            scale = torch.tensor(
+                _direction_component_scale_cpu_f64(l),
+                device=n.device,
+                dtype=n.dtype,
+            )
+            _dir_component_scale_cache_by_dev_dtype[scale_key] = scale
 
         a = exps[:, 0]
         b = exps[:, 1]
         c = exps[:, 2]
         t = x_pows[..., a] * y_pows[..., b] * z_pows[..., c]
         t = t * coefs
-        out.append(t @ P)
+        out.append((t @ P) * scale)
     return out
 
 
@@ -1026,6 +1162,93 @@ def build_cg_tensor(l1: int, l2: int, l3: int) -> torch.Tensor:
     return C.contiguous()
 
 
+@lru_cache(maxsize=None)
+def _monomial_rotation_generator_cpu_f64(L: int, axis: str) -> torch.Tensor:
+    """Infinitesimal SO(3) generator on degree-L monomial coefficients."""
+    counts = _counts_list(int(L))
+    idx = {t: i for i, t in enumerate(counts)}
+    out = torch.zeros(len(counts), len(counts), dtype=torch.float64)
+    for j, (a, b, c) in enumerate(counts):
+        terms: List[Tuple[float, Tuple[int, int, int]]] = []
+        if axis == "x":
+            if c:
+                terms.append((float(c), (a, b + 1, c - 1)))
+            if b:
+                terms.append((float(-b), (a, b - 1, c + 1)))
+        elif axis == "y":
+            if a:
+                terms.append((float(a), (a - 1, b, c + 1)))
+            if c:
+                terms.append((float(-c), (a + 1, b, c - 1)))
+        elif axis == "z":
+            if b:
+                terms.append((float(b), (a + 1, b - 1, c)))
+            if a:
+                terms.append((float(-a), (a - 1, b + 1, c)))
+        else:
+            raise ValueError(f"axis must be 'x', 'y', or 'z', got {axis!r}")
+        for coef, key in terms:
+            out[idx[key], j] += coef
+    return out
+
+
+@lru_cache(maxsize=None)
+def _harmonic_rotation_generator_cpu_f64(l: int, axis: str) -> torch.Tensor:
+    """Infinitesimal SO(3) generator in the ICTD harmonic basis."""
+    B = _harmonic_basis_t(int(l), dtype=torch.float64)
+    G = _gram_gaussian(int(l))
+    return (B.T @ G @ _monomial_rotation_generator_cpu_f64(int(l), str(axis)) @ B).contiguous()
+
+
+@lru_cache(maxsize=None)
+def build_full_cg_tensor_so3(l1: int, l2: int, l3: int) -> torch.Tensor:
+    """
+    Full SO(3) Clebsch-Gordan tensor in the ICTD harmonic basis.
+
+    `build_cg_tensor` comes from harmonic polynomial multiplication and therefore
+    only covers the natural-parity/symmetric paths where l1+l2+l3 is even. MACE's
+    higher-order contraction also uses intermediate irreps with independent O(3)
+    parity, which requires the full SO(3) tensor product, including antisymmetric
+    paths such as 1 x 1 -> 1. This routine constructs the unique intertwiner by
+    solving the infinitesimal equivariance equations in the ICTD basis, without
+    calling e3nn wigner/CG code.
+    """
+    l1 = int(l1)
+    l2 = int(l2)
+    l3 = int(l3)
+    if not (abs(l1 - l2) <= l3 <= l1 + l2):
+        return torch.zeros(2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1, dtype=torch.float64)
+
+    d1, d2, d3 = 2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1
+    n_unknown = d3 * d1 * d2
+    equations: List[torch.Tensor] = []
+    for axis in ("x", "y", "z"):
+        J1 = _harmonic_rotation_generator_cpu_f64(l1, axis)
+        J2 = _harmonic_rotation_generator_cpu_f64(l2, axis)
+        J3 = _harmonic_rotation_generator_cpu_f64(l3, axis)
+        Jin = torch.kron(J1, torch.eye(d2, dtype=torch.float64)) + torch.kron(
+            torch.eye(d1, dtype=torch.float64), J2
+        )
+        A = torch.zeros(d3 * d1 * d2, n_unknown, dtype=torch.float64)
+        col = 0
+        for q in range(d3):
+            for r in range(d1 * d2):
+                Cmat = torch.zeros(d3, d1 * d2, dtype=torch.float64)
+                Cmat[q, r] = 1.0
+                A[:, col] = (J3 @ Cmat - Cmat @ Jin).reshape(-1)
+                col += 1
+        equations.append(A)
+
+    A = torch.cat(equations, dim=0)
+    _, _, vh = torch.linalg.svd(A)
+    Cmat = vh[-1].reshape(d3, d1 * d2)
+    C = Cmat.T.reshape(d1, d2, d3).contiguous()
+    max_idx = int(C.abs().argmax().item())
+    if C.flatten()[max_idx] < 0:
+        C = -C
+    return C.contiguous()
+
+
 def cg_tensor_sparsity(C: torch.Tensor, threshold: float = 1e-10) -> Tuple[int, int, float]:
     """
     Return (numel, num_nonzero, zero_fraction) for an ICTD CG tensor.
@@ -1034,6 +1257,126 @@ def cg_tensor_sparsity(C: torch.Tensor, threshold: float = 1e-10) -> Tuple[int, 
     n = C.numel()
     nz = (C.abs() > threshold).sum().item()
     return n, nz, 1.0 - (nz / n)
+
+
+def _ictd_so3_coupled_basis(
+    *,
+    lmax: int,
+    correlation: int,
+    irrep_normalization: str = "component",
+    dtype: torch.dtype | None = None,
+) -> List[Tuple[int, int, torch.Tensor]]:
+    """
+    Build n-body SO(3) coupling basis tensors in the ICTD harmonic basis.
+
+    Returns a list of `(l_out, parity, tensor)` where tensor has shape
+    `(2*l_out+1, D, ..., D)` with `correlation` copies of the flattened
+    one-copy SO(3) input dimension `D = sum_l (2*l+1)`.
+    """
+    lmax = int(lmax)
+    correlation = int(correlation)
+    dtype = torch.float64 if dtype is None else dtype
+    if correlation < 1:
+        raise ValueError(f"correlation must be >= 1, got {correlation}")
+    dim = sum(2 * l + 1 for l in range(lmax + 1))
+    starts: Dict[int, int] = {}
+    offset = 0
+    for l in range(lmax + 1):
+        starts[l] = offset
+        offset += 2 * l + 1
+
+    basis: List[Tuple[int, int, torch.Tensor]] = []
+    eye = torch.eye(dim, dtype=dtype)
+    for l in range(lmax + 1):
+        start = starts[l]
+        stop = start + 2 * l + 1
+        basis.append((l, canonical_irrep_parity_sign(l), eye[start:stop]))
+    if correlation == 1:
+        return basis
+
+    for _order in range(2, correlation + 1):
+        next_basis: List[Tuple[int, int, torch.Tensor]] = []
+        for l_left, p_left, left_tensor in basis:
+            left_tensor = left_tensor.to(dtype=dtype)
+            for l_right in range(lmax + 1):
+                right_start = starts[l_right]
+                right_stop = right_start + 2 * l_right + 1
+                for l_out in range(abs(l_left - l_right), l_left + l_right + 1):
+                    p_out = int(p_left) * canonical_irrep_parity_sign(l_right)
+                    cg = build_full_cg_tensor_so3(l_left, l_right, l_out)
+                    cg = _apply_cg_normalization(cg, l_out, irrep_normalization).to(dtype=dtype)
+                    flat_left = left_tensor.reshape(2 * l_left + 1, -1)
+                    coupled = torch.einsum("ar,abq->qrb", flat_left, cg)
+                    full = torch.zeros(
+                        2 * l_out + 1,
+                        flat_left.shape[1],
+                        dim,
+                        dtype=dtype,
+                    )
+                    full[:, :, right_start:right_stop] = coupled
+                    full = full.reshape(2 * l_out + 1, *left_tensor.shape[1:], dim)
+                    next_basis.append((l_out, p_out, full))
+        basis = sorted(next_basis, key=lambda item: (item[0], item[1]))
+    return basis
+
+
+@lru_cache(maxsize=None)
+def _ictd_u_matrix_so3_cached(
+    lmax: int,
+    output_l: int,
+    correlation: int,
+    irrep_normalization: str,
+    dtype_name: str,
+) -> torch.Tensor:
+    if dtype_name == "float32":
+        dtype = torch.float32
+    elif dtype_name == "float64":
+        dtype = torch.float64
+    else:
+        raise ValueError(f"Unsupported cached dtype_name={dtype_name!r}")
+    basis = _ictd_so3_coupled_basis(
+        lmax=int(lmax),
+        correlation=int(correlation),
+        irrep_normalization=str(irrep_normalization),
+        dtype=dtype,
+    )
+    target_parity = canonical_irrep_parity_sign(int(output_l))
+    tensors = [
+        tensor
+        for l_out, parity, tensor in basis
+        if int(l_out) == int(output_l) and int(parity) == int(target_parity)
+    ]
+    if not tensors:
+        dim = sum(2 * l + 1 for l in range(int(lmax) + 1))
+        if int(output_l) == 0:
+            return torch.zeros(*([dim] * int(correlation)), 1, dtype=dtype)
+        return torch.zeros(2 * int(output_l) + 1, *([dim] * int(correlation)), 1, dtype=dtype)
+    if int(output_l) == 0:
+        tensors = [tensor.squeeze(0) for tensor in tensors]
+    return torch.stack(tensors, dim=-1).contiguous()
+
+
+def ictd_u_matrix_so3(
+    *,
+    lmax: int,
+    output_l: int,
+    correlation: int,
+    irrep_normalization: str = "component",
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """MACE-style symmetric-contraction U matrix generated purely from ICTD CG tensors."""
+    dtype = torch.get_default_dtype() if dtype is None else dtype
+    if dtype == torch.float64:
+        dtype_name = "float64"
+    else:
+        dtype_name = "float32"
+    return _ictd_u_matrix_so3_cached(
+        int(lmax),
+        int(output_l),
+        int(correlation),
+        str(irrep_normalization),
+        dtype_name,
+    ).to(dtype=dtype)
 
 
 class HarmonicElementwiseProduct(nn.Module):
@@ -1067,13 +1410,14 @@ class HarmonicElementwiseProduct(nn.Module):
         mul: int,
         irreps_out: str | None = "0e",
         normalization: str = "component",
+        irrep_normalization: str | None = None,
         internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.lmax = int(lmax)
         self.mul = int(mul)
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
-        self._normalization = normalization
+        self._normalization = _resolve_irrep_normalization(irrep_normalization, normalization)
         self._irreps_out = irreps_out.strip().lower() if (irreps_out and isinstance(irreps_out, str)) else "full"
         self._output_0e_only = self._irreps_out == "0e"
 
@@ -1098,11 +1442,7 @@ class HarmonicElementwiseProduct(nn.Module):
         self._cg_cache: List[torch.Tensor] = []
         for (l, l3) in self._paths:
             C = build_cg_tensor(l, l, l3)
-            C_fn = C.norm().item()
-            if normalization == "component" and C_fn > 1e-30:
-                C = C * (math.sqrt(2 * l3 + 1) / C_fn)
-            elif normalization == "norm" and C_fn > 1e-30:
-                C = C * (1.0 / C_fn)
+            C = _apply_cg_normalization(C, l3, self._normalization)
             self._cg_cache.append(C)
 
         # For the 0e fast path: precompute per-l scalar factor from the (diagonal)
@@ -1202,6 +1542,8 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         #   "norm": alpha = 1 / ||C||_F per path
         #   "none": raw CG tensors
         normalization: str = "component",
+        irrep_normalization: str | None = None,
+        path_normalization: str = "element",
         # Internal computation dtype for CG tensors and projections (default: float64 for stability)
         internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "pytorch",
@@ -1212,7 +1554,8 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
         self.mul_out = mul_out
         self.lmax = lmax
         self.internal_weights = internal_weights
-        self._normalization = normalization
+        self._normalization = _resolve_irrep_normalization(irrep_normalization, normalization)
+        self._path_normalization = _resolve_path_normalization(path_normalization)
         self._mul_path_scale = 1.0
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
         self.ictd_tp_backend = normalize_ictd_tp_backend(ictd_tp_backend)
@@ -1241,6 +1584,12 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
         self.num_paths = len(self.paths)
         self.weight_numel = self.num_paths * mul_out * mul_in1 * mul_in2
+        self._path_normalization_scales = _path_normalization_scales(
+            [tuple(p) for p in self.paths],
+            output_key_index=2,
+            num_elements=float(mul_in1 * mul_in2),
+            path_normalization=self._path_normalization,
+        )
 
         if internal_weights:
             # (P, mul_out, mul1, mul2)
@@ -1319,13 +1668,10 @@ class HarmonicFullyConnectedTensorProduct(nn.Module):
 
         if self._cg_cpu_f64 is None:
             self._cg_cpu_f64 = []
-            for (l1, l2, l3) in self.paths:
+            for path_idx, (l1, l2, l3) in enumerate(self.paths):
                 C = build_cg_tensor(l1, l2, l3)
-                C_fn = C.norm().item()
-                if self._normalization == "component" and C_fn > 1e-30:
-                    C = C * (math.sqrt(2 * l3 + 1) / C_fn)
-                elif self._normalization == "norm" and C_fn > 1e-30:
-                    C = C * (1.0 / C_fn)
+                C = _apply_cg_normalization(C, l3, self._normalization)
+                C = C * float(self._path_normalization_scales[path_idx])
                 self._cg_cpu_f64.append(C)
 
         cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
@@ -1797,12 +2143,15 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
         path_policy: str = "full",
         max_rank_other: int | None = None,
         normalization: str = "component",
+        irrep_normalization: str | None = None,
+        path_normalization: str = "element",
         internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.channels = int(channels)
         self.lmax = int(lmax)
-        self._normalization = normalization
+        self._normalization = _resolve_irrep_normalization(irrep_normalization, normalization)
+        self._path_normalization = _resolve_path_normalization(path_normalization)
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
 
         all_paths: List[Tuple[int, int, int]] = []
@@ -1827,6 +2176,12 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
                 raise ValueError(f"Unknown path_policy={path_policy!r}")
 
         self.num_paths = len(self.paths)
+        self._path_normalization_scales = _path_normalization_scales(
+            [tuple(p) for p in self.paths],
+            output_key_index=2,
+            num_elements=1.0,
+            path_normalization=self._path_normalization,
+        )
         self.weight = nn.Parameter(torch.randn(self.num_paths, self.channels) * 0.02)
 
         self._cg_cpu_f64: List[torch.Tensor] | None = None
@@ -1865,13 +2220,10 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
 
         if self._cg_cpu_f64 is None:
             self._cg_cpu_f64 = []
-            for (l1, l2, l3) in self.paths:
+            for path_idx, (l1, l2, l3) in enumerate(self.paths):
                 C = build_cg_tensor(l1, l2, l3)
-                C_fn = C.norm().item()
-                if self._normalization == "component" and C_fn > 1e-30:
-                    C = C * (math.sqrt(2 * l3 + 1) / C_fn)
-                elif self._normalization == "norm" and C_fn > 1e-30:
-                    C = C * (1.0 / C_fn)
+                C = _apply_cg_normalization(C, l3, self._normalization)
+                C = C * float(self._path_normalization_scales[path_idx])
                 self._cg_cpu_f64.append(C)
 
         cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
@@ -1908,12 +2260,79 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
         self,
         x1: Dict[int, torch.Tensor],
         x2: Dict[int, torch.Tensor],
+        path_channel_weights: torch.Tensor | None = None,
     ) -> Dict[int, torch.Tensor]:
         sample = next(iter(x1.values()))
         batch_shape = sample.shape[:-2]
         device = sample.device
         dtype = sample.dtype
         compute_dtype = self.internal_compute_dtype
+
+        out: Dict[int, torch.Tensor] = {
+            l: torch.zeros(*batch_shape, self.channels, 2 * l + 1, device=device, dtype=dtype)
+            for l in range(self.lmax + 1)
+        }
+
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        w = self.weight.to(device=device, dtype=compute_dtype)
+        if path_channel_weights is not None:
+            path_channel_weights = path_channel_weights.to(device=device, dtype=compute_dtype)
+
+        for g_idx, g in enumerate(self._groups):
+            l1 = int(g["l1"])
+            l2 = int(g["l2"])
+            segments = g["segments"]
+
+            a = x1.get(l1)
+            b = x2.get(l2)
+            if a is None or b is None:
+                continue
+
+            a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+            b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = proj_list[g_idx]
+
+            pair = (
+                a_comp.unsqueeze(-1) * b_comp.unsqueeze(-2)
+            ).reshape(*batch_shape, self.channels, m1 * m2)
+            y = torch.matmul(pair, U)
+            for p_idx, l3, s, e in segments:
+                seg = y[..., int(s): int(e)]
+                weight = w[int(p_idx)].view(*([1] * len(batch_shape)), self.channels, 1)
+                if path_channel_weights is not None:
+                    weight = weight * path_channel_weights[..., int(p_idx), :].unsqueeze(-1)
+                seg = seg * weight
+                seg = seg.to(dtype=dtype) if seg.dtype != dtype else seg
+                out[int(l3)] = out[int(l3)] + seg
+
+        return out
+
+
+class EdgeWeightedPathTensorProduct(HarmonicPathWeightedTensorProduct):
+    """
+    Thin message-passing tensor product with edge-dependent path gates.
+
+    This keeps the ICTD SO(3) path basis and path-weighted channel scaling from
+    `HarmonicPathWeightedTensorProduct`, while additionally accepting a
+    per-edge/per-sample gate tensor of shape `(..., num_paths)`.
+    """
+
+    def forward(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+        gates: torch.Tensor | None = None,
+    ) -> Dict[int, torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+
+        if gates is not None and (gates.device != device or gates.dtype != dtype):
+            gates = gates.to(device=device, dtype=dtype)
 
         out: Dict[int, torch.Tensor] = {
             l: torch.zeros(*batch_shape, self.channels, 2 * l + 1, device=device, dtype=dtype)
@@ -1947,7 +2366,102 @@ class HarmonicPathWeightedTensorProduct(nn.Module):
                 seg = y[..., int(s): int(e)]
                 seg = seg * w[int(p_idx)].view(*([1] * len(batch_shape)), self.channels, 1)
                 seg = seg.to(dtype=dtype) if seg.dtype != dtype else seg
+                if gates is not None:
+                    seg = seg * gates[..., int(p_idx)].unsqueeze(-1).unsqueeze(-1)
                 out[int(l3)] = out[int(l3)] + seg
+
+        return out
+
+
+class EdgeWeightedPathPreservingTensorProduct(EdgeWeightedPathTensorProduct):
+    """
+    Path-preserving ICTD SO(3) tensor product for MACE-style interactions.
+
+    The standard EdgeWeightedPathTensorProduct sums all paths that land in the
+    same output l. MACE/e3nn keeps each path as a separate multiplicity block
+    and only mixes them in the following equivariant linear. This class preserves
+    that layout while using the same ICTD CG/projector tensors as the compressed
+    variant.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        path_l3 = [0 for _ in range(self.num_paths)]
+        path_offset = [0 for _ in range(self.num_paths)]
+        counts = {l: 0 for l in range(self.lmax + 1)}
+        for group in self._groups:
+            for p_idx, l3, _s, _e in group["segments"]:
+                l3 = int(l3)
+                p_idx = int(p_idx)
+                path_l3[p_idx] = l3
+                path_offset[p_idx] = counts[l3]
+                counts[l3] += 1
+        self.path_l3 = path_l3
+        self.path_offset = path_offset
+        self.path_counts_by_l = counts
+
+    def forward(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+        gates: torch.Tensor | None = None,
+    ) -> Dict[int, torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+
+        if gates is not None:
+            if gates.device != device or gates.dtype != dtype:
+                gates = gates.to(device=device, dtype=dtype)
+            if gates.shape[-1] == self.num_paths * self.channels:
+                gates = gates.view(*gates.shape[:-1], self.num_paths, self.channels)
+            elif gates.shape[-2:] != (self.num_paths, self.channels):
+                raise ValueError(
+                    f"Expected gates shape (..., {self.num_paths * self.channels}) or "
+                    f"(..., {self.num_paths}, {self.channels}), got {tuple(gates.shape)}"
+                )
+
+        out: Dict[int, torch.Tensor] = {}
+        for l in range(self.lmax + 1):
+            out_channels_l = self.channels * int(self.path_counts_by_l.get(l, 0))
+            out[l] = torch.zeros(*batch_shape, out_channels_l, 2 * l + 1, device=device, dtype=dtype)
+
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        w = self.weight.to(device=device, dtype=compute_dtype)
+
+        for g_idx, group in enumerate(self._groups):
+            l1 = int(group["l1"])
+            l2 = int(group["l2"])
+            segments = group["segments"]
+
+            a = x1.get(l1)
+            b = x2.get(l2)
+            if a is None or b is None:
+                continue
+
+            a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+            b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            m1 = 2 * l1 + 1
+            m2 = 2 * l2 + 1
+            U = proj_list[g_idx]
+
+            pair = (a_comp.unsqueeze(-1) * b_comp.unsqueeze(-2)).reshape(
+                *batch_shape, self.channels, m1 * m2
+            )
+            y = torch.matmul(pair, U)
+            for p_idx, l3, s, e in segments:
+                p_idx = int(p_idx)
+                l3 = int(l3)
+                seg = y[..., int(s) : int(e)]
+                seg = seg * w[p_idx].view(*([1] * len(batch_shape)), self.channels, 1)
+                if gates is not None:
+                    seg = seg * gates[..., p_idx, :].unsqueeze(-1)
+                seg = seg.to(dtype=dtype) if seg.dtype != dtype else seg
+                c0 = int(self.path_offset[p_idx]) * self.channels
+                c1 = c0 + self.channels
+                out[l3][..., c0:c1, :] = out[l3][..., c0:c1, :] + seg
 
         return out
 
@@ -1986,13 +2500,14 @@ class HarmonicElementwiseProductO3(nn.Module):
         mul: int,
         irreps_out: str | None = "0e",
         normalization: str = "component",
+        irrep_normalization: str | None = None,
         internal_compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.active_irreps = [_normalize_irrep_key(l, p) for l, p in active_irreps]
         self.mul = int(mul)
         self.internal_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
-        self._normalization = normalization
+        self._normalization = _resolve_irrep_normalization(irrep_normalization, normalization)
         self._irreps_out = irreps_out.strip().lower() if (irreps_out and isinstance(irreps_out, str)) else "full"
         self._output_0e_only = self._irreps_out == "0e"
 
@@ -2007,11 +2522,7 @@ class HarmonicElementwiseProductO3(nn.Module):
         for l, p in self.active_irreps:
             if (l, p) not in self._0e_factors:
                 C = build_cg_tensor(l, l, 0)
-                C_fn = C.norm().item()
-                if normalization == "component" and C_fn > 1e-30:
-                    C = C * (1.0 / C_fn)
-                elif normalization == "norm" and C_fn > 1e-30:
-                    C = C * (1.0 / C_fn)
+                C = _apply_cg_normalization(C, 0, self._normalization)
                 self._0e_factors[(l, p)] = float(C[0, 0, 0].item())
     def forward(
         self,
@@ -2050,6 +2561,8 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         path_policy: str = "full",
         max_rank_other: int | None = None,
         normalization: str = "component",
+        irrep_normalization: str | None = None,
+        path_normalization: str = "element",
         internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "pytorch",
     ):
@@ -2059,7 +2572,8 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
         self.mul_out = int(mul_out)
         self.lmax = int(lmax)
         self.internal_weights = bool(internal_weights)
-        self._normalization = normalization
+        self._normalization = _resolve_irrep_normalization(irrep_normalization, normalization)
+        self._path_normalization = _resolve_path_normalization(path_normalization)
         # Keep O(3) on the same effective weight parameterization as the SO(3)
         # save path for an apples-to-apples training comparison.
         self._mul_path_scale = 1.0
@@ -2098,6 +2612,12 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
 
         self.num_paths = len(self.paths)
         self.weight_numel = self.num_paths * self.mul_out * self.mul_in1 * self.mul_in2
+        self._path_normalization_scales = _path_normalization_scales(
+            [tuple(p) for p in self.paths],
+            output_key_index=(4, 5),
+            num_elements=float(self.mul_in1 * self.mul_in2),
+            path_normalization=self._path_normalization,
+        )
         if self.internal_weights:
             self.weight = nn.Parameter(torch.randn(self.num_paths, self.mul_out, self.mul_in1, self.mul_in2) * 0.02)
         else:
@@ -2148,13 +2668,10 @@ class HarmonicFullyConnectedTensorProductO3(nn.Module):
             return cached
         if self._cg_cpu_f64 is None:
             self._cg_cpu_f64 = []
-            for (l1, _p1, l2, _p2, l3, _p3) in self.paths:
+            for path_idx, (l1, _p1, l2, _p2, l3, _p3) in enumerate(self.paths):
                 C = build_cg_tensor(l1, l2, l3)
-                C_fn = C.norm().item()
-                if self._normalization == "component" and C_fn > 1e-30:
-                    C = C * (math.sqrt(2 * l3 + 1) / C_fn)
-                elif self._normalization == "norm" and C_fn > 1e-30:
-                    C = C * (1.0 / C_fn)
+                C = _apply_cg_normalization(C, l3, self._normalization)
+                C = C * float(self._path_normalization_scales[path_idx])
                 self._cg_cpu_f64.append(C)
         cg_list = [C.to(device=device, dtype=compute_dtype) for C in self._cg_cpu_f64]
         self._cg_cache_by_dev_dtype[key] = cg_list
@@ -2588,6 +3105,8 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
         path_policy: str = "full",
         max_rank_other: int | None = None,
         normalization: str = "component",
+        irrep_normalization: str | None = None,
+        path_normalization: str = "element",
         internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "pytorch",
     ):
@@ -2608,6 +3127,8 @@ class HarmonicChannelWiseTensorProductO3(HarmonicFullyConnectedTensorProductO3):
             path_policy=path_policy,
             max_rank_other=max_rank_other,
             normalization=normalization,
+            irrep_normalization=irrep_normalization,
+            path_normalization=path_normalization,
             internal_compute_dtype=internal_compute_dtype,
             ictd_tp_backend=ictd_tp_backend,
         )
@@ -3238,6 +3759,8 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
         path_policy: str = "full",
         max_rank_other: int | None = None,
         normalization: str = "component",
+        irrep_normalization: str | None = None,
+        path_normalization: str = "element",
         internal_compute_dtype: torch.dtype | None = None,
         ictd_tp_backend: str = "pytorch",
     ):
@@ -3257,6 +3780,8 @@ class HarmonicChannelWiseTensorProduct(HarmonicFullyConnectedTensorProduct):
             path_policy=path_policy,
             max_rank_other=max_rank_other,
             normalization=normalization,
+            irrep_normalization=irrep_normalization,
+            path_normalization=path_normalization,
             internal_compute_dtype=internal_compute_dtype,
             ictd_tp_backend=ictd_tp_backend,
         )

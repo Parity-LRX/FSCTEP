@@ -1170,7 +1170,7 @@ def main():
         logging.info("Using PURE Cartesian ICTD mode (pure_cartesian_ictd_layers, save/original), num_interaction=%d", args.num_interaction)
         if tensor_product_mode == 'pure-cartesian-ictd-save-multiple':
             logging.info(
-                "  save_readout_mode=mace-contraction, order=%d, fusion_scheme=%s, mix_channels=%s, final_readout_mode=%s",
+                "  save_readout_mode=multiple-contraction, order=%d, fusion_scheme=%s, mix_channels=%s, final_readout_mode=%s",
                 args.ictd_save_contraction_order,
                 args.ictd_save_multiple_fusion_scheme,
                 args.ictd_save_multiple_mix_channels if args.ictd_save_multiple_mix_channels is not None else config.channel_in,
@@ -1195,7 +1195,7 @@ def main():
             num_interaction=args.num_interaction,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            save_readout_mode='mace-contraction' if tensor_product_mode == 'pure-cartesian-ictd-save-multiple' else 'elementwise-scalar',
+            save_readout_mode='multiple-contraction' if tensor_product_mode == 'pure-cartesian-ictd-save-multiple' else 'elementwise-scalar',
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_fusion_scheme=args.ictd_save_multiple_fusion_scheme,
             save_final_readout_mode=args.ictd_save_final_readout_mode,

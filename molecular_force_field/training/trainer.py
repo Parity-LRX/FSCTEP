@@ -89,6 +89,7 @@ class Trainer:
         patience=20,
         dump_frequency=250,
         energy_log_frequency=10,
+        train_log_interval=0,
         vhat_clamp_interval=2000,
         warmup_batches=1000,
         patience_opim=1000,
@@ -177,6 +178,8 @@ class Trainer:
             max_vhat_growth_factor: Maximum v_hat growth factor
             max_norm_value: Maximum gradient norm
             gradient_log_interval: Interval to log gradients
+            train_log_interval: Interval (in batches) for training progress logs.
+                If <= 0, use the built-in adaptive interval.
             update_param: Interval to update loss weights
             force_shift_value: Force shift value
             a: Energy loss weight
@@ -275,8 +278,9 @@ class Trainer:
         self.initial_learning_rate_for_weight = initial_learning_rate_for_weight
         self.epoch_numbers = epoch_numbers
         self.patience = patience
-        self.dump_frequency = dump_frequency
+        self.dump_frequency = int(dump_frequency)
         self.energy_log_frequency = energy_log_frequency
+        self.train_log_interval = int(train_log_interval)
         self.vhat_clamp_interval = vhat_clamp_interval
         self.warmup_batches = warmup_batches
         self.patience_opim = patience_opim
@@ -286,7 +290,9 @@ class Trainer:
         self.plateau_patience = int(plateau_patience)
         self.max_vhat_growth_factor = max_vhat_growth_factor
         self.max_norm_value = max_norm_value
-        self.gradient_log_interval = gradient_log_interval
+        self.requested_gradient_log_interval = int(gradient_log_interval)
+        self.gradient_log_interval = max(1, self.dump_frequency)
+        self.expensive_check_interval = max(1, self.dump_frequency)
         self.update_param = update_param
         self.force_shift_value = force_shift_value
         self.a = a
@@ -659,8 +665,13 @@ class Trainer:
         if self.c_max is not None:
             self.c = min(self.c, self.c_max)
 
+    def _should_run_expensive_checks(self, batch_count: int) -> bool:
+        return int(batch_count) <= 1 or (int(batch_count) % self.expensive_check_interval == 0)
+
     def _ensure_finite_tensor(self, tensor, label: str, *, epoch: int, batch_count: int):
         """Raise early when a key training tensor becomes NaN/Inf."""
+        if not self._should_run_expensive_checks(batch_count):
+            return
         if torch.is_tensor(tensor) and not torch.isfinite(tensor).all():
             raise FloatingPointError(
                 f"Non-finite tensor detected: {label} at epoch={epoch}, batch_count={batch_count}"
@@ -668,6 +679,8 @@ class Trainer:
 
     def _ensure_finite_parameters(self, *, epoch: int, batch_count: int):
         """Fail fast when parameters or gradients become NaN/Inf."""
+        if not self._should_run_expensive_checks(batch_count):
+            return
         named_modules = (
             ("e3trans", self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans),
             ("model", self.model),
@@ -1170,16 +1183,19 @@ class Trainer:
         self.model.train()
         self.e3trans.train()  # DDP model's train() will call internal module's train()
         
-        total_batch_loss = []
-        total_batch_energy_loss = []
-        total_batch_energy_rmse = []
-        total_batch_energy_rmse_avg = []
-        total_batch_force_loss = []
-        total_batch_force_rmse = []
-        total_batch_stress_loss = []
-        total_batch_stress_rmse = []
-        total_batch_phys_loss = []
-        total_batch_delta_reg_loss = []
+        metric_sums = {
+            "total_loss": torch.tensor(0.0, device=self.device),
+            "energy_loss": torch.tensor(0.0, device=self.device),
+            "energy_rmse": torch.tensor(0.0, device=self.device),
+            "energy_rmse_avg": torch.tensor(0.0, device=self.device),
+            "force_loss": torch.tensor(0.0, device=self.device),
+            "force_rmse": torch.tensor(0.0, device=self.device),
+            "stress_loss": torch.tensor(0.0, device=self.device),
+            "stress_rmse": torch.tensor(0.0, device=self.device),
+            "phys_loss": torch.tensor(0.0, device=self.device),
+            "delta_reg_loss": torch.tensor(0.0, device=self.device),
+        }
+        num_effective_batches = 0
         
         all_nets = [self.e3trans, self.model]
         all_parameters = [param for net in all_nets for param in net.parameters()]
@@ -1198,6 +1214,7 @@ class Trainer:
             
             if batch_data is None:
                 continue
+            num_effective_batches += 1
             
             extras = {}
             if isinstance(batch_data, (list, tuple)) and len(batch_data) == 11:
@@ -1549,16 +1566,16 @@ class Trainer:
             else:
                 self.scheduler.step()
             
-            total_batch_loss.append(total_loss.item())
-            total_batch_energy_loss.append(energy_loss.item())
-            total_batch_energy_rmse.append(energy_rmse.item())
-            total_batch_energy_rmse_avg.append(energy_rmse_avg.item())
-            total_batch_force_loss.append(force_loss.item())
-            total_batch_force_rmse.append(force_rmse.item())
-            total_batch_stress_loss.append(stress_loss.item())
-            total_batch_stress_rmse.append(stress_rmse.item())
-            total_batch_phys_loss.append(phys_loss.item())
-            total_batch_delta_reg_loss.append(delta_reg_loss.item())
+            metric_sums["total_loss"] = metric_sums["total_loss"] + total_loss.detach()
+            metric_sums["energy_loss"] = metric_sums["energy_loss"] + energy_loss.detach()
+            metric_sums["energy_rmse"] = metric_sums["energy_rmse"] + energy_rmse.detach()
+            metric_sums["energy_rmse_avg"] = metric_sums["energy_rmse_avg"] + energy_rmse_avg.detach()
+            metric_sums["force_loss"] = metric_sums["force_loss"] + force_loss.detach()
+            metric_sums["force_rmse"] = metric_sums["force_rmse"] + force_rmse.detach()
+            metric_sums["stress_loss"] = metric_sums["stress_loss"] + stress_loss.detach()
+            metric_sums["stress_rmse"] = metric_sums["stress_rmse"] + stress_rmse.detach()
+            metric_sums["phys_loss"] = metric_sums["phys_loss"] + phys_loss.detach()
+            metric_sums["delta_reg_loss"] = metric_sums["delta_reg_loss"] + delta_reg_loss.detach()
             
             # Record batch time
             batch_end_time = time.time()
@@ -1567,13 +1584,16 @@ class Trainer:
             
             # Log training progress only to file, not console (only on main process)
             if self.is_main_process:
-                progress_interval = max(1, min(10, total_batches // 20))  # Show at least 20 updates per epoch
+                if self.train_log_interval > 0:
+                    progress_interval = self.train_log_interval
+                else:
+                    progress_interval = max(1, min(10, total_batches // 20))  # Show at least 20 updates per epoch
                 if (batch_idx_loader + 1) % progress_interval == 0 or (batch_idx_loader + 1) == total_batches:
-                    current_energy_loss = np.mean(total_batch_energy_loss[-10:]) if len(total_batch_energy_loss) >= 10 else total_batch_energy_loss[-1] if total_batch_energy_loss else 0
-                    current_force_loss = np.mean(total_batch_force_loss[-10:]) if len(total_batch_force_loss) >= 10 else total_batch_force_loss[-1] if total_batch_force_loss else 0
-                    current_stress_loss = np.mean(total_batch_stress_loss[-10:]) if len(total_batch_stress_loss) >= 10 else total_batch_stress_loss[-1] if total_batch_stress_loss else 0
-                    current_phys_loss = np.mean(total_batch_phys_loss[-10:]) if len(total_batch_phys_loss) >= 10 else total_batch_phys_loss[-1] if total_batch_phys_loss else 0
-                    current_delta_reg_loss = np.mean(total_batch_delta_reg_loss[-10:]) if len(total_batch_delta_reg_loss) >= 10 else total_batch_delta_reg_loss[-1] if total_batch_delta_reg_loss else 0
+                    current_energy_loss = float(energy_loss.detach().cpu())
+                    current_force_loss = float(force_loss.detach().cpu())
+                    current_stress_loss = float(stress_loss.detach().cpu())
+                    current_phys_loss = float(phys_loss.detach().cpu())
+                    current_delta_reg_loss = float(delta_reg_loss.detach().cpu())
                     current_lr = self.optimizer.param_groups[0]['lr']
                     avg_batch_time = np.mean(batch_times[-10:]) if len(batch_times) >= 10 else np.mean(batch_times)
                     elapsed_time = batch_end_time - epoch_start_time
@@ -1598,18 +1618,18 @@ class Trainer:
                 else:
                     # Use current batch loss directly (no extra forward pass)
                     full_train_metrics = {
-                        'train_total_loss': total_loss.item(),
-                        'train_energy_loss': energy_loss.item(),
-                        'train_force_loss': force_loss.item(),
-                        'train_stress_loss': stress_loss.item(),
-                        'train_phys_loss': phys_loss.item(),
-                        'train_energy_rmse': energy_rmse.item(),
+                        'train_total_loss': float(total_loss.detach().cpu()),
+                        'train_energy_loss': float(energy_loss.detach().cpu()),
+                        'train_force_loss': float(force_loss.detach().cpu()),
+                        'train_stress_loss': float(stress_loss.detach().cpu()),
+                        'train_phys_loss': float(phys_loss.detach().cpu()),
+                        'train_energy_rmse': float(energy_rmse.detach().cpu()),
                         'train_energy_mae': 0.0,
-                        'train_energy_rmse_avg': energy_rmse_avg.item(),
+                        'train_energy_rmse_avg': float(energy_rmse_avg.detach().cpu()),
                         'train_energy_mae_avg': 0.0,
-                        'train_force_rmse': force_rmse.item(),
+                        'train_force_rmse': float(force_rmse.detach().cpu()),
                         'train_force_mae': 0.0,
-                        'train_stress_rmse': stress_rmse.item(),
+                        'train_stress_rmse': float(stress_rmse.detach().cpu()),
                         'train_stress_mae': 0.0,
                     }
                 self.validate(epoch, full_train_metrics)
@@ -1624,17 +1644,18 @@ class Trainer:
                 f"Avg batch time: {avg_batch_time:.3f}s | Total batches: {len(batch_times)}"
             )
         
+        denom = float(max(1, num_effective_batches))
         return {
-            'total_loss': np.mean(total_batch_loss) if total_batch_loss else 0,
-            'energy_loss': np.mean(total_batch_energy_loss) if total_batch_energy_loss else 0,
-            'energy_rmse': np.mean(total_batch_energy_rmse) if total_batch_energy_rmse else 0,
-            'energy_rmse_avg': np.mean(total_batch_energy_rmse_avg) if total_batch_energy_rmse_avg else 0,
-            'force_loss': np.mean(total_batch_force_loss) if total_batch_force_loss else 0,
-            'force_rmse': np.mean(total_batch_force_rmse) if total_batch_force_rmse else 0,
-            'stress_loss': np.mean(total_batch_stress_loss) if total_batch_stress_loss else 0,
-            'stress_rmse': np.mean(total_batch_stress_rmse) if total_batch_stress_rmse else 0,
-            'phys_loss': np.mean(total_batch_phys_loss) if total_batch_phys_loss else 0,
-            'delta_reg_loss': np.mean(total_batch_delta_reg_loss) if total_batch_delta_reg_loss else 0,
+            'total_loss': float((metric_sums['total_loss'] / denom).detach().cpu()),
+            'energy_loss': float((metric_sums['energy_loss'] / denom).detach().cpu()),
+            'energy_rmse': float((metric_sums['energy_rmse'] / denom).detach().cpu()),
+            'energy_rmse_avg': float((metric_sums['energy_rmse_avg'] / denom).detach().cpu()),
+            'force_loss': float((metric_sums['force_loss'] / denom).detach().cpu()),
+            'force_rmse': float((metric_sums['force_rmse'] / denom).detach().cpu()),
+            'stress_loss': float((metric_sums['stress_loss'] / denom).detach().cpu()),
+            'stress_rmse': float((metric_sums['stress_rmse'] / denom).detach().cpu()),
+            'phys_loss': float((metric_sums['phys_loss'] / denom).detach().cpu()),
+            'delta_reg_loss': float((metric_sums['delta_reg_loss'] / denom).detach().cpu()),
             'epoch_time': epoch_time,
             'avg_batch_time': avg_batch_time,
         }
@@ -1926,15 +1947,14 @@ class Trainer:
                     p_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, eval_model)
                     val_phys_loss_list.append(p_loss.detach().item())
                 
-                # Stream output: log first sample's restored energy (consistent with original train-val.py)
-                # Only log on main process
-                if self.is_main_process:
+                # Optional stream output for debugging; disabled by default because it logs once per validation batch.
+                if self.is_main_process and self.log_val_batch_energy_to_console:
                     restored_pred = self.val_dataset.restore_energy(E_mean_val[0].item())
                     restored_target = self.val_dataset.restore_energy(target_energies[0].item())
-                    # Use debug level if console output is disabled (will only go to file)
-                    # Use info level if console output is enabled
-                    log_level = logging.info if self.log_val_batch_energy_to_console else logging.debug
-                    log_level(f"Batch {batch_idx_loader + 1}/{total_batches} Sample -> Pred: {restored_pred:.4f} , True: {restored_target:.4f}")
+                    logging.info(
+                        f"Batch {batch_idx_loader + 1}/{total_batches} Sample -> "
+                        f"Pred: {restored_pred:.4f} , True: {restored_target:.4f}"
+                    )
         
         # Check if we have any validation data on this process
         local_has_data = len(val_E_preds) > 0

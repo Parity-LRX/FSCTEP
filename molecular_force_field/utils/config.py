@@ -84,7 +84,7 @@ class ModelConfig:
         torch.set_default_dtype(self.dtype)
         
         if self.main_hidden_sizes3 is None:
-            self.main_hidden_sizes3 = [64, 32]
+            self.main_hidden_sizes3 = [64]
         if self.embed_size is None:
             self.embed_size = [128, 128, 128]
         if self.emb_number is None:

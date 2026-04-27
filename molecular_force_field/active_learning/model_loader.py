@@ -425,7 +425,7 @@ def build_e3trans_from_checkpoint(
     elif mode in {"pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple"}:
         e3trans = PureCartesianICTDTransformerLayer(
             **k_cartesian,
-            save_readout_mode="mace-contraction" if mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
+            save_readout_mode="multiple-contraction" if mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
             save_contraction_order=save_contraction_order,
             save_multiple_fusion_scheme=save_multiple_fusion_scheme,
             save_final_readout_mode=save_final_readout_mode,

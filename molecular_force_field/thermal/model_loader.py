@@ -254,7 +254,7 @@ def _build_model(
             invariant_channels=invariant_channels,
             function_type_main=config.function_type,
             lmax=config.lmax,
-            save_readout_mode="mace-contraction" if tensor_product_mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
+            save_readout_mode="multiple-contraction" if tensor_product_mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
             save_contraction_order=save_contraction_order,
             save_multiple_fusion_scheme=save_multiple_fusion_scheme,
             save_final_readout_mode=save_final_readout_mode,

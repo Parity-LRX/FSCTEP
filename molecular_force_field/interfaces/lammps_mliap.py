@@ -1254,7 +1254,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 lmax=config.lmax,
                 ictd_tp_path_policy=ictd_tp_path_policy,
                 ictd_tp_max_rank_other=ictd_tp_max_rank_other,
-                save_readout_mode="mace-contraction" if mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
+                save_readout_mode="multiple-contraction" if mode == "pure-cartesian-ictd-save-multiple" else "elementwise-scalar",
                 save_contraction_order=save_contraction_order,
                 save_multiple_fusion_scheme=save_multiple_fusion_scheme,
                 save_final_readout_mode=save_final_readout_mode,

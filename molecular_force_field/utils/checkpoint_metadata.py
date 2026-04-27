@@ -81,6 +81,15 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "external_tensor_specs": None,
 }
 
+
+def resolve_save_multiple_mix_channels_default(
+    channels: int,
+    num_interaction: int,
+) -> int:
+    channels = int(channels)
+    num_interaction = int(num_interaction)
+    return max(1, math.ceil(channels * num_interaction / 2))
+
 def derive_long_range_far_max_radius_multiplier(
     far_num_shells: int,
     far_shell_growth: float,
@@ -388,7 +397,10 @@ def resolve_model_architecture(
         checkpoint,
         arch_meta,
         "save_multiple_mix_channels",
-        arch_meta.get("channel_in", 64),
+        resolve_save_multiple_mix_channels_default(
+            arch_meta.get("channel_in", 64),
+            resolved["num_interaction"],
+        ),
         checkpoint_key="ictd_save_multiple_mix_channels",
     )
     if resolved["save_multiple_mix_channels"] is not None:
