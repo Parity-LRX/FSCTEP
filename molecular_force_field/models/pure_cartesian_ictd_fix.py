@@ -1405,6 +1405,8 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_product_backend: str = "ictd-pure-u",
         ictd_fix_interaction_scale: str = "none",
         ictd_fix_fusion_scale_init: float = 0.1,
+        ictd_fix_fusion_heads: int = 1,
+        ictd_fix_fusion_head_weight_mode: str = "softmax",
         save_contraction_order: int = 3,
         save_multiple_mix_channels: int | None = None,
         avg_num_neighbors: float | None = None,
@@ -1435,6 +1437,11 @@ class PureCartesianICTDFix(nn.Module):
             raise ValueError(
                 f"ictd_fix_interaction_scale must be 'none' or 'mace-rms', got {ictd_fix_interaction_scale!r}"
             )
+        if ictd_fix_fusion_head_weight_mode not in {"softmax", "free"}:
+            raise ValueError(
+                "ictd_fix_fusion_head_weight_mode must be 'softmax' or 'free', "
+                f"got {ictd_fix_fusion_head_weight_mode!r}"
+            )
         if long_range_mode != "none" or feature_spectral_mode != "none":
             raise NotImplementedError("pure-cartesian-ictd-fix currently supports only long_range_mode=none and feature_spectral_mode=none")
 
@@ -1449,6 +1456,10 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_product_backend = str(ictd_fix_product_backend)
         self.ictd_fix_interaction_scale = str(ictd_fix_interaction_scale)
         self.ictd_fix_fusion_scale_init = float(ictd_fix_fusion_scale_init)
+        self.ictd_fix_fusion_heads = int(ictd_fix_fusion_heads)
+        self.ictd_fix_fusion_head_weight_mode = str(ictd_fix_fusion_head_weight_mode)
+        if self.ictd_fix_fusion_heads < 1:
+            raise ValueError(f"ictd_fix_fusion_heads must be >= 1, got {self.ictd_fix_fusion_heads}")
         self.max_atomvalue = int(max_atomvalue)
         self.avg_num_neighbors = None if avg_num_neighbors is None else float(avg_num_neighbors)
         self.edge_compute_dtype = _resolve_internal_compute_dtype(internal_compute_dtype)
@@ -1601,22 +1612,52 @@ class PureCartesianICTDFix(nn.Module):
                 correlation=save_contraction_order,
             )
             self.multiple_contract_fuse = None
-            self.fusion_readout = FusionProduct5ReadoutSO3(
-                channels=self.channels,
-                lmax=self.lmax,
-                num_feature_blocks=self.num_interaction + 1,
-                hidden_sizes=main_hidden_sizes3,
-                output_init_std=0.003,
-                internal_compute_dtype=internal_compute_dtype,
+            self.fusion_readouts = nn.ModuleList(
+                [
+                    FusionProduct5ReadoutSO3(
+                        channels=self.channels,
+                        lmax=self.lmax,
+                        num_feature_blocks=self.num_interaction + 1,
+                        hidden_sizes=main_hidden_sizes3,
+                        output_init_std=0.003,
+                        internal_compute_dtype=internal_compute_dtype,
+                    )
+                    for _ in range(self.ictd_fix_fusion_heads)
+                ]
             )
-            self.fusion_energy_scale = nn.Parameter(
-                torch.tensor(self.ictd_fix_fusion_scale_init, dtype=torch.get_default_dtype())
-            )
+            self.fusion_readout = self.fusion_readouts[0]
+            if self.ictd_fix_fusion_heads == 1:
+                self.fusion_head_logits = None
+                self.fusion_head_weights = None
+                self.fusion_energy_scale = nn.Parameter(
+                    torch.tensor(self.ictd_fix_fusion_scale_init, dtype=torch.get_default_dtype())
+                )
+            elif self.ictd_fix_fusion_head_weight_mode == "softmax":
+                self.fusion_head_logits = nn.Parameter(
+                    torch.zeros(self.ictd_fix_fusion_heads, dtype=torch.get_default_dtype())
+                )
+                self.fusion_head_weights = None
+                self.fusion_energy_scale = nn.Parameter(
+                    torch.tensor(self.ictd_fix_fusion_scale_init, dtype=torch.get_default_dtype())
+                )
+            else:
+                self.fusion_head_logits = None
+                self.fusion_head_weights = nn.Parameter(
+                    torch.full(
+                        (self.ictd_fix_fusion_heads,),
+                        self.ictd_fix_fusion_scale_init / self.ictd_fix_fusion_heads,
+                        dtype=torch.get_default_dtype(),
+                    )
+                )
+                self.fusion_energy_scale = None
         else:
             self.save_multiple_mix_channels = None
             self.multiple_contraction_mix = None
             self.multiple_contract_fuse = None
+            self.fusion_readouts = None
             self.fusion_readout = None
+            self.fusion_head_logits = None
+            self.fusion_head_weights = None
             self.fusion_energy_scale = None
 
     def forward(
@@ -1720,8 +1761,31 @@ class PureCartesianICTDFix(nn.Module):
                 raise RuntimeError("fusion route expected a last_preproduct_state but none was produced")
             mix_inputs = torch.cat(layer_states, dim=-1)
             g_mix = self.multiple_contraction_mix(mix_inputs, node_attrs)
-            fusion_energy = self.fusion_readout(layer_states + [g_mix])
-            fusion_energy = self.fusion_energy_scale.to(dtype=fusion_energy.dtype, device=fusion_energy.device) * fusion_energy
+            fusion_inputs = layer_states + [g_mix]
+            if self.ictd_fix_fusion_heads == 1:
+                fusion_energy = self.fusion_readout(fusion_inputs)
+                fusion_energy = self.fusion_energy_scale.to(dtype=fusion_energy.dtype, device=fusion_energy.device) * fusion_energy
+            else:
+                head_energies = torch.stack(
+                    [readout(fusion_inputs) for readout in self.fusion_readouts],
+                    dim=0,
+                )
+                if self.ictd_fix_fusion_head_weight_mode == "softmax":
+                    head_weights = torch.softmax(
+                        self.fusion_head_logits.to(dtype=head_energies.dtype, device=head_energies.device),
+                        dim=0,
+                    )
+                    head_weights = self.fusion_energy_scale.to(
+                        dtype=head_energies.dtype,
+                        device=head_energies.device,
+                    ) * head_weights
+                else:
+                    head_weights = self.fusion_head_weights.to(
+                        dtype=head_energies.dtype,
+                        device=head_energies.device,
+                    )
+                head_weights = head_weights.view(self.ictd_fix_fusion_heads, 1, 1)
+                fusion_energy = (head_energies * head_weights).sum(dim=0)
             total_energy = fusion_energy if total_energy is None else (total_energy + fusion_energy)
             combined_features = torch.cat([combined_features, g_mix], dim=-1)
 
