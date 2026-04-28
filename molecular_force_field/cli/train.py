@@ -24,6 +24,8 @@ from molecular_force_field.models import (
     PureCartesianSparseTransformerLayerSave,
     PureCartesianICTDTransformerLayer,
     PureCartesianICTDFix,
+    PureCartesianICTDFixSO2,
+    PureCartesianICTDNodeSO2TransformerLayer,
     SphericalFix,
     PureCartesianICTDTransformerLayerNoCrossFusion,
     PureCartesianICTDTransformerLayerNoShallowReadout,
@@ -753,7 +755,7 @@ def main():
                         help='Number of radial basis functions for the main message-passing stack. '
                              'If not set, restore from checkpoint when available, else use 8.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'spherical-fix', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-macereadout', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-multiple-nocross', 'pure-cartesian-ictd-save-multiple-noshallowreadout', 'pure-cartesian-ictd-save-o3', 'pure-cartesian-ictd-fix'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'spherical-fix', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-macereadout', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-multiple-nocross', 'pure-cartesian-ictd-save-multiple-noshallowreadout', 'pure-cartesian-ictd-save-o3', 'pure-cartesian-ictd-fix', 'pure-cartesian-ictd-fix-so2', 'pure-cartesian-ictd-node-so2'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
@@ -773,10 +775,12 @@ def main():
                              '"pure-cartesian-ictd-save-multiple-noshallowreadout" is an ablation that keeps contraction-level cross-layer fusion but removes the shallow f1 shortcut from the final readout. '
                              '"pure-cartesian-ictd-save-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware save O(3) ICTD). '
                              '"pure-cartesian-ictd-fix" uses a dedicated MACE-style ICTD backbone with element-conditioned contraction blocks and optional fusion correction. '
+                             '"pure-cartesian-ictd-fix-so2" uses a single-projection local SO2/O2 variant of the fix backbone. '
+                             '"pure-cartesian-ictd-node-so2" uses the original node-local SO2 backbone with multiple-contraction readout. '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--ictd-fix-route', type=str, default='baseline',
                         choices=['baseline', 'fusion'],
-                        help='Route for --tensor-product-mode pure-cartesian-ictd-fix or spherical-fix. '
+                        help='Route for --tensor-product-mode pure-cartesian-ictd-fix, pure-cartesian-ictd-fix-so2, or spherical-fix. '
                              '"baseline" keeps pure MACE-style layerwise readout only. '
                              '"fusion" adds an extra cross-layer fusion correction head in parallel.')
     parser.add_argument('--ictd-fix-contraction-combine', type=str, default='softmax',
@@ -798,6 +802,14 @@ def main():
                              '"mace-rms" initializes message/sc scales from the e3nn interaction distribution diagnostic.')
     parser.add_argument('--ictd-fix-fusion-scale-init', type=float, default=0.1,
                         help='Initial learnable scale for the pure-cartesian-ictd-fix fusion energy correction.')
+    parser.add_argument('--ictd-fix-fusion-heads', type=int, default=1,
+                        help='Number of parallel fusion residual readout heads for pure-cartesian-ictd-fix. '
+                             'Heads are combined with learned softmax weights; default 1 preserves the original behavior.')
+    parser.add_argument('--ictd-fix-fusion-head-weight-mode', type=str, default='softmax',
+                        choices=['softmax', 'free'],
+                        help='How to combine multiple pure-cartesian-ictd-fix fusion heads. '
+                             '"softmax" uses a learnable global scale times normalized head weights. '
+                             '"free" learns unconstrained per-head residual coefficients initialized to scale_init / heads.')
     parser.add_argument('--max-rank-other', type=int, default=None,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
                              'If not set, restore from checkpoint when available, else use 1. '
@@ -1662,7 +1674,7 @@ def main():
         )
 
     resolved_avg_num_neighbors = args.avg_num_neighbors
-    if args.tensor_product_mode in {"pure-cartesian-ictd-fix", "spherical-fix"} and resolved_avg_num_neighbors is None:
+    if args.tensor_product_mode in {"pure-cartesian-ictd-fix", "pure-cartesian-ictd-fix-so2", "spherical-fix"} and resolved_avg_num_neighbors is None:
         resolved_avg_num_neighbors = _compute_avg_num_neighbors_from_h5(train_dataset)
         if rank == 0:
             logging.info("Computed average number of neighbors: %.12g", resolved_avg_num_neighbors)
@@ -2125,13 +2137,15 @@ def main():
         logging.info(
             "Using PURE Cartesian ICTD FIX mode (MACE-style backbone with ICTD-SO3 operators), "
             "num_interaction=%d, route=%s, contraction_combine=%s, product_backend=%s, interaction_scale=%s, "
-            "fusion_scale_init=%g",
+            "fusion_scale_init=%g, fusion_heads=%d, fusion_head_weight_mode=%s",
             args.num_interaction,
             args.ictd_fix_route,
             args.ictd_fix_contraction_combine,
             args.ictd_fix_product_backend,
             args.ictd_fix_interaction_scale,
             args.ictd_fix_fusion_scale_init,
+            args.ictd_fix_fusion_heads,
+            args.ictd_fix_fusion_head_weight_mode,
         )
         e3trans = PureCartesianICTDFix(
             max_embed_radius=config.max_radius,
@@ -2157,6 +2171,8 @@ def main():
             ictd_fix_product_backend=args.ictd_fix_product_backend,
             ictd_fix_interaction_scale=args.ictd_fix_interaction_scale,
             ictd_fix_fusion_scale_init=args.ictd_fix_fusion_scale_init,
+            ictd_fix_fusion_heads=args.ictd_fix_fusion_heads,
+            ictd_fix_fusion_head_weight_mode=args.ictd_fix_fusion_head_weight_mode,
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             ictd_tp_path_policy=args.ictd_tp_path_policy,
@@ -2167,6 +2183,83 @@ def main():
             device=device,
             **common_invariant_kwargs,
             **common_long_range_kwargs,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd-fix-so2':
+        logging.info(
+            "Using PURE Cartesian ICTD FIX SO2 mode (single-projection local SO2/O2 fix backbone), "
+            "num_interaction=%d, route=%s",
+            args.num_interaction,
+            args.ictd_fix_route,
+        )
+        if PureCartesianICTDFixSO2 is None:
+            raise ImportError("PureCartesianICTDFixSO2 is unavailable in this build")
+        e3trans = PureCartesianICTDFixSO2(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            atomic_numbers=(list(config.atomic_energy_keys) if getattr(config, "atomic_energy_keys", None) is not None else None),
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            ictd_fix_route=args.ictd_fix_route,
+            ictd_fix_contraction_combine=args.ictd_fix_contraction_combine,
+            ictd_fix_product_backend=args.ictd_fix_product_backend,
+            ictd_fix_interaction_scale=args.ictd_fix_interaction_scale,
+            ictd_fix_fusion_scale_init=args.ictd_fix_fusion_scale_init,
+            save_contraction_order=args.ictd_save_contraction_order,
+            save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
+            internal_compute_dtype=config.internal_compute_dtype,
+            interaction_compute_dtype=None,
+            contraction_compute_dtype=None,
+            avg_num_neighbors=resolved_avg_num_neighbors,
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd-node-so2':
+        logging.info(
+            "Using PURE Cartesian ICTD NODE SO2 mode (original node-local SO2 backbone), "
+            "num_interaction=%d, readout=multiple-contraction",
+            args.num_interaction,
+        )
+        if PureCartesianICTDNodeSO2TransformerLayer is None:
+            raise ImportError("PureCartesianICTDNodeSO2TransformerLayer is unavailable in this build")
+        resolved_mix_channels = resolve_save_multiple_mix_channels(
+            config.channel_in,
+            args.num_interaction,
+            args.ictd_save_multiple_mix_channels,
+        )
+        e3trans = PureCartesianICTDNodeSO2TransformerLayer(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            output_size=config.output_size,
+            lmax=config.lmax,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            num_interaction=args.num_interaction,
+            embed_size=config.embed_size,
+            function_type_main=config.function_type,
+            save_readout_mode="multiple-contraction",
+            save_contraction_order=args.ictd_save_contraction_order,
+            save_multiple_mix_channels=resolved_mix_channels,
+            internal_compute_dtype=config.internal_compute_dtype,
+            interaction_compute_dtype=None,
+            contraction_compute_dtype=None,
+            equivariant_post_linear=args.equivariant_post_linear,
         ).to(device)
     elif args.tensor_product_mode == 'spherical-fix':
         if args.ictd_fix_route != "baseline":
