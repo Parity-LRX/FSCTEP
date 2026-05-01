@@ -271,47 +271,17 @@ def so3_blocks_to_node_local_so2(
         blk = blocks[l].to(dtype=compute_dtype)
         slices = so3_local_so2_basis_cpu(l)[1]
         if l == 0:
-            blk_local = blk
-            blk_freq = blk_local
-            for m, (s, e) in enumerate(slices):
-                local[(l, m)] = blk_freq[..., s:e]
-            continue
-        elif l in (1, 2):
-            H, C = _get_harmonic_full_maps(l, device, compute_dtype)
-            full = torch.matmul(blk, H)
-            if l == 1:
-                vec_local = torch.einsum("...ai,...ci->...ca", Gc, full)
-                blk_local = torch.matmul(vec_local, C)
-            else:
-                tens = full.reshape(*full.shape[:-1], 3, 3)
-                tens_local = torch.einsum("...ai,...cij,...bj->...cab", Gc, tens, Gc)
-                blk_local = torch.matmul(tens_local.reshape(*tens_local.shape[:-2], 9), C)
-            Q = get_local_q(l, device, compute_dtype)
-            blk_freq = torch.matmul(blk_local, Q)
+            blk_freq = blk
             for m, (s, e) in enumerate(slices):
                 local[(l, m)] = blk_freq[..., s:e]
             continue
 
         Q = get_local_q(l, device, compute_dtype)
-        chunk = _rotation_chunk_size(l, blk.shape[0], compute_dtype)
-        if chunk >= blk.shape[0]:
-            D = harmonic_row_rotation(Gc, l)
-            blk_local = torch.matmul(blk, D)
-            blk_freq = torch.matmul(blk_local, Q)
-            for m, (s, e) in enumerate(slices):
-                local[(l, m)] = blk_freq[..., s:e]
-            continue
-
-        parts: Dict[int, List[torch.Tensor]] = {m: [] for m in range(l + 1)}
-        for start in range(0, blk.shape[0], chunk):
-            end = min(blk.shape[0], start + chunk)
-            D = harmonic_row_rotation(Gc[start:end], l)
-            blk_local = torch.matmul(blk[start:end], D)
-            blk_freq = torch.matmul(blk_local, Q)
-            for m, (s, e) in enumerate(slices):
-                parts[m].append(blk_freq[..., s:e])
-        for m in range(l + 1):
-            local[(l, m)] = torch.cat(parts[m], dim=0)
+        D = harmonic_row_rotation(Gc, l)
+        blk_local = torch.matmul(blk, D)
+        blk_freq = torch.matmul(blk_local, Q)
+        for m, (s, e) in enumerate(slices):
+            local[(l, m)] = blk_freq[..., s:e]
     return local
 
 

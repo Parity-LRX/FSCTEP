@@ -1484,3 +1484,182 @@ class MultipleContractionO2(nn.Module):
             current_flat = self.order_mix[order_idx](current_flat)
             accum = accum + current_flat
         return self.out_linear(accum)
+
+
+# ---------------------------------------------------------------------------
+# SO2 U-tensor construction (ictd-pure-u equivalent)
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=None)
+def _so2_flat_index_cpu(lmax: int) -> tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], int]:
+    """Pre-compute flat-index mapping for SO2 (l,m) blocks.
+
+    Returns (start_lm, dim_lm, D) where D = Σ dim(m) = (lmax+1)²."""
+    starts: dict[tuple[int, int], int] = {}
+    dims: dict[tuple[int, int], int] = {}
+    offset = 0
+    for l in range(int(lmax) + 1):
+        for m in range(l + 1):
+            d = 1 if m == 0 else 2
+            starts[(l, m)] = offset
+            dims[(l, m)] = d
+            offset += d
+    return starts, dims, offset
+
+
+# SO2 coupling constraints (m-coupling + triangle) are enforced inside
+# _ictd_so2_coupled_basis through the l_out loop range and per-m CG building.
+# Parity is propagated independently: p_out = p_left * (-1)^l_right,
+# and filtered at U-tensor level by _ictd_u_tensor_so2_cached.
+
+
+def _canonical_so2_parity(l: int) -> int:
+    """Canonical parity for SO2 l-block: (-1)^l (mirrors canonical_irrep_parity_sign)."""
+    return 1 if (int(l) % 2 == 0) else -1
+
+
+def _ictd_so2_coupled_basis(
+    lmax: int,
+    correlation: int,
+    normalization: str = "component",
+    dtype: torch.dtype | None = None,
+) -> list[tuple[int, int, torch.Tensor]]:
+    """Recursively build SO2 coupled basis tensors (mirrors _ictd_so3_coupled_basis).
+
+    Returns list of (l_out, parity, tensor) where tensor has shape
+    (2l_out+1, D, ..., D) with ``correlation`` copies of D = (lmax+1)².
+    Parity is propagated independently: p_out = p_left * (-1)^l_right,
+    matching SO3's approach instead of enforcing (l1+l2+l3)%2==0."""
+    lmax = int(lmax)
+    correlation = int(correlation)
+    dtype = torch.float64 if dtype is None else dtype
+    if correlation < 1:
+        raise ValueError(f"correlation must be >= 1, got {correlation}")
+
+    starts, dims, D = _so2_flat_index_cpu(lmax)
+
+    # Build per-l starting offsets and width (2l+1 = sum of dim(m) for m=0..l)
+    l_starts: dict[int, int] = {}
+    l_widths: dict[int, int] = {}
+    for l in range(lmax + 1):
+        l_starts[l] = starts[(l, 0)]
+        l_widths[l] = sum(dims[(l, m)] for m in range(l + 1))
+
+    eye = torch.eye(D, dtype=dtype)
+    basis: list[tuple[int, int, torch.Tensor]] = []
+    for l in range(lmax + 1):
+        basis.append((l, _canonical_so2_parity(l), eye[l_starts[l] : l_starts[l] + l_widths[l]]))
+
+    if correlation == 1:
+        return basis
+
+    for _order in range(2, correlation + 1):
+        next_basis: list[tuple[int, int, torch.Tensor]] = []
+        for l_left, p_left, left_tensor in basis:
+            left_tensor = left_tensor.to(dtype=dtype)
+            flat_left = left_tensor.reshape(l_widths[l_left], -1)
+            for l_right in range(lmax + 1):
+                right_start = l_starts[l_right]
+                right_width = l_widths[l_right]
+                for l_out in range(abs(l_left - l_right), l_left + l_right + 1):
+                    if l_out > lmax:
+                        continue
+                    p_out = int(p_left) * _canonical_so2_parity(l_right)
+                    out_width = l_widths[l_out]
+
+                    # Build block-diagonal CG: (left, right, out) order for einsum "abq"
+                    cg_block = torch.zeros(l_widths[l_left], l_widths[l_right], out_width, dtype=dtype)
+                    off_left = 0
+                    for m_left in range(l_left + 1):
+                        d_left = dims[(l_left, m_left)]
+                        off_right = 0
+                        for m_right in range(l_right + 1):
+                            d_right = dims[(l_right, m_right)]
+                            for m_out in range(l_out + 1):
+                                if m_out != abs(m_left - m_right) and m_out != m_left + m_right:
+                                    continue
+                                d_out = dims[(l_out, m_out)]
+                                cg_so2 = build_cg_tensor_so2(m_left, m_right, m_out).to(dtype=dtype)
+                                cg_fn = cg_so2.norm().item()
+                                if normalization == "component" and cg_fn > 1e-30:
+                                    cg_so2 = cg_so2 * (math.sqrt(float(d_out)) / cg_fn)
+                                elif normalization == "norm" and cg_fn > 1e-30:
+                                    cg_so2 = cg_so2 * (1.0 / cg_fn)
+                                off_out_m = sum(dims[(l_out, mm)] for mm in range(m_out))
+                                cg_block[off_left : off_left + d_left,
+                                         off_right : off_right + d_right,
+                                         off_out_m : off_out_m + d_out] = cg_so2
+                            off_right += d_right
+                        off_left += d_left
+
+                    coupled = torch.einsum("ar,abq->qrb", flat_left, cg_block)
+                    full = torch.zeros(out_width, flat_left.shape[1], D, dtype=dtype)
+                    full[:, :, right_start : right_start + right_width] = coupled
+                    full = full.reshape(out_width, *left_tensor.shape[1:], D)
+                    next_basis.append((l_out, p_out, full))
+        basis = sorted(next_basis, key=lambda item: (item[0], item[1]))
+    return basis
+
+
+@lru_cache(maxsize=None)
+def _ictd_u_tensor_so2_cached(
+    lmax: int,
+    output_l: int,
+    correlation: int,
+    normalization: str,
+    dtype_name: str,
+) -> torch.Tensor:
+    if dtype_name == "float32":
+        dtype = torch.float32
+    elif dtype_name == "float64":
+        dtype = torch.float64
+    else:
+        raise ValueError(f"Unsupported dtype_name={dtype_name!r}")
+
+    _, _, D = _so2_flat_index_cpu(lmax)
+    l_width = 2 * int(output_l) + 1
+    target_parity = _canonical_so2_parity(int(output_l))
+
+    basis = _ictd_so2_coupled_basis(
+        int(lmax), int(correlation), normalization, torch.float64
+    )
+
+    matching = [
+        t for l, p, t in basis
+        if int(l) == int(output_l) and int(p) == int(target_parity)
+    ]
+    if not matching:
+        shape = [D] * correlation + [1]
+        if l_width > 1:
+            shape = [l_width] + shape
+        return torch.zeros(shape, dtype=dtype)
+
+    if l_width == 1:
+        tensors = [t.squeeze(0) for t in matching]
+    else:
+        tensors = matching
+    return torch.stack(tensors, dim=-1).to(dtype=dtype)
+
+
+def ictd_u_tensor_so2(
+    *,
+    lmax: int,
+    output_l: int,
+    correlation: int,
+    normalization: str = "component",
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """SO2 U-tensor for ictd-pure-u contraction (mirrors ictd_u_matrix_so3).
+
+    Returns tensor of shape:
+      - output_l = 0: (D, D, ..., D, N_trees)  with ``correlation`` copies of D
+      - output_l > 0: (2l+1, D, D, ..., D, N_trees)
+
+    where D = (lmax+1)², N_trees = number of valid coupling paths."""
+    dtype = torch.get_default_dtype() if dtype is None else dtype
+    name = "float64" if dtype == torch.float64 else "float32"
+    return _ictd_u_tensor_so2_cached(
+        int(lmax), int(output_l), int(correlation),
+        str(normalization), name,
+    ).to(dtype=dtype)
