@@ -780,6 +780,8 @@ class Trainer:
                 "feature_spectral_include_k0",
                 "feature_spectral_assignment",
                 "feature_spectral_gate_init",
+                "ictd_fix_readout_head_scale_init",
+                "ictd_fix_readout_head_scale_trainable",
                 "zbl_enabled",
                 "zbl_inner_cutoff",
                 "zbl_outer_cutoff",

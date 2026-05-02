@@ -790,12 +790,14 @@ def main():
                              '"free" uses unconstrained per-element order weights; '
                              '"path-free" additionally uses per-element/per-channel TP path weights in ICTD contraction.')
     parser.add_argument('--ictd-fix-product-backend', type=str, default='ictd-pure-u',
-                        choices=['ictd', 'native-mace', 'ictd-mace-u', 'ictd-pure-u'],
+                        choices=['ictd', 'native-mace', 'ictd-bridge-u', 'ictd-mace-u', 'ictd-pure-u'],
                         help='Product/contraction backend for --tensor-product-mode pure-cartesian-ictd-fix. '
                              '"ictd" uses ICTD-SO3 contraction; '
                              '"native-mace" keeps ICTD interaction but uses native MACE symmetric contraction; '
-                             '"ictd-mace-u" folds MACE U_matrix_real into the ICTD basis; '
-                             '"ictd-pure-u" generates MACE-style U tensors directly from ICTD CG.')
+                             '"ictd-bridge-u" folds MACE U_matrix_real into the ICTD basis bridge; '
+                             '"ictd-mace-u" is a deprecated alias of "ictd-bridge-u"; '
+                             '"ictd-pure-u" generates MACE-style U tensors directly from ICTD CG, '
+                             'with automatic bridge-U fallback for lmax > 3.')
     parser.add_argument('--ictd-fix-interaction-scale', type=str, default='none',
                         choices=['none', 'mace-rms'],
                         help='Optional per-l learnable output scale after ICTD fix interaction. '
@@ -810,6 +812,16 @@ def main():
                         help='How to combine multiple pure-cartesian-ictd-fix fusion heads. '
                              '"softmax" uses a learnable global scale times normalized head weights. '
                              '"free" learns unconstrained per-head residual coefficients initialized to scale_init / heads.')
+    parser.add_argument('--ictd-fix-readout-head-scale-init', type=float, default=1.0,
+                        help='Initial coefficient for pure-cartesian-ictd-fix-so2 scalar readout heads '
+                             '(head0=intermediate scalar readout, head1=final scalar readout).')
+    parser.add_argument('--ictd-fix-readout-head-scale-trainable', dest='ictd_fix_readout_head_scale_trainable',
+                        action='store_true',
+                        help='Make pure-cartesian-ictd-fix-so2 scalar readout head coefficients trainable.')
+    parser.add_argument('--ictd-fix-readout-head-scale-fixed', dest='ictd_fix_readout_head_scale_trainable',
+                        action='store_false',
+                        help='Keep pure-cartesian-ictd-fix-so2 scalar readout head coefficients fixed.')
+    parser.set_defaults(ictd_fix_readout_head_scale_trainable=False)
     parser.add_argument('--max-rank-other', type=int, default=None,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
                              'If not set, restore from checkpoint when available, else use 1. '
@@ -2187,9 +2199,11 @@ def main():
     elif args.tensor_product_mode == 'pure-cartesian-ictd-fix-so2':
         logging.info(
             "Using PURE Cartesian ICTD FIX SO2 mode (single-projection local SO2/O2 fix backbone), "
-            "num_interaction=%d, route=%s",
+            "num_interaction=%d, route=%s, readout_head_scale_init=%g, readout_head_scale_trainable=%s",
             args.num_interaction,
             args.ictd_fix_route,
+            args.ictd_fix_readout_head_scale_init,
+            args.ictd_fix_readout_head_scale_trainable,
         )
         if PureCartesianICTDFixSO2 is None:
             raise ImportError("PureCartesianICTDFixSO2 is unavailable in this build")
@@ -2216,6 +2230,10 @@ def main():
             ictd_fix_product_backend=args.ictd_fix_product_backend,
             ictd_fix_interaction_scale=args.ictd_fix_interaction_scale,
             ictd_fix_fusion_scale_init=args.ictd_fix_fusion_scale_init,
+            ictd_fix_fusion_heads=args.ictd_fix_fusion_heads,
+            ictd_fix_fusion_head_weight_mode=args.ictd_fix_fusion_head_weight_mode,
+            ictd_fix_readout_head_scale_init=args.ictd_fix_readout_head_scale_init,
+            ictd_fix_readout_head_scale_trainable=args.ictd_fix_readout_head_scale_trainable,
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             internal_compute_dtype=config.internal_compute_dtype,
