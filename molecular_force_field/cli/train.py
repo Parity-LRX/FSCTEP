@@ -25,6 +25,7 @@ from molecular_force_field.models import (
     PureCartesianICTDTransformerLayer,
     PureCartesianICTDFix,
     PureCartesianICTDFixSO2,
+    PureCartesianICTDESCNSO2,
     PureCartesianICTDNodeSO2TransformerLayer,
     SphericalFix,
     PureCartesianICTDTransformerLayerNoCrossFusion,
@@ -755,7 +756,7 @@ def main():
                         help='Number of radial basis functions for the main message-passing stack. '
                              'If not set, restore from checkpoint when available, else use 8.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'spherical-fix', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-macereadout', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-multiple-nocross', 'pure-cartesian-ictd-save-multiple-noshallowreadout', 'pure-cartesian-ictd-save-o3', 'pure-cartesian-ictd-fix', 'pure-cartesian-ictd-fix-so2', 'pure-cartesian-ictd-node-so2'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'spherical-fix', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-macereadout', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-multiple-nocross', 'pure-cartesian-ictd-save-multiple-noshallowreadout', 'pure-cartesian-ictd-save-o3', 'pure-cartesian-ictd-fix', 'pure-cartesian-ictd-fix-so2', 'pure-cartesian-ictd-escn-so2', 'pure-cartesian-ictd-node-so2'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
@@ -776,6 +777,7 @@ def main():
                              '"pure-cartesian-ictd-save-o3" uses pure_cartesian_ictd_layers_o3 (strict parity-aware save O(3) ICTD). '
                              '"pure-cartesian-ictd-fix" uses a dedicated MACE-style ICTD backbone with element-conditioned contraction blocks and optional fusion correction. '
                              '"pure-cartesian-ictd-fix-so2" uses a single-projection local SO2/O2 variant of the fix backbone. '
+                             '"pure-cartesian-ictd-escn-so2" uses an eSCN-style edge-frame SO2 backbone/readout. '
                              '"pure-cartesian-ictd-node-so2" uses the original node-local SO2 backbone with multiple-contraction readout. '
                              'Note: ICTD inference is typically ~3x faster than spherical-save.')
     parser.add_argument('--ictd-fix-route', type=str, default='baseline',
@@ -812,15 +814,33 @@ def main():
                         help='How to combine multiple pure-cartesian-ictd-fix fusion heads. '
                              '"softmax" uses a learnable global scale times normalized head weights. '
                              '"free" learns unconstrained per-head residual coefficients initialized to scale_init / heads.')
+    parser.add_argument('--ictd-fix-fusion-input-scale-init', type=float, default=1.0,
+                        help='Initial coefficient for each SO3 layer state before fusion mix contraction.')
+    parser.add_argument('--ictd-fix-fusion-input-scale-trainable', dest='ictd_fix_fusion_input_scale_trainable',
+                        action='store_true',
+                        help='Make per-interaction fusion mix input coefficients trainable.')
+    parser.add_argument('--ictd-fix-fusion-input-scale-fixed', dest='ictd_fix_fusion_input_scale_trainable',
+                        action='store_false',
+                        help='Keep per-interaction fusion mix input coefficients fixed.')
+    parser.set_defaults(ictd_fix_fusion_input_scale_trainable=False)
+    parser.add_argument('--ictd-fix-gmix-gate-init', type=float, default=1.0,
+                        help='Initial scalar gate applied to g_mix after fusion mix contraction.')
+    parser.add_argument('--ictd-fix-gmix-gate-trainable', dest='ictd_fix_gmix_gate_trainable',
+                        action='store_true',
+                        help='Make the post-contraction g_mix scalar gate trainable.')
+    parser.add_argument('--ictd-fix-gmix-gate-fixed', dest='ictd_fix_gmix_gate_trainable',
+                        action='store_false',
+                        help='Keep the post-contraction g_mix scalar gate fixed.')
+    parser.set_defaults(ictd_fix_gmix_gate_trainable=False)
     parser.add_argument('--ictd-fix-readout-head-scale-init', type=float, default=1.0,
-                        help='Initial coefficient for pure-cartesian-ictd-fix-so2 scalar readout heads '
+                        help='Initial coefficient for pure-cartesian-ictd-fix scalar readout heads '
                              '(head0=intermediate scalar readout, head1=final scalar readout).')
     parser.add_argument('--ictd-fix-readout-head-scale-trainable', dest='ictd_fix_readout_head_scale_trainable',
                         action='store_true',
-                        help='Make pure-cartesian-ictd-fix-so2 scalar readout head coefficients trainable.')
+                        help='Make pure-cartesian-ictd-fix scalar readout head coefficients trainable.')
     parser.add_argument('--ictd-fix-readout-head-scale-fixed', dest='ictd_fix_readout_head_scale_trainable',
                         action='store_false',
-                        help='Keep pure-cartesian-ictd-fix-so2 scalar readout head coefficients fixed.')
+                        help='Keep pure-cartesian-ictd-fix scalar readout head coefficients fixed.')
     parser.set_defaults(ictd_fix_readout_head_scale_trainable=False)
     parser.add_argument('--max-rank-other', type=int, default=None,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
@@ -2149,7 +2169,10 @@ def main():
         logging.info(
             "Using PURE Cartesian ICTD FIX mode (MACE-style backbone with ICTD-SO3 operators), "
             "num_interaction=%d, route=%s, contraction_combine=%s, product_backend=%s, interaction_scale=%s, "
-            "fusion_scale_init=%g, fusion_heads=%d, fusion_head_weight_mode=%s",
+            "fusion_scale_init=%g, fusion_heads=%d, fusion_head_weight_mode=%s, "
+            "fusion_input_scale_init=%g, fusion_input_scale_trainable=%s, "
+            "gmix_gate_init=%g, gmix_gate_trainable=%s, "
+            "readout_head_scale_init=%g, readout_head_scale_trainable=%s",
             args.num_interaction,
             args.ictd_fix_route,
             args.ictd_fix_contraction_combine,
@@ -2158,6 +2181,12 @@ def main():
             args.ictd_fix_fusion_scale_init,
             args.ictd_fix_fusion_heads,
             args.ictd_fix_fusion_head_weight_mode,
+            args.ictd_fix_fusion_input_scale_init,
+            args.ictd_fix_fusion_input_scale_trainable,
+            args.ictd_fix_gmix_gate_init,
+            args.ictd_fix_gmix_gate_trainable,
+            args.ictd_fix_readout_head_scale_init,
+            args.ictd_fix_readout_head_scale_trainable,
         )
         e3trans = PureCartesianICTDFix(
             max_embed_radius=config.max_radius,
@@ -2185,6 +2214,12 @@ def main():
             ictd_fix_fusion_scale_init=args.ictd_fix_fusion_scale_init,
             ictd_fix_fusion_heads=args.ictd_fix_fusion_heads,
             ictd_fix_fusion_head_weight_mode=args.ictd_fix_fusion_head_weight_mode,
+            ictd_fix_fusion_input_scale_init=args.ictd_fix_fusion_input_scale_init,
+            ictd_fix_fusion_input_scale_trainable=args.ictd_fix_fusion_input_scale_trainable,
+            ictd_fix_gmix_gate_init=args.ictd_fix_gmix_gate_init,
+            ictd_fix_gmix_gate_trainable=args.ictd_fix_gmix_gate_trainable,
+            ictd_fix_readout_head_scale_init=args.ictd_fix_readout_head_scale_init,
+            ictd_fix_readout_head_scale_trainable=args.ictd_fix_readout_head_scale_trainable,
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             ictd_tp_path_policy=args.ictd_tp_path_policy,
@@ -2208,6 +2243,51 @@ def main():
         if PureCartesianICTDFixSO2 is None:
             raise ImportError("PureCartesianICTDFixSO2 is unavailable in this build")
         e3trans = PureCartesianICTDFixSO2(
+            max_embed_radius=config.max_radius,
+            main_max_radius=config.max_radius_main,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            hidden_dim_sh=config.get_hidden_dim_sh(),
+            hidden_dim=config.emb_number_main_2,
+            channel_in2=config.channel_in2,
+            embedding_dim=config.embedding_dim,
+            max_atomvalue=config.max_atomvalue,
+            atomic_numbers=(list(config.atomic_energy_keys) if getattr(config, "atomic_energy_keys", None) is not None else None),
+            output_size=config.output_size,
+            embed_size=config.embed_size,
+            main_hidden_sizes3=config.main_hidden_sizes3,
+            num_layers=config.num_layers,
+            num_interaction=args.num_interaction,
+            function_type_main=config.function_type,
+            lmax=config.lmax,
+            ictd_fix_route=args.ictd_fix_route,
+            ictd_fix_contraction_combine=args.ictd_fix_contraction_combine,
+            ictd_fix_product_backend=args.ictd_fix_product_backend,
+            ictd_fix_interaction_scale=args.ictd_fix_interaction_scale,
+            ictd_fix_fusion_scale_init=args.ictd_fix_fusion_scale_init,
+            ictd_fix_fusion_heads=args.ictd_fix_fusion_heads,
+            ictd_fix_fusion_head_weight_mode=args.ictd_fix_fusion_head_weight_mode,
+            ictd_fix_readout_head_scale_init=args.ictd_fix_readout_head_scale_init,
+            ictd_fix_readout_head_scale_trainable=args.ictd_fix_readout_head_scale_trainable,
+            save_contraction_order=args.ictd_save_contraction_order,
+            save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
+            internal_compute_dtype=config.internal_compute_dtype,
+            interaction_compute_dtype=None,
+            contraction_compute_dtype=None,
+            avg_num_neighbors=resolved_avg_num_neighbors,
+            device=device,
+            **common_invariant_kwargs,
+            **common_long_range_kwargs,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd-escn-so2':
+        logging.info(
+            "Using PURE Cartesian ICTD eSCN-SO2 mode (edge-frame SO2 backbone/readout, no pure-U product/fusion), "
+            "num_interaction=%d",
+            args.num_interaction,
+        )
+        if PureCartesianICTDESCNSO2 is None:
+            raise ImportError("PureCartesianICTDESCNSO2 is unavailable in this build")
+        e3trans = PureCartesianICTDESCNSO2(
             max_embed_radius=config.max_radius,
             main_max_radius=config.max_radius_main,
             main_number_of_basis=config.number_of_basis_main,

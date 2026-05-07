@@ -46,6 +46,12 @@ try:
     )
 except ImportError:  # pragma: no cover
     PureCartesianICTDFixSO2 = None  # type: ignore[assignment]
+try:
+    from molecular_force_field.models.pure_cartesian_ictd_escn_so2 import (
+        PureCartesianICTDESCNSO2,
+    )
+except ImportError:  # pragma: no cover
+    PureCartesianICTDESCNSO2 = None  # type: ignore[assignment]
 from molecular_force_field.models.spherical_fix import (
     SphericalFix,
 )
@@ -153,3 +159,5 @@ if PureCartesianICTDNodeSO2TransformerLayer is not None:
     __all__.append("PureCartesianICTDNodeSO2TransformerLayer")
 if PureCartesianICTDFixSO2 is not None:
     __all__.append("PureCartesianICTDFixSO2")
+if PureCartesianICTDESCNSO2 is not None:
+    __all__.append("PureCartesianICTDESCNSO2")

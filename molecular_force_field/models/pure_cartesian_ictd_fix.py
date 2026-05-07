@@ -125,6 +125,25 @@ def _merge_blocks_subset(blocks: Dict[int, torch.Tensor], channels: int, lmax: i
     return torch.cat([blocks[l].reshape(blocks[l].shape[0], int(channels) * (2 * l + 1)) for l in range(int(lmax) + 1)], dim=-1)
 
 
+def _concat_so3_states_by_l(states: List[torch.Tensor], channels: int, lmax: int) -> torch.Tensor:
+    """
+    Concatenate multiple SO3-flat states by channel within each l-block.
+
+    Each state is laid out as [l0 | l1 | ...]. Directly concatenating states
+    along the flat dimension would produce [s0_l0 | s0_l1 | ... | s1_l0 | ...],
+    which is not a valid SO3-flat layout for a larger channel count. Equivariant
+    operators expect [all_l0_channels | all_l1_channels | ...].
+    """
+    if len(states) == 0:
+        raise ValueError("states must contain at least one SO3-flat tensor")
+    split_states = [_split_irreps(state, int(channels), int(lmax)) for state in states]
+    parts = []
+    for l in range(int(lmax) + 1):
+        block = torch.cat([split_state[l] for split_state in split_states], dim=-2)
+        parts.append(block.reshape(*block.shape[:-2], block.shape[-2] * block.shape[-1]))
+    return torch.cat(parts, dim=-1)
+
+
 def _tp_allowed_paths_from_target_lmax(lmax_in1: int, lmax_in2: int, lmax_target: int) -> List[tuple[int, int, int]]:
     """
     Mirror MACE/e3nn instruction pruning at the SO3 level:
@@ -1458,6 +1477,12 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_fusion_scale_init: float = 0.1,
         ictd_fix_fusion_heads: int = 1,
         ictd_fix_fusion_head_weight_mode: str = "softmax",
+        ictd_fix_fusion_input_scale_init: float = 1.0,
+        ictd_fix_fusion_input_scale_trainable: bool = False,
+        ictd_fix_gmix_gate_init: float = 1.0,
+        ictd_fix_gmix_gate_trainable: bool = False,
+        ictd_fix_readout_head_scale_init: float = 1.0,
+        ictd_fix_readout_head_scale_trainable: bool = False,
         save_contraction_order: int = 3,
         save_multiple_mix_channels: int | None = None,
         avg_num_neighbors: float | None = None,
@@ -1518,6 +1543,12 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_fusion_scale_init = float(ictd_fix_fusion_scale_init)
         self.ictd_fix_fusion_heads = int(ictd_fix_fusion_heads)
         self.ictd_fix_fusion_head_weight_mode = str(ictd_fix_fusion_head_weight_mode)
+        self.ictd_fix_fusion_input_scale_init = float(ictd_fix_fusion_input_scale_init)
+        self.ictd_fix_fusion_input_scale_trainable = bool(ictd_fix_fusion_input_scale_trainable)
+        self.ictd_fix_gmix_gate_init = float(ictd_fix_gmix_gate_init)
+        self.ictd_fix_gmix_gate_trainable = bool(ictd_fix_gmix_gate_trainable)
+        self.ictd_fix_readout_head_scale_init = float(ictd_fix_readout_head_scale_init)
+        self.ictd_fix_readout_head_scale_trainable = bool(ictd_fix_readout_head_scale_trainable)
         if self.ictd_fix_fusion_heads < 1:
             raise ValueError(f"ictd_fix_fusion_heads must be >= 1, got {self.ictd_fix_fusion_heads}")
         self.max_atomvalue = int(max_atomvalue)
@@ -1660,6 +1691,12 @@ class PureCartesianICTDFix(nn.Module):
             hidden_channels=16,
             output_init_std=0.003,
         )
+        if self.ictd_fix_readout_head_scale_trainable:
+            self.readout_head_scales = nn.Parameter(
+                torch.full((2,), self.ictd_fix_readout_head_scale_init, dtype=torch.get_default_dtype())
+            )
+        else:
+            self.readout_head_scales = None
 
         if self.ictd_fix_route == "fusion":
             self.save_multiple_mix_channels = resolve_save_multiple_mix_channels(
@@ -1677,6 +1714,22 @@ class PureCartesianICTDFix(nn.Module):
                 correlation=save_contraction_order,
             )
             self.multiple_contract_fuse = None
+            if self.ictd_fix_fusion_input_scale_trainable:
+                self.fusion_input_scales = nn.Parameter(
+                    torch.full(
+                        (self.num_interaction,),
+                        self.ictd_fix_fusion_input_scale_init,
+                        dtype=torch.get_default_dtype(),
+                    )
+                )
+            else:
+                self.fusion_input_scales = None
+            if self.ictd_fix_gmix_gate_trainable:
+                self.g_mix_gate = nn.Parameter(
+                    torch.tensor(self.ictd_fix_gmix_gate_init, dtype=torch.get_default_dtype())
+                )
+            else:
+                self.g_mix_gate = None
             self.fusion_readouts = nn.ModuleList(
                 [
                     FusionProduct5ReadoutSO3(
@@ -1725,6 +1778,23 @@ class PureCartesianICTDFix(nn.Module):
             self.fusion_head_logits = None
             self.fusion_head_weights = None
             self.fusion_energy_scale = None
+            self.fusion_input_scales = None
+            self.g_mix_gate = None
+
+    def _readout_head_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
+        if self.readout_head_scales is None:
+            return ref.new_tensor(self.ictd_fix_readout_head_scale_init)
+        return self.readout_head_scales[index].to(dtype=ref.dtype, device=ref.device)
+
+    def _fusion_input_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
+        if self.fusion_input_scales is None:
+            return ref.new_tensor(self.ictd_fix_fusion_input_scale_init)
+        return self.fusion_input_scales[index].to(dtype=ref.dtype, device=ref.device)
+
+    def _g_mix_gate(self, ref: torch.Tensor) -> torch.Tensor:
+        if self.g_mix_gate is None:
+            return ref.new_tensor(self.ictd_fix_gmix_gate_init)
+        return self.g_mix_gate.to(dtype=ref.dtype, device=ref.device)
 
     def forward(
         self,
@@ -1812,21 +1882,29 @@ class PureCartesianICTDFix(nn.Module):
                 layer_states.append(last_preproduct_state)
                 h_last = product(node_feats=message, sc=sc, node_attrs=node_attrs)
                 e_layer = self.last_layer_energy_readout(h_last)
+                e_layer = self._readout_head_scale(1, e_layer) * e_layer
             else:
                 h = product(node_feats=message, sc=sc, node_attrs=node_attrs)
                 layer_states.append(h)
                 if layer_idx < self.num_interaction - 1:
                     e_layer = self.layer_energy_readouts[layer_idx](h)
+                    e_layer = self._readout_head_scale(0, e_layer) * e_layer
                 else:
                     e_layer = self.last_layer_energy_readout(h)
+                    e_layer = self._readout_head_scale(1, e_layer) * e_layer
             total_energy = e_layer if total_energy is None else (total_energy + e_layer)
 
         combined_features = torch.cat(layer_states, dim=-1)
         if self.ictd_fix_route == "fusion":
             if last_preproduct_state is None:
                 raise RuntimeError("fusion route expected a last_preproduct_state but none was produced")
-            mix_inputs = torch.cat(layer_states, dim=-1)
+            fusion_mix_states = [
+                self._fusion_input_scale(idx, state) * state
+                for idx, state in enumerate(layer_states)
+            ]
+            mix_inputs = _concat_so3_states_by_l(fusion_mix_states, self.channels, self.lmax)
             g_mix = self.multiple_contraction_mix(mix_inputs, node_attrs)
+            g_mix = self._g_mix_gate(g_mix) * g_mix
             fusion_inputs = layer_states + [g_mix]
             if self.ictd_fix_fusion_heads == 1:
                 fusion_energy = self.fusion_readout(fusion_inputs)

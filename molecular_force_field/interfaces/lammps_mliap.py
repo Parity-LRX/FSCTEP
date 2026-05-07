@@ -70,6 +70,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers import (
 from molecular_force_field.models.pure_cartesian_ictd_layers_full import PureCartesianICTDTransformerLayer
 from molecular_force_field.models.pure_cartesian_ictd_layers_full_o3 import PureCartesianICTDO3TransformerLayer
 from molecular_force_field.models.pure_cartesian_ictd_layers_o3 import PureCartesianICTDSaveO3TransformerLayer
+from molecular_force_field.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
 from molecular_force_field.utils.config import ModelConfig
 from molecular_force_field.utils.checkpoint_metadata import (
     derive_long_range_far_max_radius_multiplier,
@@ -941,6 +942,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         - "pure-cartesian-ictd-save": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers)
         - "pure-cartesian-ictd-save-multiple": PureCartesianICTDTransformerLayer (pure_cartesian_ictd_layers, multi-branch contraction)
         - "pure-cartesian-ictd-save-o3": PureCartesianICTDSaveO3TransformerLayer (pure_cartesian_ictd_layers_o3)
+        - "pure-cartesian-ictd-fix": PureCartesianICTDFix (pure_cartesian_ictd_fix)
         """
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         selected_state_dict, state_source = get_checkpoint_e3_state_dict(ckpt)
@@ -1090,7 +1092,151 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         if save_multiple_mix_channels is not None:
             save_multiple_mix_channels = int(save_multiple_mix_channels)
 
-        if mode == "pure-cartesian-ictd":
+        if mode == "pure-cartesian-ictd-fix":
+            ictd_tp_path_policy = ictd_tp_path_policy or ckpt.get("ictd_tp_path_policy") or arch_meta.get("ictd_tp_path_policy", "full")
+            ictd_tp_max_rank_other = (
+                ictd_tp_max_rank_other
+                if ictd_tp_max_rank_other is not None
+                else ckpt.get("ictd_tp_max_rank_other", arch_meta.get("ictd_tp_max_rank_other"))
+            )
+            has_fusion_mix = any(k.startswith("multiple_contraction_mix") for k in selected_state_dict)
+            has_softmax_heads = "fusion_head_logits" in selected_state_dict
+            has_free_heads = "fusion_head_weights" in selected_state_dict
+            if has_softmax_heads:
+                inferred_fusion_heads = int(selected_state_dict["fusion_head_logits"].numel())
+                inferred_head_mode = "softmax"
+            elif has_free_heads:
+                inferred_fusion_heads = int(selected_state_dict["fusion_head_weights"].numel())
+                inferred_head_mode = "free"
+            else:
+                inferred_fusion_heads = 1
+                inferred_head_mode = "softmax"
+            atomic_numbers = aek.detach().cpu().to(dtype=torch.long).tolist() if aek is not None else None
+            model = PureCartesianICTDFix(
+                max_embed_radius=config.max_radius,
+                main_max_radius=config.max_radius_main,
+                main_number_of_basis=config.number_of_basis_main,
+                hidden_dim_conv=config.channel_in,
+                hidden_dim_sh=config.get_hidden_dim_sh(),
+                hidden_dim=config.emb_number_main_2,
+                channel_in2=config.channel_in2,
+                embedding_dim=config.embedding_dim,
+                max_atomvalue=config.max_atomvalue,
+                atomic_numbers=atomic_numbers,
+                output_size=config.output_size,
+                embed_size=config.embed_size,
+                main_hidden_sizes3=config.main_hidden_sizes3,
+                num_layers=config.num_layers,
+                num_interaction=num_interaction,
+                invariant_channels=invariant_channels,
+                function_type_main=config.function_type,
+                lmax=config.lmax,
+                ictd_tp_path_policy=ictd_tp_path_policy,
+                ictd_tp_max_rank_other=ictd_tp_max_rank_other,
+                internal_compute_dtype=config.internal_compute_dtype,
+                ictd_save_tp_mode=str(
+                    ckpt.get("ictd_save_tp_mode")
+                    or arch_meta.get("ictd_save_tp_mode", "fully-connected")
+                ),
+                ictd_fix_route=str(
+                    ckpt.get("ictd_fix_route")
+                    or arch_meta.get("ictd_fix_route", "fusion" if has_fusion_mix else "baseline")
+                ),
+                ictd_fix_contraction_combine=str(
+                    ckpt.get("ictd_fix_contraction_combine")
+                    or arch_meta.get("ictd_fix_contraction_combine", "softmax")
+                ),
+                ictd_fix_product_backend=str(
+                    ckpt.get("ictd_fix_product_backend")
+                    or arch_meta.get("ictd_fix_product_backend", "ictd-pure-u")
+                ),
+                ictd_fix_interaction_scale=str(
+                    ckpt.get("ictd_fix_interaction_scale")
+                    or arch_meta.get("ictd_fix_interaction_scale", "none")
+                ),
+                ictd_fix_fusion_scale_init=float(
+                    ckpt.get("ictd_fix_fusion_scale_init")
+                    or arch_meta.get("ictd_fix_fusion_scale_init", 0.1)
+                ),
+                ictd_fix_fusion_heads=int(
+                    ckpt.get("ictd_fix_fusion_heads")
+                    or arch_meta.get("ictd_fix_fusion_heads")
+                    or inferred_fusion_heads
+                ),
+                ictd_fix_fusion_head_weight_mode=str(
+                    ckpt.get("ictd_fix_fusion_head_weight_mode")
+                    or arch_meta.get("ictd_fix_fusion_head_weight_mode", inferred_head_mode)
+                ),
+                ictd_fix_fusion_input_scale_init=float(
+                    ckpt.get("ictd_fix_fusion_input_scale_init")
+                    or arch_meta.get("ictd_fix_fusion_input_scale_init", 1.0)
+                ),
+                ictd_fix_fusion_input_scale_trainable=(
+                    "fusion_input_scales" in selected_state_dict
+                    or bool(arch_meta.get("ictd_fix_fusion_input_scale_trainable", False))
+                ),
+                ictd_fix_gmix_gate_init=float(
+                    ckpt.get("ictd_fix_gmix_gate_init")
+                    or arch_meta.get("ictd_fix_gmix_gate_init", 1.0)
+                ),
+                ictd_fix_gmix_gate_trainable=(
+                    "g_mix_gate" in selected_state_dict
+                    or bool(arch_meta.get("ictd_fix_gmix_gate_trainable", False))
+                ),
+                ictd_fix_readout_head_scale_init=float(
+                    ckpt.get("ictd_fix_readout_head_scale_init")
+                    or arch_meta.get("ictd_fix_readout_head_scale_init", 1.0)
+                ),
+                ictd_fix_readout_head_scale_trainable=(
+                    "readout_head_scales" in selected_state_dict
+                    or bool(arch_meta.get("ictd_fix_readout_head_scale_trainable", False))
+                ),
+                save_contraction_order=save_contraction_order,
+                save_multiple_mix_channels=save_multiple_mix_channels,
+                avg_num_neighbors=float(
+                    ckpt.get("avg_num_neighbors")
+                    or arch_meta.get("avg_num_neighbors", 14.38)
+                ),
+                device=torch.device(device),
+                long_range_mode=long_range_mode,
+                long_range_hidden_dim=long_range_hidden_dim,
+                long_range_boundary=long_range_boundary,
+                long_range_neutralize=long_range_neutralize,
+                long_range_filter_hidden_dim=long_range_filter_hidden_dim,
+                long_range_kmax=long_range_kmax,
+                long_range_mesh_size=long_range_mesh_size,
+                long_range_slab_padding_factor=long_range_slab_padding_factor,
+                long_range_include_k0=long_range_include_k0,
+                long_range_source_channels=long_range_source_channels,
+                long_range_backend=long_range_backend,
+                long_range_reciprocal_backend=long_range_reciprocal_backend,
+                long_range_energy_partition=long_range_energy_partition,
+                long_range_green_mode=long_range_green_mode,
+                long_range_assignment=long_range_assignment,
+                long_range_theta=long_range_theta,
+                long_range_leaf_size=long_range_leaf_size,
+                long_range_multipole_order=long_range_multipole_order,
+                long_range_far_source_dim=long_range_far_source_dim,
+                long_range_far_num_shells=long_range_far_num_shells,
+                long_range_far_shell_growth=long_range_far_shell_growth,
+                long_range_far_tail=long_range_far_tail,
+                long_range_far_tail_bins=long_range_far_tail_bins,
+                long_range_far_stats=long_range_far_stats,
+                long_range_far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+                long_range_far_source_norm=long_range_far_source_norm,
+                long_range_far_gate_init=long_range_far_gate_init,
+                feature_spectral_mode=feature_spectral_mode,
+                feature_spectral_bottleneck_dim=feature_spectral_bottleneck_dim,
+                feature_spectral_mesh_size=feature_spectral_mesh_size,
+                feature_spectral_filter_hidden_dim=feature_spectral_filter_hidden_dim,
+                feature_spectral_boundary=feature_spectral_boundary,
+                feature_spectral_slab_padding_factor=feature_spectral_slab_padding_factor,
+                feature_spectral_neutralize=feature_spectral_neutralize,
+                feature_spectral_include_k0=feature_spectral_include_k0,
+                feature_spectral_assignment=feature_spectral_assignment,
+                feature_spectral_gate_init=feature_spectral_gate_init,
+            ).to(device)
+        elif mode == "pure-cartesian-ictd":
             model = PureCartesianICTDTransformerLayer(
                 max_embed_radius=config.max_radius,
                 main_max_radius=config.max_radius_main,
@@ -1604,7 +1750,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         # Optional TorchScript tracing
         use_ts = bool(torchscript) or (os.environ.get("MLIAP_USE_TORCHSCRIPT", "").lower() in ("1", "true", "yes"))
         if use_ts:
-            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple", "pure-cartesian-ictd-save-o3", "spherical-save-cue")
+            _ts_supported = ("pure-cartesian-ictd", "pure-cartesian-ictd-o3", "pure-cartesian-ictd-save", "pure-cartesian-ictd-save-multiple", "pure-cartesian-ictd-save-o3", "pure-cartesian-ictd-fix", "spherical-save-cue")
             if mode not in _ts_supported:
                 raise ValueError(f"TorchScript export is only supported for {_ts_supported}, got {mode!r}")
             model = _maybe_torchscript_trace_model(

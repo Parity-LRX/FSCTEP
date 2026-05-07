@@ -15,6 +15,13 @@ from molecular_force_field.models.pure_cartesian_ictd_fix_so2 import (
     _so3_blocks_to_node_local_so2_fast,
     _strict_so3_u_tensor_in_local_so2_basis,
 )
+from molecular_force_field.models.pure_cartesian_ictd_escn_so2 import (
+    ICTDS2GridActivation,
+    ICTDSO2Convolution,
+    PureCartesianICTDESCNSO2,
+    _pack_m_major_so2,
+    _unpack_m_major_so2,
+)
 
 
 def _make_dummy_graph(
@@ -80,6 +87,163 @@ def _run_model_smoke(device: torch.device, route: str):
 def test_pure_cartesian_ictd_fix_so2_cpu_smoke() -> None:
     _run_model_smoke(torch.device("cpu"), "baseline")
     _run_model_smoke(torch.device("cpu"), "fusion")
+
+
+def test_pure_cartesian_ictd_escn_so2_cpu_smoke() -> None:
+    dtype = torch.float32
+    device = torch.device("cpu")
+    pos, A, batch, edge_src, edge_dst, edge_shifts, cell = _make_dummy_graph(
+        device,
+        dtype,
+        num_nodes=16,
+        avg_degree=4,
+    )
+    pos = pos.requires_grad_(True)
+    model = PureCartesianICTDESCNSO2(
+        max_embed_radius=5.0,
+        main_max_radius=5.0,
+        main_number_of_basis=4,
+        hidden_dim_conv=8,
+        hidden_dim_sh=8,
+        hidden_dim=8,
+        lmax=1,
+        num_interaction=2,
+        ictd_fix_route="fusion",
+        ictd_fix_fusion_heads=4,
+        ictd_fix_fusion_head_weight_mode="softmax",
+        ictd_fix_readout_head_scale_init=0.3,
+        ictd_fix_readout_head_scale_trainable=True,
+        save_contraction_order=2,
+        internal_compute_dtype=None,
+    ).to(device=device, dtype=dtype)
+    out, feats = model(
+        pos,
+        A,
+        batch,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        return_combined_features=True,
+    )
+    assert out.shape == (pos.shape[0], 1)
+    assert feats.shape[0] == pos.shape[0]
+    assert len(model.blocks) == 2
+    assert not hasattr(model, "products")
+    assert not hasattr(model, "fusion_readouts")
+    loss = out.square().mean()
+    loss.backward()
+    assert pos.grad is not None
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(feats).all()
+    assert torch.isfinite(pos.grad).all()
+
+
+def _random_so2_local(num_nodes: int, channels: int, lmax: int, *, dtype: torch.dtype) -> dict[tuple[int, int], torch.Tensor]:
+    local: dict[tuple[int, int], torch.Tensor] = {}
+    for l in range(lmax + 1):
+        local[(l, 0)] = torch.randn(num_nodes, channels, 1, dtype=dtype)
+        for m in range(1, l + 1):
+            local[(l, m)] = torch.randn(num_nodes, channels, 2, dtype=dtype)
+    return local
+
+
+def _rotate_so2_local_z(
+    local: dict[tuple[int, int], torch.Tensor],
+    theta: float,
+) -> dict[tuple[int, int], torch.Tensor]:
+    out: dict[tuple[int, int], torch.Tensor] = {}
+    for (l, m), block in local.items():
+        if m == 0:
+            out[(l, m)] = block.clone()
+            continue
+        c = torch.cos(block.new_tensor(float(m) * theta))
+        s = torch.sin(block.new_tensor(float(m) * theta))
+        x = block[..., 0]
+        y = block[..., 1]
+        out[(l, m)] = torch.stack([c * x - s * y, s * x + c * y], dim=-1)
+    return out
+
+
+def test_escn_so2_m_major_pack_roundtrip() -> None:
+    torch.manual_seed(0)
+    local = _random_so2_local(5, 4, 3, dtype=torch.float32)
+    packed = _pack_m_major_so2(local, lmax=3, mmax=3)
+    restored = _unpack_m_major_so2(packed, lmax=3, channels=4, mmax=3)
+    assert list(packed) == [0, 1, 2, 3]
+    assert packed[0].shape == (5, 4, 4, 1)
+    assert packed[1].shape == (5, 3, 4, 2)
+    for key in local:
+        assert torch.equal(local[key], restored[key])
+
+
+def test_escn_so2_convolution_block_equivariance_smoke() -> None:
+    torch.manual_seed(1)
+    local = _random_so2_local(7, 3, 2, dtype=torch.float32)
+    conv = ICTDSO2Convolution(in_channels=3, out_channels=5, lmax=2, external_weights=False)
+    theta = 0.41
+    y_rotated_input = conv(_rotate_so2_local_z(local, theta))
+    y_rotated_output = _rotate_so2_local_z(conv(local), theta)
+    for key in y_rotated_output:
+        assert torch.allclose(y_rotated_input[key], y_rotated_output[key], atol=2e-6, rtol=2e-6)
+
+
+def test_escn_s2_grid_activation_forward_backward_finite() -> None:
+    torch.manual_seed(2)
+    local = _random_so2_local(6, 4, 2, dtype=torch.float32)
+    local = {key: value.requires_grad_(True) for key, value in local.items()}
+    act = ICTDS2GridActivation(channels=4, lmax=2, grid_points=64)
+    out = act(local)
+    loss = sum(value.square().mean() for value in out.values())
+    loss.backward()
+    for key in local:
+        assert out[key].shape == local[key].shape
+        assert torch.isfinite(out[key]).all()
+        assert local[key].grad is not None
+        assert torch.isfinite(local[key].grad).all()
+
+
+def test_pure_cartesian_ictd_escn_so2_z_rotation_energy_force_smoke() -> None:
+    torch.manual_seed(3)
+    dtype = torch.float32
+    device = torch.device("cpu")
+    pos, A, batch, edge_src, edge_dst, edge_shifts, cell = _make_dummy_graph(
+        device,
+        dtype,
+        num_nodes=10,
+        avg_degree=3,
+        seed=3,
+    )
+    model = PureCartesianICTDESCNSO2(
+        main_max_radius=5.0,
+        main_number_of_basis=4,
+        hidden_dim_conv=6,
+        hidden_dim_sh=6,
+        hidden_dim=6,
+        lmax=1,
+        num_interaction=2,
+        ictd_fix_route="fusion",
+        ictd_fix_fusion_heads=4,
+        ictd_fix_fusion_head_weight_mode="softmax",
+        ictd_fix_readout_head_scale_init=0.3,
+        ictd_fix_readout_head_scale_trainable=True,
+        save_contraction_order=2,
+        internal_compute_dtype=None,
+    ).to(device=device, dtype=dtype)
+    theta = 0.23
+    c = torch.cos(torch.tensor(theta, dtype=dtype))
+    s = torch.sin(torch.tensor(theta, dtype=dtype))
+    R = torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=dtype)
+    pos1 = pos.detach().clone().requires_grad_(True)
+    pos2 = (pos.detach() @ R.T).requires_grad_(True)
+
+    e1 = model(pos1, A, batch, edge_src, edge_dst, edge_shifts, cell)
+    e2 = model(pos2, A, batch, edge_src, edge_dst, edge_shifts, cell)
+    g1 = torch.autograd.grad(e1.sum(), pos1, create_graph=False)[0]
+    g2 = torch.autograd.grad(e2.sum(), pos2, create_graph=False)[0]
+
+    assert torch.allclose(e1, e2, atol=2e-3, rtol=2e-3)
+    assert torch.allclose(g2, g1 @ R.T, atol=5e-2, rtol=5e-2)
 
 
 def test_fix_so2_contraction_uses_o2_complete_stack() -> None:
