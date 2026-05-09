@@ -1191,6 +1191,12 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                     "readout_head_scales" in selected_state_dict
                     or bool(arch_meta.get("ictd_fix_readout_head_scale_trainable", False))
                 ),
+                ictd_fix_fusion_readout_mixed_channels=bool(
+                    ckpt.get(
+                        "ictd_fix_fusion_readout_mixed_channels",
+                        arch_meta.get("ictd_fix_fusion_readout_mixed_channels", False),
+                    )
+                ),
                 save_contraction_order=save_contraction_order,
                 save_multiple_mix_channels=save_multiple_mix_channels,
                 avg_num_neighbors=float(

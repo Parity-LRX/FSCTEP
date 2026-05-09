@@ -842,6 +842,17 @@ def main():
                         action='store_false',
                         help='Keep pure-cartesian-ictd-fix scalar readout head coefficients fixed.')
     parser.set_defaults(ictd_fix_readout_head_scale_trainable=False)
+    parser.add_argument('--ictd-fix-fusion-readout-mixed-channels',
+                        dest='ictd_fix_fusion_readout_mixed_channels',
+                        action='store_true',
+                        help='Allow pure-cartesian-ictd-fix fusion product5 readout to consume g_mix with '
+                             'save_multiple_mix_channels directly instead of projecting g_mix back to backbone channels. '
+                             'This is the default for new training runs.')
+    parser.add_argument('--no-ictd-fix-fusion-readout-mixed-channels',
+                        dest='ictd_fix_fusion_readout_mixed_channels',
+                        action='store_false',
+                        help='Use the legacy same-channel fusion readout by projecting g_mix back to backbone channels.')
+    parser.set_defaults(ictd_fix_fusion_readout_mixed_channels=True)
     parser.add_argument('--max-rank-other', type=int, default=None,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
                              'If not set, restore from checkpoint when available, else use 1. '
@@ -2172,7 +2183,8 @@ def main():
             "fusion_scale_init=%g, fusion_heads=%d, fusion_head_weight_mode=%s, "
             "fusion_input_scale_init=%g, fusion_input_scale_trainable=%s, "
             "gmix_gate_init=%g, gmix_gate_trainable=%s, "
-            "readout_head_scale_init=%g, readout_head_scale_trainable=%s",
+            "readout_head_scale_init=%g, readout_head_scale_trainable=%s, "
+            "fusion_readout_mixed_channels=%s",
             args.num_interaction,
             args.ictd_fix_route,
             args.ictd_fix_contraction_combine,
@@ -2187,6 +2199,7 @@ def main():
             args.ictd_fix_gmix_gate_trainable,
             args.ictd_fix_readout_head_scale_init,
             args.ictd_fix_readout_head_scale_trainable,
+            args.ictd_fix_fusion_readout_mixed_channels,
         )
         e3trans = PureCartesianICTDFix(
             max_embed_radius=config.max_radius,
@@ -2220,6 +2233,7 @@ def main():
             ictd_fix_gmix_gate_trainable=args.ictd_fix_gmix_gate_trainable,
             ictd_fix_readout_head_scale_init=args.ictd_fix_readout_head_scale_init,
             ictd_fix_readout_head_scale_trainable=args.ictd_fix_readout_head_scale_trainable,
+            ictd_fix_fusion_readout_mixed_channels=args.ictd_fix_fusion_readout_mixed_channels,
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             ictd_tp_path_policy=args.ictd_tp_path_policy,

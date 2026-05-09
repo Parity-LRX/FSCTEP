@@ -1201,6 +1201,51 @@ class FusionProduct5ReadoutSO3(nn.Module):
         return self.proj_total(f_prod5)
 
 
+class FusionProduct5ReadoutSO3Mixed(nn.Module):
+    """Product5 readout for SO3 blocks with different channel counts."""
+
+    def __init__(
+        self,
+        *,
+        channels_per_block: list[int] | tuple[int, ...],
+        lmax: int,
+        hidden_sizes: list[int] | tuple[int, ...],
+        output_init_std: float = 0.003,
+        internal_compute_dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.channels_per_block = tuple(int(c) for c in channels_per_block)
+        self.lmax = int(lmax)
+        self.num_feature_blocks = len(self.channels_per_block)
+        if self.num_feature_blocks < 1:
+            raise ValueError("channels_per_block must contain at least one feature block")
+        if any(c < 1 for c in self.channels_per_block):
+            raise ValueError(f"channels_per_block entries must be positive, got {self.channels_per_block}")
+        self.total_channels = int(sum(self.channels_per_block))
+        self.product_5 = HarmonicElementwiseProduct(
+            lmax=self.lmax,
+            mul=self.total_channels,
+            irreps_out="0e",
+            internal_compute_dtype=internal_compute_dtype,
+        )
+        proj_in_dim = self.total_channels * (self.lmax + 1)
+        self.proj_total = MainNet(proj_in_dim, list(hidden_sizes), 1, output_init_std=output_init_std)
+
+    def forward(self, features: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if len(features) != self.num_feature_blocks:
+            raise ValueError(f"Expected {self.num_feature_blocks} feature blocks, got {len(features)}")
+        split_features = [
+            _split_irreps(x, channels, self.lmax)
+            for x, channels in zip(features, self.channels_per_block)
+        ]
+        t_blocks = {
+            l: torch.cat([blocks[l] for blocks in split_features], dim=-2)
+            for l in range(self.lmax + 1)
+        }
+        f_prod5 = self.product_5(t_blocks, t_blocks)
+        return self.proj_total(f_prod5)
+
+
 class MACEStyleScalarReadoutSO3(nn.Module):
     """Native MACE final readout shape for this config: Cx0e -> 16x0e -> 1x0e."""
 
@@ -1483,6 +1528,7 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_gmix_gate_trainable: bool = False,
         ictd_fix_readout_head_scale_init: float = 1.0,
         ictd_fix_readout_head_scale_trainable: bool = False,
+        ictd_fix_fusion_readout_mixed_channels: bool = True,
         save_contraction_order: int = 3,
         save_multiple_mix_channels: int | None = None,
         avg_num_neighbors: float | None = None,
@@ -1549,6 +1595,7 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_gmix_gate_trainable = bool(ictd_fix_gmix_gate_trainable)
         self.ictd_fix_readout_head_scale_init = float(ictd_fix_readout_head_scale_init)
         self.ictd_fix_readout_head_scale_trainable = bool(ictd_fix_readout_head_scale_trainable)
+        self.ictd_fix_fusion_readout_mixed_channels = bool(ictd_fix_fusion_readout_mixed_channels)
         if self.ictd_fix_fusion_heads < 1:
             raise ValueError(f"ictd_fix_fusion_heads must be >= 1, got {self.ictd_fix_fusion_heads}")
         self.max_atomvalue = int(max_atomvalue)
@@ -1713,7 +1760,16 @@ class PureCartesianICTDFix(nn.Module):
                 lmax=self.lmax,
                 correlation=save_contraction_order,
             )
-            self.multiple_contract_fuse = None
+            self.multiple_contract_fuse = (
+                nn.Identity()
+                if self.ictd_fix_fusion_readout_mixed_channels or self.save_multiple_mix_channels == self.channels
+                else EquivariantChannelLinearSO3Rect(
+                    self.save_multiple_mix_channels,
+                    self.channels,
+                    self.lmax,
+                    bias=False,
+                )
+            )
             if self.ictd_fix_fusion_input_scale_trainable:
                 self.fusion_input_scales = nn.Parameter(
                     torch.full(
@@ -1730,18 +1786,27 @@ class PureCartesianICTDFix(nn.Module):
                 )
             else:
                 self.g_mix_gate = None
+            if self.ictd_fix_fusion_readout_mixed_channels:
+                fusion_readout_cls = FusionProduct5ReadoutSO3Mixed
+                fusion_readout_kwargs = dict(
+                    channels_per_block=[self.channels] * self.num_interaction + [self.save_multiple_mix_channels],
+                    lmax=self.lmax,
+                    hidden_sizes=main_hidden_sizes3,
+                    output_init_std=0.003,
+                    internal_compute_dtype=internal_compute_dtype,
+                )
+            else:
+                fusion_readout_cls = FusionProduct5ReadoutSO3
+                fusion_readout_kwargs = dict(
+                    channels=self.channels,
+                    lmax=self.lmax,
+                    num_feature_blocks=self.num_interaction + 1,
+                    hidden_sizes=main_hidden_sizes3,
+                    output_init_std=0.003,
+                    internal_compute_dtype=internal_compute_dtype,
+                )
             self.fusion_readouts = nn.ModuleList(
-                [
-                    FusionProduct5ReadoutSO3(
-                        channels=self.channels,
-                        lmax=self.lmax,
-                        num_feature_blocks=self.num_interaction + 1,
-                        hidden_sizes=main_hidden_sizes3,
-                        output_init_std=0.003,
-                        internal_compute_dtype=internal_compute_dtype,
-                    )
-                    for _ in range(self.ictd_fix_fusion_heads)
-                ]
+                [fusion_readout_cls(**fusion_readout_kwargs) for _ in range(self.ictd_fix_fusion_heads)]
             )
             self.fusion_readout = self.fusion_readouts[0]
             if self.ictd_fix_fusion_heads == 1:
@@ -1905,6 +1970,7 @@ class PureCartesianICTDFix(nn.Module):
             mix_inputs = _concat_so3_states_by_l(fusion_mix_states, self.channels, self.lmax)
             g_mix = self.multiple_contraction_mix(mix_inputs, node_attrs)
             g_mix = self._g_mix_gate(g_mix) * g_mix
+            g_mix = self.multiple_contract_fuse(g_mix)
             fusion_inputs = layer_states + [g_mix]
             if self.ictd_fix_fusion_heads == 1:
                 fusion_energy = self.fusion_readout(fusion_inputs)
