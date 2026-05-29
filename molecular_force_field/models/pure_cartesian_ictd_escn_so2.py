@@ -288,7 +288,7 @@ def _edge_radial_basis(
     max_radius: float,
     function_type: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from e3nn.math import soft_one_hot_linspace
+    from molecular_force_field.models.radial_basis import soft_one_hot_linspace_mace_cutoff as soft_one_hot_linspace
 
     dtype = edge_length.dtype
     radial = (

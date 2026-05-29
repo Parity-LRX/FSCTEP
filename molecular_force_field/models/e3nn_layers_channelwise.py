@@ -26,12 +26,12 @@ import torch
 import torch.nn as nn
 from e3nn import o3
 from e3nn import nn as e3nn_nn
-from e3nn.math import soft_one_hot_linspace
 from e3nn.nn import Gate
 from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
 from molecular_force_field.models.long_range import apply_long_range_modules, configure_long_range_modules
+from molecular_force_field.models.radial_basis import mace_radial_embedding
 
 
 def _scatter_sum_maybe_compiled(
@@ -159,14 +159,12 @@ class _ChannelwiseEdgeConv(nn.Module):
         )
 
         # Radial embedding -> per-edge TP weights
-        emb = soft_one_hot_linspace(
+        emb = mace_radial_embedding(
             edge_length,
-            0.0,
-            self.r_max,
-            self.number_of_basis,
-            basis=self.function_type,
-            cutoff=True,
-        ).mul(self.number_of_basis ** 0.5)
+            r_max=self.r_max,
+            number_of_basis=self.number_of_basis,
+            function_type=self.function_type,
+        )
         w = self.conv_tp_weights(emb)
 
         # Linear-up then channelwise TP on edges

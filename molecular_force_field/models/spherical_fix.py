@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import nn as e3nn_nn
 from e3nn import o3
-from e3nn.math import soft_one_hot_linspace
+from molecular_force_field.models.radial_basis import soft_one_hot_linspace_mace_cutoff as soft_one_hot_linspace
 
 from molecular_force_field.models._mace_symmetric_contraction import (
     MaceSymmetricContraction,

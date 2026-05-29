@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-from e3nn.math import soft_one_hot_linspace
+from molecular_force_field.models.radial_basis import soft_one_hot_linspace_mace_cutoff as soft_one_hot_linspace
 
 from molecular_force_field.models.ictd_irreps import direction_harmonics_all
 from molecular_force_field.models.mlp import MainNet

@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from molecular_force_field.models.long_range import build_feature_spectral_module, build_long_range_module
 from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
+from molecular_force_field.models.radial_basis import mace_polynomial_cutoff
 from molecular_force_field.utils.fidelity import (
     apply_delta_energy_heads,
     apply_fidelity_embedding,
@@ -187,7 +188,7 @@ def _radial_embedding(
         emb = torch.exp(-0.5 * ((x[:, None] - centers[None, :]) / max(sigma, 1e-6)) ** 2)
 
     emb = emb * (nb**0.5)
-    emb = emb * (r <= r_max).to(dtype=r.dtype)[:, None]
+    emb = emb * mace_polynomial_cutoff(r, r_max, p=6)[:, None]
     return emb.reshape(-1, nb)
 
 

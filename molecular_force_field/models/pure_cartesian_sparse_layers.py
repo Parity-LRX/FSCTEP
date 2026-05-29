@@ -12,11 +12,11 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
-from e3nn.math import soft_one_hot_linspace
 from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import RobustScalarWeightedSum
 from molecular_force_field.models.long_range import apply_long_range_modules, configure_long_range_modules
+from molecular_force_field.models.radial_basis import mace_radial_embedding
 from molecular_force_field.models.pure_cartesian import (
     PureCartesianTensorProductO3Sparse,
     PureCartesianElementwiseTensorProductO3,
@@ -316,9 +316,12 @@ class PureCartesianSparseE3Conv(nn.Module):
             x2_blocks[(1, L)] = z  # Shared zero tensor (both are zero, never written to)
         x2 = merge_by_rank_o3(x2_blocks, self.output_size, self.Lmax)
 
-        emb = soft_one_hot_linspace(
-            edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True
-        ).mul(self.number_of_basis ** 0.5)
+        emb = mace_radial_embedding(
+            edge_length,
+            r_max=self.max_radius,
+            number_of_basis=self.number_of_basis,
+            function_type=self.function_type,
+        )
         emb = emb.to(dtype=Ai.dtype)
         weights = self.fc(emb)
 
@@ -407,9 +410,12 @@ class PureCartesianSparseE3Conv2(nn.Module):
             e_blocks[(1, L)] = z_base
         e_flat = merge_by_rank_o3(e_blocks, 1, self.Lmax)
 
-        emb = soft_one_hot_linspace(
-            edge_length, 0.0, self.max_radius, self.number_of_basis, basis=self.function_type, cutoff=True
-        ).mul(self.number_of_basis ** 0.5)
+        emb = mace_radial_embedding(
+            edge_length,
+            r_max=self.max_radius,
+            number_of_basis=self.number_of_basis,
+            function_type=self.function_type,
+        )
         emb = emb.to(dtype=f_in.dtype)
         weights = self.fc(emb)
 

@@ -98,22 +98,16 @@ def _build_node_local_moments_escn(
     per-node SO3 blocks, then ``so3_blocks_to_node_local_so2`` rotates and
     decomposes into (l,m).  O(E·l²) harmonic eval + O(N·l²) rotation replaces
     the original O(E) per-edge vector rotation + O(E·l²) harmonic eval."""
-    from e3nn.math import soft_one_hot_linspace as _soft_one_hot
     from molecular_force_field.models.ictd_irreps import direction_harmonics_all as _sh
+    from molecular_force_field.models.radial_basis import mace_radial_embedding
 
     dtype = edge_vec.dtype
-    radial = (
-        _soft_one_hot(
-            edge_length,
-            0.0,
-            float(max_radius),
-            int(number_of_basis),
-            basis=str(function_type),
-            cutoff=True,
-        )
-        .mul(int(number_of_basis) ** 0.5)
-        .to(dtype=dtype)
-    )
+    radial = mace_radial_embedding(
+        edge_length,
+        r_max=float(max_radius),
+        number_of_basis=int(number_of_basis),
+        function_type=str(function_type),
+    ).to(dtype=dtype)
     neighbor_count = (
         scatter(edge_mask.to(dtype=dtype).view(-1), edge_dst, dim=0, dim_size=int(num_nodes), reduce="sum")
         .clamp(min=1.0)
@@ -153,22 +147,16 @@ def _build_edge_local_so3_moments_escn(
     G_node: torch.Tensor | None,
     compute_dtype: torch.dtype,
 ):
-    from e3nn.math import soft_one_hot_linspace as _soft_one_hot
     from molecular_force_field.models.ictd_irreps import direction_harmonics_all as _sh
+    from molecular_force_field.models.radial_basis import mace_radial_embedding
 
     dtype = edge_vec.dtype
-    radial = (
-        _soft_one_hot(
-            edge_length,
-            0.0,
-            float(max_radius),
-            int(number_of_basis),
-            basis=str(function_type),
-            cutoff=True,
-        )
-        .mul(int(number_of_basis) ** 0.5)
-        .to(dtype=dtype)
-    )
+    radial = mace_radial_embedding(
+        edge_length,
+        r_max=float(max_radius),
+        number_of_basis=int(number_of_basis),
+        function_type=str(function_type),
+    ).to(dtype=dtype)
     neighbor_count = (
         scatter(edge_mask.to(dtype=dtype).view(-1), edge_dst, dim=0, dim_size=int(num_nodes), reduce="sum")
         .clamp(min=1.0)

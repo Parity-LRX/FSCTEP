@@ -13,7 +13,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from torch_scatter import scatter
-from e3nn.math import soft_one_hot_linspace
+from molecular_force_field.models.radial_basis import soft_one_hot_linspace_mace_cutoff as soft_one_hot_linspace
 
 from molecular_force_field.models.long_range import build_feature_spectral_module, build_long_range_module
 from molecular_force_field.models.ictd_irreps import (

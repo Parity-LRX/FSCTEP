@@ -15,7 +15,7 @@ simply stacking two contraction blocks.
 from __future__ import annotations
 
 import torch
-from e3nn.math import soft_one_hot_linspace
+from molecular_force_field.models.radial_basis import soft_one_hot_linspace_mace_cutoff as soft_one_hot_linspace
 
 from molecular_force_field.utils.scatter import scatter
 from molecular_force_field.models.long_range import apply_long_range_modules

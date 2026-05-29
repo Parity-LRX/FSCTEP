@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
 from molecular_force_field.models.long_range import apply_long_range_modules, configure_long_range_modules
+from molecular_force_field.models.radial_basis import mace_polynomial_cutoff
 
 
 def _require_cue():
@@ -89,7 +90,7 @@ def _radial_embedding(
         emb = torch.exp(-0.5 * ((x[:, None] - centers[None, :]) / max(sigma, 1e-6)) ** 2)
 
     emb = emb * (nb ** 0.5)
-    emb = emb * (r <= r_max).to(dtype=r.dtype)[:, None]
+    emb = emb * mace_polynomial_cutoff(r, r_max, p=6)[:, None]
     return emb.reshape(E, nb)
 
 

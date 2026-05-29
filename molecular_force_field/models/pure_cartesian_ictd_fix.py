@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
-from e3nn.math import soft_one_hot_linspace
 
 from molecular_force_field.models.ictd_irreps import (
     EdgeWeightedPathPreservingTensorProduct,
@@ -19,8 +18,10 @@ from molecular_force_field.models.ictd_irreps import (
     direction_harmonics_all,
     ictd_u_matrix_so3,
 )
+from molecular_force_field.models.radial_basis import mace_radial_embedding
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     EquivariantScalarReadoutSO3,
+    SO3BlockRMSNorm,
     _irreps_total_dim,
     _merge_irreps,
     _split_irreps,
@@ -140,6 +141,25 @@ def _concat_so3_states_by_l(states: List[torch.Tensor], channels: int, lmax: int
     parts = []
     for l in range(int(lmax) + 1):
         block = torch.cat([split_state[l] for split_state in split_states], dim=-2)
+        parts.append(block.reshape(*block.shape[:-2], block.shape[-2] * block.shape[-1]))
+    return torch.cat(parts, dim=-1)
+
+
+def _so3_block_rmsnorm(
+    x: torch.Tensor,
+    channels: int,
+    lmax: int,
+    gamma: torch.Tensor,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Apply an equivariant RMS normalization independently inside each l block."""
+    blocks = _split_irreps(x, int(channels), int(lmax))
+    parts = []
+    gamma = gamma.to(dtype=x.dtype, device=x.device)
+    for l in range(int(lmax) + 1):
+        block = blocks[l]
+        rms = block.square().mean(dim=(-2, -1), keepdim=True).add(float(eps)).sqrt()
+        block = block / rms * gamma[l].view(*([1] * (block.ndim - 2)), 1, 1)
         parts.append(block.reshape(*block.shape[:-2], block.shape[-2] * block.shape[-1]))
     return torch.cat(parts, dim=-1)
 
@@ -1162,7 +1182,12 @@ class ICTDBridgeUFusionMixBlockSO3(nn.Module):
 
 
 class FusionProduct5ReadoutSO3(nn.Module):
-    """Old product5/proj_total readout applied directly to fused feature blocks."""
+    """Old product5/proj_total readout applied directly to fused feature blocks.
+
+    When ``pre_product_norm=True``, each input block is normalized with a
+    per-block SO3BlockRMSNorm before the elementwise product. See
+    ``FusionProduct5ReadoutSO3Mixed`` for the motivation.
+    """
 
     def __init__(
         self,
@@ -1173,6 +1198,7 @@ class FusionProduct5ReadoutSO3(nn.Module):
         hidden_sizes: list[int] | tuple[int, ...],
         output_init_std: float = 0.003,
         internal_compute_dtype: torch.dtype | None = None,
+        pre_product_norm: bool = False,
     ):
         super().__init__()
         self.channels = int(channels)
@@ -1180,6 +1206,14 @@ class FusionProduct5ReadoutSO3(nn.Module):
         self.num_feature_blocks = int(num_feature_blocks)
         if self.num_feature_blocks < 1:
             raise ValueError(f"num_feature_blocks must be >= 1, got {self.num_feature_blocks}")
+        self.pre_product_norm = bool(pre_product_norm)
+        self.pre_product_norms = (
+            nn.ModuleList(
+                [SO3BlockRMSNorm(channels=self.channels, lmax=self.lmax) for _ in range(self.num_feature_blocks)]
+            )
+            if self.pre_product_norm
+            else None
+        )
         self.product_5 = HarmonicElementwiseProduct(
             lmax=self.lmax,
             mul=self.channels * self.num_feature_blocks,
@@ -1192,6 +1226,8 @@ class FusionProduct5ReadoutSO3(nn.Module):
     def forward(self, features: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
         if len(features) != self.num_feature_blocks:
             raise ValueError(f"Expected {self.num_feature_blocks} feature blocks, got {len(features)}")
+        if self.pre_product_norms is not None:
+            features = [norm(x) for x, norm in zip(features, self.pre_product_norms)]
         split_features = [_split_irreps(x, self.channels, self.lmax) for x in features]
         t_blocks = {
             l: torch.cat([blocks[l] for blocks in split_features], dim=-2)
@@ -1202,7 +1238,14 @@ class FusionProduct5ReadoutSO3(nn.Module):
 
 
 class FusionProduct5ReadoutSO3Mixed(nn.Module):
-    """Product5 readout for SO3 blocks with different channel counts."""
+    """Product5 readout for SO3 blocks with different channel counts.
+
+    When ``pre_product_norm=True``, each input block is normalized with a
+    per-block SO3BlockRMSNorm before the elementwise product. This decouples
+    product5's quadratic readout from upstream scale shifts (e.g. RBF envelope
+    perturbations), improving robustness to RBF / init changes at the cost of
+    one extra (lmax+1)*channels gain parameter per block.
+    """
 
     def __init__(
         self,
@@ -1212,6 +1255,7 @@ class FusionProduct5ReadoutSO3Mixed(nn.Module):
         hidden_sizes: list[int] | tuple[int, ...],
         output_init_std: float = 0.003,
         internal_compute_dtype: torch.dtype | None = None,
+        pre_product_norm: bool = False,
     ):
         super().__init__()
         self.channels_per_block = tuple(int(c) for c in channels_per_block)
@@ -1222,6 +1266,14 @@ class FusionProduct5ReadoutSO3Mixed(nn.Module):
         if any(c < 1 for c in self.channels_per_block):
             raise ValueError(f"channels_per_block entries must be positive, got {self.channels_per_block}")
         self.total_channels = int(sum(self.channels_per_block))
+        self.pre_product_norm = bool(pre_product_norm)
+        self.pre_product_norms = (
+            nn.ModuleList(
+                [SO3BlockRMSNorm(channels=int(c), lmax=self.lmax) for c in self.channels_per_block]
+            )
+            if self.pre_product_norm
+            else None
+        )
         self.product_5 = HarmonicElementwiseProduct(
             lmax=self.lmax,
             mul=self.total_channels,
@@ -1234,6 +1286,8 @@ class FusionProduct5ReadoutSO3Mixed(nn.Module):
     def forward(self, features: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
         if len(features) != self.num_feature_blocks:
             raise ValueError(f"Expected {self.num_feature_blocks} feature blocks, got {len(features)}")
+        if self.pre_product_norms is not None:
+            features = [norm(x) for x, norm in zip(features, self.pre_product_norms)]
         split_features = [
             _split_irreps(x, channels, self.lmax)
             for x, channels in zip(features, self.channels_per_block)
@@ -1293,10 +1347,12 @@ class ICTDResidualInteractionBlock(nn.Module):
         avg_num_neighbors: float | None = None,
         message_scale_init: list[float] | tuple[float, ...] | None = None,
         sc_scale_init: list[float] | tuple[float, ...] | None = None,
+        use_rms_norm: bool = False,
     ):
         super().__init__()
         self.channels = int(channels)
         self.lmax = int(lmax)
+        self.use_rms_norm = bool(use_rms_norm)
         self.input_lmax = self.lmax if input_lmax is None else int(input_lmax)
         self.target_lmax = self.lmax if target_lmax is None else int(target_lmax)
         self.sc_lmax = self.input_lmax if sc_lmax is None else int(sc_lmax)
@@ -1360,8 +1416,12 @@ class ICTDResidualInteractionBlock(nn.Module):
             else None
         )
         _init_element_conditioned_identity_(self.self_connection)
-        self.message_norm = nn.Identity()
-        self.sc_norm = nn.Identity()
+        self.message_norm = (
+            SO3BlockRMSNorm(self.channels, self.target_lmax) if self.use_rms_norm else nn.Identity()
+        )
+        self.sc_norm = (
+            SO3BlockRMSNorm(self.channels, self.sc_lmax) if (self.use_rms_norm and self.self_connection is not None) else nn.Identity()
+        )
         self.message_output_scale = (
             PerLScaleSO3(self.channels, self.target_lmax, message_scale_init)
             if message_scale_init is not None
@@ -1526,9 +1586,17 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_fusion_input_scale_trainable: bool = False,
         ictd_fix_gmix_gate_init: float = 1.0,
         ictd_fix_gmix_gate_trainable: bool = False,
+        ictd_fix_gmix_block_rmsnorm: bool = False,
+        ictd_fix_gmix_block_rmsnorm_gamma_init: float = 1.0,
         ictd_fix_readout_head_scale_init: float = 1.0,
         ictd_fix_readout_head_scale_trainable: bool = False,
         ictd_fix_fusion_readout_mixed_channels: bool = True,
+        ictd_fix_fusion_pre_product_norm: bool = True,
+        ictd_fix_interaction_rms_norm: bool = False,
+        ictd_fix_gmix_energy_readout: bool = True,
+        ictd_fix_gmix_readout_scale_init: float | None = None,
+        ictd_fix_gmix_readout_output_init_std: float = 0.003,
+        polynomial_cutoff_p: int | None = 6,
         save_contraction_order: int = 3,
         save_multiple_mix_channels: int | None = None,
         avg_num_neighbors: float | None = None,
@@ -1593,9 +1661,25 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_fusion_input_scale_trainable = bool(ictd_fix_fusion_input_scale_trainable)
         self.ictd_fix_gmix_gate_init = float(ictd_fix_gmix_gate_init)
         self.ictd_fix_gmix_gate_trainable = bool(ictd_fix_gmix_gate_trainable)
+        self.ictd_fix_gmix_block_rmsnorm = bool(ictd_fix_gmix_block_rmsnorm)
+        self.ictd_fix_gmix_block_rmsnorm_gamma_init = float(ictd_fix_gmix_block_rmsnorm_gamma_init)
         self.ictd_fix_readout_head_scale_init = float(ictd_fix_readout_head_scale_init)
         self.ictd_fix_readout_head_scale_trainable = bool(ictd_fix_readout_head_scale_trainable)
         self.ictd_fix_fusion_readout_mixed_channels = bool(ictd_fix_fusion_readout_mixed_channels)
+        self.ictd_fix_fusion_pre_product_norm = bool(ictd_fix_fusion_pre_product_norm)
+        self.ictd_fix_interaction_rms_norm = bool(ictd_fix_interaction_rms_norm)
+        self.ictd_fix_gmix_energy_readout = bool(ictd_fix_gmix_energy_readout)
+        self.ictd_fix_gmix_readout_output_init_std = float(ictd_fix_gmix_readout_output_init_std)
+        self.ictd_fix_gmix_readout_scale_init = (
+            float(self.ictd_fix_readout_head_scale_init)
+            if ictd_fix_gmix_readout_scale_init is None
+            else float(ictd_fix_gmix_readout_scale_init)
+        )
+        self.polynomial_cutoff_p = (
+            None
+            if polynomial_cutoff_p is None or int(polynomial_cutoff_p) <= 0
+            else int(polynomial_cutoff_p)
+        )
         if self.ictd_fix_fusion_heads < 1:
             raise ValueError(f"ictd_fix_fusion_heads must be >= 1, got {self.ictd_fix_fusion_heads}")
         self.max_atomvalue = int(max_atomvalue)
@@ -1670,6 +1754,7 @@ class PureCartesianICTDFix(nn.Module):
                     avg_num_neighbors=self.avg_num_neighbors,
                     message_scale_init=message_scale_init,
                     sc_scale_init=sc_scale_init,
+                    use_rms_norm=self.ictd_fix_interaction_rms_norm,
                 )
             )
             if effective_product_backend == "native-mace":
@@ -1786,6 +1871,16 @@ class PureCartesianICTDFix(nn.Module):
                 )
             else:
                 self.g_mix_gate = None
+            if self.ictd_fix_gmix_block_rmsnorm:
+                self.gmix_block_rmsnorm_gamma = nn.Parameter(
+                    torch.full(
+                        (self.lmax + 1,),
+                        self.ictd_fix_gmix_block_rmsnorm_gamma_init,
+                        dtype=torch.get_default_dtype(),
+                    )
+                )
+            else:
+                self.gmix_block_rmsnorm_gamma = None
             if self.ictd_fix_fusion_readout_mixed_channels:
                 fusion_readout_cls = FusionProduct5ReadoutSO3Mixed
                 fusion_readout_kwargs = dict(
@@ -1794,6 +1889,7 @@ class PureCartesianICTDFix(nn.Module):
                     hidden_sizes=main_hidden_sizes3,
                     output_init_std=0.003,
                     internal_compute_dtype=internal_compute_dtype,
+                    pre_product_norm=self.ictd_fix_fusion_pre_product_norm,
                 )
             else:
                 fusion_readout_cls = FusionProduct5ReadoutSO3
@@ -1804,6 +1900,7 @@ class PureCartesianICTDFix(nn.Module):
                     hidden_sizes=main_hidden_sizes3,
                     output_init_std=0.003,
                     internal_compute_dtype=internal_compute_dtype,
+                    pre_product_norm=self.ictd_fix_fusion_pre_product_norm,
                 )
             self.fusion_readouts = nn.ModuleList(
                 [fusion_readout_cls(**fusion_readout_kwargs) for _ in range(self.ictd_fix_fusion_heads)]
@@ -1833,6 +1930,21 @@ class PureCartesianICTDFix(nn.Module):
                     )
                 )
                 self.fusion_energy_scale = None
+            if self.ictd_fix_gmix_energy_readout:
+                self.gmix_energy_readout = EquivariantScalarReadoutSO3(
+                    self.save_multiple_mix_channels,
+                    self.lmax,
+                    output_init_std=self.ictd_fix_gmix_readout_output_init_std,
+                )
+                if self.ictd_fix_readout_head_scale_trainable:
+                    self.gmix_readout_head_scale = nn.Parameter(
+                        torch.tensor(self.ictd_fix_gmix_readout_scale_init, dtype=torch.get_default_dtype())
+                    )
+                else:
+                    self.gmix_readout_head_scale = None
+            else:
+                self.gmix_energy_readout = None
+                self.gmix_readout_head_scale = None
         else:
             self.save_multiple_mix_channels = None
             self.multiple_contraction_mix = None
@@ -1845,6 +1957,9 @@ class PureCartesianICTDFix(nn.Module):
             self.fusion_energy_scale = None
             self.fusion_input_scales = None
             self.g_mix_gate = None
+            self.gmix_block_rmsnorm_gamma = None
+            self.gmix_energy_readout = None
+            self.gmix_readout_head_scale = None
 
     def _readout_head_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
         if self.readout_head_scales is None:
@@ -1860,6 +1975,17 @@ class PureCartesianICTDFix(nn.Module):
         if self.g_mix_gate is None:
             return ref.new_tensor(self.ictd_fix_gmix_gate_init)
         return self.g_mix_gate.to(dtype=ref.dtype, device=ref.device)
+
+    def _maybe_gmix_block_rmsnorm(self, g_mix: torch.Tensor) -> torch.Tensor:
+        if self.gmix_block_rmsnorm_gamma is None:
+            return g_mix
+        channels = self.save_multiple_mix_channels if self.ictd_fix_fusion_readout_mixed_channels else self.channels
+        return _so3_block_rmsnorm(
+            g_mix,
+            int(channels),
+            self.lmax,
+            self.gmix_block_rmsnorm_gamma,
+        )
 
     def forward(
         self,
@@ -1904,14 +2030,13 @@ class PureCartesianICTDFix(nn.Module):
         edge_mask = (edge_length <= self.max_radius).to(dtype=pos.dtype).unsqueeze(-1)
         Y_list = direction_harmonics_all(n.to(dtype=dtype), self.lmax)
         edge_attrs = {l: Y_list[l].to(dtype=dtype).unsqueeze(-2) for l in range(self.lmax + 1)}
-        edge_feats = soft_one_hot_linspace(
+        edge_feats = mace_radial_embedding(
             edge_length,
-            0.0,
-            self.max_radius,
-            self.number_of_basis,
-            basis=self.function_type,
-            cutoff=True,
-        ).mul(self.number_of_basis ** 0.5).to(dtype=dtype)
+            r_max=self.max_radius,
+            number_of_basis=self.number_of_basis,
+            function_type=self.function_type,
+            polynomial_cutoff_p=self.polynomial_cutoff_p,
+        ).to(dtype=dtype)
 
         A_long = A.long()
         if int(A_long.max().item()) >= self.atomic_number_to_index.numel():
@@ -1971,6 +2096,14 @@ class PureCartesianICTDFix(nn.Module):
             g_mix = self.multiple_contraction_mix(mix_inputs, node_attrs)
             g_mix = self._g_mix_gate(g_mix) * g_mix
             g_mix = self.multiple_contract_fuse(g_mix)
+            g_mix = self._maybe_gmix_block_rmsnorm(g_mix)
+            if self.gmix_energy_readout is not None:
+                e_gmix = self.gmix_energy_readout(g_mix)
+                if self.gmix_readout_head_scale is not None:
+                    e_gmix = self.gmix_readout_head_scale.to(dtype=e_gmix.dtype, device=e_gmix.device) * e_gmix
+                else:
+                    e_gmix = e_gmix * self.ictd_fix_readout_head_scale_init
+                total_energy = e_gmix if total_energy is None else (total_energy + e_gmix)
             fusion_inputs = layer_states + [g_mix]
             if self.ictd_fix_fusion_heads == 1:
                 fusion_energy = self.fusion_readout(fusion_inputs)

@@ -1183,6 +1183,14 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                     "g_mix_gate" in selected_state_dict
                     or bool(arch_meta.get("ictd_fix_gmix_gate_trainable", False))
                 ),
+                ictd_fix_gmix_block_rmsnorm=(
+                    "gmix_block_rmsnorm_gamma" in selected_state_dict
+                    or bool(arch_meta.get("ictd_fix_gmix_block_rmsnorm", False))
+                ),
+                ictd_fix_gmix_block_rmsnorm_gamma_init=float(
+                    ckpt.get("ictd_fix_gmix_block_rmsnorm_gamma_init")
+                    or arch_meta.get("ictd_fix_gmix_block_rmsnorm_gamma_init", 1.0)
+                ),
                 ictd_fix_readout_head_scale_init=float(
                     ckpt.get("ictd_fix_readout_head_scale_init")
                     or arch_meta.get("ictd_fix_readout_head_scale_init", 1.0)

@@ -19,7 +19,7 @@ import itertools
 import torch
 import torch.nn as nn
 from molecular_force_field.utils.scatter import scatter
-from e3nn.math import soft_one_hot_linspace
+from molecular_force_field.models.radial_basis import soft_one_hot_linspace_mace_cutoff as soft_one_hot_linspace
 import math
 from functools import lru_cache
 

@@ -832,6 +832,15 @@ def main():
                         action='store_false',
                         help='Keep the post-contraction g_mix scalar gate fixed.')
     parser.set_defaults(ictd_fix_gmix_gate_trainable=False)
+    parser.add_argument('--ictd-fix-gmix-block-rmsnorm', dest='ictd_fix_gmix_block_rmsnorm',
+                        action='store_true',
+                        help='Apply SO3 block-wise RMSNorm to g_mix before fusion readout.')
+    parser.add_argument('--no-ictd-fix-gmix-block-rmsnorm', dest='ictd_fix_gmix_block_rmsnorm',
+                        action='store_false',
+                        help='Disable SO3 block-wise RMSNorm on g_mix.')
+    parser.set_defaults(ictd_fix_gmix_block_rmsnorm=False)
+    parser.add_argument('--ictd-fix-gmix-block-rmsnorm-gamma-init', type=float, default=1.0,
+                        help='Initial per-l gamma for --ictd-fix-gmix-block-rmsnorm.')
     parser.add_argument('--ictd-fix-readout-head-scale-init', type=float, default=1.0,
                         help='Initial coefficient for pure-cartesian-ictd-fix scalar readout heads '
                              '(head0=intermediate scalar readout, head1=final scalar readout).')
@@ -853,6 +862,56 @@ def main():
                         action='store_false',
                         help='Use the legacy same-channel fusion readout by projecting g_mix back to backbone channels.')
     parser.set_defaults(ictd_fix_fusion_readout_mixed_channels=True)
+    parser.add_argument('--ictd-fix-fusion-pre-product-norm',
+                        dest='ictd_fix_fusion_pre_product_norm',
+                        action='store_true',
+                        help='Apply per-block SO3BlockRMSNorm before product5 in the fusion readout. '
+                             'Decouples product5 quadratic readout from upstream scale shifts '
+                             '(e.g. RBF envelope perturbations), improving robustness to RBF / init changes. '
+                             'Enabled by default.')
+    parser.add_argument('--no-ictd-fix-fusion-pre-product-norm',
+                        dest='ictd_fix_fusion_pre_product_norm',
+                        action='store_false',
+                        help='Disable pre-product5 norm.')
+    parser.set_defaults(ictd_fix_fusion_pre_product_norm=True)
+    parser.add_argument('--ictd-fix-interaction-rms-norm',
+                        dest='ictd_fix_interaction_rms_norm',
+                        action='store_true',
+                        help='Replace the Identity message_norm and sc_norm inside each ICTDResidualInteractionBlock '
+                             'with per-l SO3BlockRMSNorm. Absorbs RBF / envelope / init-induced scale shifts at the '
+                             'source so they do not propagate to deeper layers / readout.')
+    parser.add_argument('--no-ictd-fix-interaction-rms-norm',
+                        dest='ictd_fix_interaction_rms_norm',
+                        action='store_false',
+                        help='Keep interaction message_norm / sc_norm as Identity (default).')
+    parser.set_defaults(ictd_fix_interaction_rms_norm=False)
+    parser.add_argument('--ictd-fix-gmix-energy-readout',
+                        dest='ictd_fix_gmix_energy_readout',
+                        action='store_true',
+                        help='Add a direct linear scalar readout from g_mix (the saved multi-mix '
+                             'features) to total energy, symmetric with per-layer readouts. '
+                             'g_mix currently only participates in fusion via product5; this flag '
+                             'gives it an additional direct gradient path. Enabled by default.')
+    parser.add_argument('--no-ictd-fix-gmix-energy-readout',
+                        dest='ictd_fix_gmix_energy_readout',
+                        action='store_false',
+                        help='Disable direct g_mix readout.')
+    parser.set_defaults(ictd_fix_gmix_energy_readout=True)
+    parser.add_argument('--ictd-fix-gmix-readout-output-init-std', type=float, default=0.003,
+                        help='Output init std for the g_mix readout Linear weight. '
+                             'Default 0.003 (same as other readouts). Set to 0.1 for '
+                             'closer-to-Xavier init — avoids large early gradients from '
+                             'near-zero weight initialization.')
+    parser.add_argument('--ictd-fix-gmix-readout-scale-init', type=float, default=None,
+                        help='Initial value for the g_mix readout head scale coefficient. '
+                             'If None (default), uses --ictd-fix-readout-head-scale-init (1.0). '
+                             'Set smaller (e.g. 0.1) to let the model ramp up the direct g_mix '
+                             'energy contribution gradually instead of starting at full strength.')
+    parser.add_argument('--polynomial-cutoff-p', type=int, default=6,
+                        help='Order p of the MACE polynomial envelope multiplied onto the radial basis. '
+                             'Default 6 (MACE-style) provides C^(p-1) smoothness at r_max — required for '
+                             'MD inference / energy conservation in long NVE trajectories. '
+                             'Pass 0 or negative integer to disable envelope (raw e3nn bessel basis).')
     parser.add_argument('--max-rank-other', type=int, default=None,
                         help='Max rank for sparse tensor product in pure-cartesian-sparse / pure-cartesian-sparse-save mode. '
                              'If not set, restore from checkpoint when available, else use 1. '
@@ -2183,6 +2242,7 @@ def main():
             "fusion_scale_init=%g, fusion_heads=%d, fusion_head_weight_mode=%s, "
             "fusion_input_scale_init=%g, fusion_input_scale_trainable=%s, "
             "gmix_gate_init=%g, gmix_gate_trainable=%s, "
+            "gmix_block_rmsnorm=%s, gmix_block_rmsnorm_gamma_init=%g, "
             "readout_head_scale_init=%g, readout_head_scale_trainable=%s, "
             "fusion_readout_mixed_channels=%s",
             args.num_interaction,
@@ -2197,6 +2257,8 @@ def main():
             args.ictd_fix_fusion_input_scale_trainable,
             args.ictd_fix_gmix_gate_init,
             args.ictd_fix_gmix_gate_trainable,
+            args.ictd_fix_gmix_block_rmsnorm,
+            args.ictd_fix_gmix_block_rmsnorm_gamma_init,
             args.ictd_fix_readout_head_scale_init,
             args.ictd_fix_readout_head_scale_trainable,
             args.ictd_fix_fusion_readout_mixed_channels,
@@ -2231,9 +2293,17 @@ def main():
             ictd_fix_fusion_input_scale_trainable=args.ictd_fix_fusion_input_scale_trainable,
             ictd_fix_gmix_gate_init=args.ictd_fix_gmix_gate_init,
             ictd_fix_gmix_gate_trainable=args.ictd_fix_gmix_gate_trainable,
+            ictd_fix_gmix_block_rmsnorm=args.ictd_fix_gmix_block_rmsnorm,
+            ictd_fix_gmix_block_rmsnorm_gamma_init=args.ictd_fix_gmix_block_rmsnorm_gamma_init,
             ictd_fix_readout_head_scale_init=args.ictd_fix_readout_head_scale_init,
             ictd_fix_readout_head_scale_trainable=args.ictd_fix_readout_head_scale_trainable,
             ictd_fix_fusion_readout_mixed_channels=args.ictd_fix_fusion_readout_mixed_channels,
+            ictd_fix_fusion_pre_product_norm=args.ictd_fix_fusion_pre_product_norm,
+            ictd_fix_interaction_rms_norm=args.ictd_fix_interaction_rms_norm,
+            ictd_fix_gmix_energy_readout=args.ictd_fix_gmix_energy_readout,
+            ictd_fix_gmix_readout_scale_init=args.ictd_fix_gmix_readout_scale_init,
+            ictd_fix_gmix_readout_output_init_std=args.ictd_fix_gmix_readout_output_init_std,
+            polynomial_cutoff_p=args.polynomial_cutoff_p,
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
             ictd_tp_path_policy=args.ictd_tp_path_policy,

@@ -6,13 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from e3nn import o3
 from e3nn import nn as e3nn_nn
-from e3nn.math import soft_one_hot_linspace
 from e3nn.nn import S2Activation
 from e3nn.nn import Gate
 from molecular_force_field.utils.scatter import scatter
 
 from molecular_force_field.models.mlp import MainNet2, MainNet, RobustScalarWeightedSum
 from molecular_force_field.models.long_range import apply_long_range_modules, configure_long_range_modules
+from molecular_force_field.models.radial_basis import mace_radial_embedding
 
 class E3Conv(nn.Module):
     """E3NN-based convolutional layer for molecular graph neural networks."""
@@ -125,14 +125,12 @@ class E3Conv(nn.Module):
         f_in = self.tensor_product(Ai[edge_src], sh_edge)
         
         # Calculate spherical harmonics and basis functions
-        emb = soft_one_hot_linspace(
+        emb = mace_radial_embedding(
             edge_length,
-            0.0,
-            self.max_radius,
-            self.number_of_basis,
-            basis=self.function_type,
-            cutoff=True
-        ).mul(self.number_of_basis ** 0.5)
+            r_max=self.max_radius,
+            number_of_basis=self.number_of_basis,
+            function_type=self.function_type,
+        )
 
         # Use TensorProduct to process neighbor features
         edge_features = self.tp(f_in, Ai[edge_dst], self.fc(emb))
@@ -267,14 +265,12 @@ class E3Conv2(nn.Module):
         Feature = sh_edge
 
         # Calculate spherical harmonics and basis functions
-        emb = soft_one_hot_linspace(
+        emb = mace_radial_embedding(
             edge_length,
-            0.0,
-            self.max_radius,
-            self.number_of_basis,
-            basis=self.function_type,
-            cutoff=True
-        ).mul(self.number_of_basis ** 0.5)
+            r_max=self.max_radius,
+            number_of_basis=self.number_of_basis,
+            function_type=self.function_type,
+        )
 
         # Use TensorProduct to process neighbor features
         edge_features = self.tp(f_in[edge_src], Feature, self.fc(emb))
