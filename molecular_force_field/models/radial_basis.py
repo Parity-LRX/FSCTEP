@@ -18,17 +18,25 @@ def mace_polynomial_cutoff(
     The polynomial is 1 at r=0 and has zero value and zero derivatives up to
     order p - 1 at r=r_max.  This mirrors MACE's PolynomialCutoff formula.
     """
-    r_max_t = torch.as_tensor(r_max, dtype=x.dtype, device=x.device)
     p_int = int(p)
-    p_t = torch.as_tensor(p_int, dtype=x.dtype, device=x.device)
-    r = x / r_max_t
+    p_f = float(p_int)
+    # Use Python scalars instead of host->device tensors (torch.as_tensor) so this
+    # forward is CUDA-graph capturable. tensor/scalar ops cast the scalar to
+    # x.dtype, so the result is numerically identical to the tensor version.
+    if isinstance(r_max, torch.Tensor):
+        r = x / r_max
+        within = (x < r_max).to(dtype=x.dtype)
+    else:
+        r_max_f = float(r_max)
+        r = x / r_max_f
+        within = (x < r_max_f).to(dtype=x.dtype)
     envelope = (
         1.0
-        - ((p_t + 1.0) * (p_t + 2.0) / 2.0) * torch.pow(r, p_int)
-        + p_t * (p_t + 2.0) * torch.pow(r, p_int + 1)
-        - (p_t * (p_t + 1.0) / 2.0) * torch.pow(r, p_int + 2)
+        - ((p_f + 1.0) * (p_f + 2.0) / 2.0) * torch.pow(r, p_int)
+        + p_f * (p_f + 2.0) * torch.pow(r, p_int + 1)
+        - (p_f * (p_f + 1.0) / 2.0) * torch.pow(r, p_int + 2)
     )
-    return envelope * (x < r_max_t).to(dtype=x.dtype)
+    return envelope * within
 
 
 def mace_radial_embedding(

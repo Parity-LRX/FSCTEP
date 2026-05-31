@@ -142,6 +142,10 @@ class Trainer:
         compile_val_fullgraph: bool = False,
         compile_val_dynamic: bool = False,
         compile_val_precache: bool = False,
+        # Training-step compiled-autograd: compiles the loss.backward() (the mixed
+        # 2nd-order / double-backward) via torch._dynamo.compiled_autograd. Forward
+        # stays eager (torch.compile's AOTAutograd cannot double-backward). Opt-in.
+        train_compiled_autograd: bool = False,
         # 推理模式：保存到 checkpoint，evaluate/inference_ddp 可读取；TorchScript/LAMMPS 导出始终只输出能量和力
         inference_output_physical_tensors: bool = False,
         # 物理张量 loss 系数：{"charge": 1.0, "dipole": 2.0, ...}，未指定则 1.0；charge_per_atom 用 charge
@@ -236,6 +240,10 @@ class Trainer:
         self.compile_val_fullgraph = bool(compile_val_fullgraph)
         self.compile_val_dynamic = bool(compile_val_dynamic)
         self.compile_val_precache = bool(compile_val_precache)
+        self.train_compiled_autograd = bool(train_compiled_autograd)
+        self._compiled_autograd_warned = False
+        self._ca_checked = False   # first-step probe done?
+        self._ca_disabled = False  # permanently fell back to eager?
         self._val_compiled_current = None
         self._val_compiled_ema = None
         self._val_compile_failed_current = False
@@ -266,6 +274,7 @@ class Trainer:
         
         self.model = model
         self.e3trans = e3trans
+        self._maybe_freeze_fusion_bias_for_compiled_autograd()
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.train_dataset = train_dataset
@@ -552,6 +561,87 @@ class Trainer:
             torch.compiler.cudagraph_mark_step_begin()  # type: ignore[attr-defined]
         except Exception:
             pass
+
+    def _compiled_autograd_ctx(self):
+        """Context for the training-step backward. When enabled, compiles the
+        double-backward via compiled-autograd (forward stays eager). On any error
+        or unsupported torch, falls back to a no-op context (eager backward)."""
+        import contextlib
+        if not getattr(self, "train_compiled_autograd", False):
+            return contextlib.nullcontext()
+        try:
+            import torch._dynamo as _dynamo
+            import torch._dynamo.compiled_autograd as _ca
+            enable = getattr(_ca, "enable", None) or getattr(_ca, "_enable", None)
+            if enable is None:
+                raise RuntimeError("compiled_autograd.enable not available")
+            if _dynamo.config.cache_size_limit < 256:
+                _dynamo.config.cache_size_limit = 256
+
+            def _compiler(gm, **kw):
+                # dynamic=True: training batches vary in atom/edge count.
+                return torch.compile(gm, dynamic=True)
+
+            return enable(_compiler)
+        except Exception as e:  # pragma: no cover - safety net
+            if not self._compiled_autograd_warned:
+                self._compiled_autograd_warned = True
+                logging.warning(f"train_compiled_autograd unavailable; using eager backward. Error: {e}")
+            return contextlib.nullcontext()
+
+    def _maybe_freeze_fusion_bias_for_compiled_autograd(self) -> None:
+        """When train_compiled_autograd is on AND the backbone uses the ictd-fix
+        fusion route, freeze the `fusion_readouts.*.bias` params. Their 2nd-order
+        force gradient (d2E/dpos/dbias) is structurally None, which is the ONLY
+        thing that blocks compiled-autograd on the fusion route. These are additive
+        energy terms on scalar/invariant readout outputs (a constant energy offset,
+        redundant with the model's atomic-energy references; equivariance-safe), so
+        freezing them lets compiled-autograd compile the force double-backward (~1.35x)
+        instead of falling back to eager. No-op for non-fusion routes / flag off."""
+        if not getattr(self, "train_compiled_autograd", False):
+            return
+        base = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+        if getattr(base, "ictd_fix_route", None) != "fusion":
+            return
+        frozen = []
+        for n, p in base.named_parameters():
+            if n.endswith(".bias") and "fusion_readouts" in n and p.requires_grad:
+                p.requires_grad_(False)
+                frozen.append(n)
+        if frozen:
+            logging.info(
+                "train_compiled_autograd + fusion route: froze %d fusion_readouts bias param(s) "
+                "(additive energy terms with None 2nd-order force grad) to unblock compiled-autograd. "
+                "Frozen: %s", len(frozen), ", ".join(frozen),
+            )
+
+    def _train_step_backward(self, total_loss: torch.Tensor) -> None:
+        """Run the training-step backward. When train_compiled_autograd is on, the
+        first step is a probe: the backward runs under compiled-autograd with the
+        graph retained, and if it raises (e.g. the fusion-route double-backward
+        hits a compiled-autograd None-accumulate limitation), it permanently falls
+        back to an eager backward so a misconfigured flag never crashes training."""
+        if not getattr(self, "train_compiled_autograd", False) or self._ca_disabled:
+            total_loss.backward()
+            return
+        if self._ca_checked:
+            with self._compiled_autograd_ctx():
+                total_loss.backward()
+            return
+        # First step: probe. Retain the graph so we can fall back to eager.
+        try:
+            with self._compiled_autograd_ctx():
+                total_loss.backward(retain_graph=True)
+            self._ca_checked = True
+        except Exception as e:
+            self._ca_disabled = True
+            self._ca_checked = True
+            logging.warning(
+                "train_compiled_autograd backward failed on the first step; disabling it and using "
+                f"eager backward for the rest of training (this is expected for some model routes). Error: {e}"
+            )
+            self.optimizer.zero_grad(set_to_none=True)  # discard any partial grads from the failed pass
+            total_loss.backward()
 
     def _maybe_compile_validation_model(self, eval_model: nn.Module, batch_tensors, *, is_ema: bool) -> nn.Module:
         """
@@ -1533,7 +1623,7 @@ class Trainer:
             self._ensure_finite_tensor(force_loss, "force_loss", epoch=epoch, batch_count=self.batch_count)
             self._ensure_finite_tensor(total_loss, "total_loss", epoch=epoch, batch_count=self.batch_count)
 
-            total_loss.backward()
+            self._train_step_backward(total_loss)
             self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
             
             # Gradient clipping

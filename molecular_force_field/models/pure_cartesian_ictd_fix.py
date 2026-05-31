@@ -2045,17 +2045,19 @@ class PureCartesianICTDFix(nn.Module):
 
     def _readout_head_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
         if self.readout_head_scales is None:
-            return ref.new_tensor(self.ictd_fix_readout_head_scale_init)
+            # new_zeros(()) is a device memset (no host->device copy) so this stays
+            # CUDA-graph capturable; +scalar is a kernel arg. Equals the scalar.
+            return ref.new_zeros(()) + float(self.ictd_fix_readout_head_scale_init)
         return self.readout_head_scales[index].to(dtype=ref.dtype, device=ref.device)
 
     def _fusion_input_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
         if self.fusion_input_scales is None:
-            return ref.new_tensor(self.ictd_fix_fusion_input_scale_init)
+            return ref.new_zeros(()) + float(self.ictd_fix_fusion_input_scale_init)
         return self.fusion_input_scales[index].to(dtype=ref.dtype, device=ref.device)
 
     def _g_mix_gate(self, ref: torch.Tensor) -> torch.Tensor:
         if self.g_mix_gate is None:
-            return ref.new_tensor(self.ictd_fix_gmix_gate_init)
+            return ref.new_zeros(()) + float(self.ictd_fix_gmix_gate_init)
         return self.g_mix_gate.to(dtype=ref.dtype, device=ref.device)
 
     def _maybe_gmix_block_rmsnorm(self, g_mix: torch.Tensor) -> torch.Tensor:
@@ -2121,18 +2123,24 @@ class PureCartesianICTDFix(nn.Module):
         ).to(dtype=dtype)
 
         A_long = A.long()
-        if int(A_long.max().item()) >= self.atomic_number_to_index.numel():
-            raise ValueError(
-                f"Encountered atomic number {int(A_long.max().item())}, but compact mapping supports only up to "
-                f"{self.atomic_number_to_index.numel() - 1}. atomic_numbers={self.atomic_numbers}"
-            )
+        # `skip_input_validation` removes the two host syncs below (`.item()` /
+        # `torch.any` + `.tolist()`) so this forward can be captured by a CUDA
+        # graph. It only disables guards; the numerics (compact_idx, one_hot) are
+        # unchanged. The capture wrapper validates inputs once before enabling it.
+        if not getattr(self, "skip_input_validation", False):
+            if int(A_long.max().item()) >= self.atomic_number_to_index.numel():
+                raise ValueError(
+                    f"Encountered atomic number {int(A_long.max().item())}, but compact mapping supports only up to "
+                    f"{self.atomic_number_to_index.numel() - 1}. atomic_numbers={self.atomic_numbers}"
+                )
         compact_idx = self.atomic_number_to_index[A_long]
-        if torch.any(compact_idx < 0):
-            bad = torch.unique(A_long[compact_idx < 0]).tolist()
-            raise ValueError(
-                f"Encountered atomic numbers without compact mapping: {bad}. "
-                f"Configured atomic_numbers={self.atomic_numbers}"
-            )
+        if not getattr(self, "skip_input_validation", False):
+            if torch.any(compact_idx < 0):
+                bad = torch.unique(A_long[compact_idx < 0]).tolist()
+                raise ValueError(
+                    f"Encountered atomic numbers without compact mapping: {bad}. "
+                    f"Configured atomic_numbers={self.atomic_numbers}"
+                )
         node_attrs = F.one_hot(compact_idx, num_classes=self.num_elements).to(dtype=dtype)
         h = self.node_embedding(node_attrs)
 
