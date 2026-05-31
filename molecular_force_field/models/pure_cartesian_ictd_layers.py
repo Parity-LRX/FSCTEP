@@ -110,6 +110,11 @@ class EquivariantScalarReadoutSO3(nn.Module):
     """
 
     def __init__(self, channels: int, lmax: int, output_init_std: float = 0.003):
+        """
+        output_init_std: small value (default 0.003) so initial energy predictions ≈ 0,
+        keeping energy loss small early in training so that force gradients dominate
+        early learning dynamics (standard MLIP training practice).
+        """
         super().__init__()
         self.channels = int(channels)
         self.lmax = int(lmax)

@@ -164,6 +164,73 @@ def _so3_block_rmsnorm(
     return torch.cat(parts, dim=-1)
 
 
+class FusionDepthAttentionSO3(nn.Module):
+    """Per-node attention over interaction-layer states (the depth / scale axis).
+
+    Generalizes the constant per-layer ``fusion_input_scales`` into per-node,
+    per-layer convex weights. The score for each layer state is computed purely
+    from that state's SO(3)-invariant ``l=0`` channels, so the weights are
+    rotation/parity invariant scalars that broadcast-multiply the full equivariant
+    state -> the operation stays strictly equivariant.
+
+    Weights are normalized with a softmax over the L layers and then rescaled by
+    ``L * base_scale`` so the total per-node input mass into the fusion mix
+    contraction equals ``L * base_scale`` (constant, only redistributed across
+    scales). The final score head is zero-initialized, so at init every weight is
+    exactly ``base_scale`` -> identical to the constant ``fusion_input_scales``
+    behavior, making this a clean drop-in ablation.
+
+    Cost is O(N * L * channels): L = num_interaction (2-3), so effectively free,
+    and never O(N^2).
+
+    Physically this implements an environment-adaptive renormalization weighting:
+    the relative coupling strength of each scale (layer) is decided per atom by
+    its local invariant content, in the spirit of Wilson RG off-diagonal mixing.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        lmax: int,
+        num_layers: int,
+        base_scale: float = 1.0,
+        hidden_channels: int | None = None,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.lmax = int(lmax)
+        self.num_layers = int(num_layers)
+        self.base_scale = float(base_scale)
+        hidden = self.channels if hidden_channels is None else int(hidden_channels)
+        self.fc1 = nn.Linear(self.channels, hidden)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(hidden, 1)
+        # Per-layer logit bias breaks layer symmetry while staying uniform at init.
+        self.layer_bias = nn.Parameter(torch.zeros(self.num_layers, dtype=torch.get_default_dtype()))
+        # Zero-init the score head so logits == layer_bias (== 0) at init
+        # -> uniform softmax -> every weight == base_scale (matches constant scales).
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, layer_states: List[torch.Tensor]) -> torch.Tensor:
+        if len(layer_states) != self.num_layers:
+            raise ValueError(
+                f"FusionDepthAttentionSO3 expected {self.num_layers} layer states, got {len(layer_states)}"
+            )
+        ref = layer_states[0]
+        w_dtype = self.fc1.weight.dtype
+        logits = []
+        for t, state in enumerate(layer_states):
+            inv = _split_irreps(state, self.channels, self.lmax)[0]
+            inv = inv.reshape(inv.shape[0], self.channels).to(dtype=w_dtype)
+            hidden = self.act(self.fc1(inv))
+            logit = self.fc2(hidden).squeeze(-1) + self.layer_bias[t].to(dtype=w_dtype)
+            logits.append(logit)
+        logits = torch.stack(logits, dim=-1)  # [N, L]
+        weights = torch.softmax(logits, dim=-1) * (self.num_layers * self.base_scale)
+        return weights.to(dtype=ref.dtype, device=ref.device)
+
+
 def _tp_allowed_paths_from_target_lmax(lmax_in1: int, lmax_in2: int, lmax_target: int) -> List[tuple[int, int, int]]:
     """
     Mirror MACE/e3nn instruction pruning at the SO3 level:
@@ -1304,6 +1371,7 @@ class MACEStyleScalarReadoutSO3(nn.Module):
     """Native MACE final readout shape for this config: Cx0e -> 16x0e -> 1x0e."""
 
     def __init__(self, channels: int, hidden_channels: int = 16, output_init_std: float = 0.003):
+        """output_init_std: small value (0.003) so initial energy ≈ 0 (MLIP standard practice)."""
         super().__init__()
         self.channels = int(channels)
         self.hidden_channels = int(hidden_channels)
@@ -1584,6 +1652,7 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_fusion_head_weight_mode: str = "softmax",
         ictd_fix_fusion_input_scale_init: float = 1.0,
         ictd_fix_fusion_input_scale_trainable: bool = False,
+        ictd_fix_fusion_depth_attention: bool = False,
         ictd_fix_gmix_gate_init: float = 1.0,
         ictd_fix_gmix_gate_trainable: bool = False,
         ictd_fix_gmix_block_rmsnorm: bool = False,
@@ -1596,6 +1665,7 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_gmix_energy_readout: bool = True,
         ictd_fix_gmix_readout_scale_init: float | None = None,
         ictd_fix_gmix_readout_output_init_std: float = 0.003,
+        ictd_fix_layer_readout_output_init_std: float = 0.003,
         polynomial_cutoff_p: int | None = 6,
         save_contraction_order: int = 3,
         save_multiple_mix_channels: int | None = None,
@@ -1659,6 +1729,7 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_fusion_head_weight_mode = str(ictd_fix_fusion_head_weight_mode)
         self.ictd_fix_fusion_input_scale_init = float(ictd_fix_fusion_input_scale_init)
         self.ictd_fix_fusion_input_scale_trainable = bool(ictd_fix_fusion_input_scale_trainable)
+        self.ictd_fix_fusion_depth_attention = bool(ictd_fix_fusion_depth_attention)
         self.ictd_fix_gmix_gate_init = float(ictd_fix_gmix_gate_init)
         self.ictd_fix_gmix_gate_trainable = bool(ictd_fix_gmix_gate_trainable)
         self.ictd_fix_gmix_block_rmsnorm = bool(ictd_fix_gmix_block_rmsnorm)
@@ -1670,6 +1741,7 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_interaction_rms_norm = bool(ictd_fix_interaction_rms_norm)
         self.ictd_fix_gmix_energy_readout = bool(ictd_fix_gmix_energy_readout)
         self.ictd_fix_gmix_readout_output_init_std = float(ictd_fix_gmix_readout_output_init_std)
+        self.ictd_fix_layer_readout_output_init_std = float(ictd_fix_layer_readout_output_init_std)
         self.ictd_fix_gmix_readout_scale_init = (
             float(self.ictd_fix_readout_head_scale_init)
             if ictd_fix_gmix_readout_scale_init is None
@@ -1816,12 +1888,12 @@ class PureCartesianICTDFix(nn.Module):
                     )
                 )
         self.layer_energy_readouts = nn.ModuleList(
-            [EquivariantScalarReadoutSO3(self.channels, self.lmax, output_init_std=0.003) for _ in range(self.num_interaction - 1)]
+            [EquivariantScalarReadoutSO3(self.channels, self.lmax, output_init_std=self.ictd_fix_layer_readout_output_init_std) for _ in range(self.num_interaction - 1)]
         )
         self.last_layer_energy_readout = MACEStyleScalarReadoutSO3(
             self.channels,
             hidden_channels=16,
-            output_init_std=0.003,
+            output_init_std=self.ictd_fix_layer_readout_output_init_std,
         )
         if self.ictd_fix_readout_head_scale_trainable:
             self.readout_head_scales = nn.Parameter(
@@ -1865,6 +1937,15 @@ class PureCartesianICTDFix(nn.Module):
                 )
             else:
                 self.fusion_input_scales = None
+            if self.ictd_fix_fusion_depth_attention:
+                self.fusion_depth_attention = FusionDepthAttentionSO3(
+                    channels=self.channels,
+                    lmax=self.lmax,
+                    num_layers=self.num_interaction,
+                    base_scale=self.ictd_fix_fusion_input_scale_init,
+                )
+            else:
+                self.fusion_depth_attention = None
             if self.ictd_fix_gmix_gate_trainable:
                 self.g_mix_gate = nn.Parameter(
                     torch.tensor(self.ictd_fix_gmix_gate_init, dtype=torch.get_default_dtype())
@@ -1887,7 +1968,7 @@ class PureCartesianICTDFix(nn.Module):
                     channels_per_block=[self.channels] * self.num_interaction + [self.save_multiple_mix_channels],
                     lmax=self.lmax,
                     hidden_sizes=main_hidden_sizes3,
-                    output_init_std=0.003,
+                    output_init_std=self.ictd_fix_layer_readout_output_init_std,
                     internal_compute_dtype=internal_compute_dtype,
                     pre_product_norm=self.ictd_fix_fusion_pre_product_norm,
                 )
@@ -1898,7 +1979,7 @@ class PureCartesianICTDFix(nn.Module):
                     lmax=self.lmax,
                     num_feature_blocks=self.num_interaction + 1,
                     hidden_sizes=main_hidden_sizes3,
-                    output_init_std=0.003,
+                    output_init_std=self.ictd_fix_layer_readout_output_init_std,
                     internal_compute_dtype=internal_compute_dtype,
                     pre_product_norm=self.ictd_fix_fusion_pre_product_norm,
                 )
@@ -1956,6 +2037,7 @@ class PureCartesianICTDFix(nn.Module):
             self.fusion_head_weights = None
             self.fusion_energy_scale = None
             self.fusion_input_scales = None
+            self.fusion_depth_attention = None
             self.g_mix_gate = None
             self.gmix_block_rmsnorm_gamma = None
             self.gmix_energy_readout = None
@@ -2088,10 +2170,17 @@ class PureCartesianICTDFix(nn.Module):
         if self.ictd_fix_route == "fusion":
             if last_preproduct_state is None:
                 raise RuntimeError("fusion route expected a last_preproduct_state but none was produced")
-            fusion_mix_states = [
-                self._fusion_input_scale(idx, state) * state
-                for idx, state in enumerate(layer_states)
-            ]
+            if self.fusion_depth_attention is not None:
+                depth_weights = self.fusion_depth_attention(layer_states)  # [N, L]
+                fusion_mix_states = [
+                    depth_weights[:, idx : idx + 1] * state
+                    for idx, state in enumerate(layer_states)
+                ]
+            else:
+                fusion_mix_states = [
+                    self._fusion_input_scale(idx, state) * state
+                    for idx, state in enumerate(layer_states)
+                ]
             mix_inputs = _concat_so3_states_by_l(fusion_mix_states, self.channels, self.lmax)
             g_mix = self.multiple_contraction_mix(mix_inputs, node_attrs)
             g_mix = self._g_mix_gate(g_mix) * g_mix

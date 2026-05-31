@@ -823,6 +823,20 @@ def main():
                         action='store_false',
                         help='Keep per-interaction fusion mix input coefficients fixed.')
     parser.set_defaults(ictd_fix_fusion_input_scale_trainable=False)
+    parser.add_argument('--ictd-fix-fusion-depth-attention',
+                        dest='ictd_fix_fusion_depth_attention', action='store_true',
+                        help='Replace the global per-layer fusion input scales with per-node softmax '
+                             'attention over the interaction-layer states (depth / scale attention). '
+                             'Scores are computed from each layer state\'s SO(3)-invariant (l=0) content '
+                             'and rescaled so the total per-node input mass equals '
+                             'num_interaction * --ictd-fix-fusion-input-scale-init (constant; only '
+                             'redistributed across scales). The score head is zero-initialized, so at init '
+                             'the weights exactly equal the constant scales -> clean drop-in ablation. '
+                             'O(N*L) cost (L = num_interaction), strictly equivariant. Default off.')
+    parser.add_argument('--no-ictd-fix-fusion-depth-attention',
+                        dest='ictd_fix_fusion_depth_attention', action='store_false',
+                        help='Use the global per-layer fusion input scales (default).')
+    parser.set_defaults(ictd_fix_fusion_depth_attention=False)
     parser.add_argument('--ictd-fix-gmix-gate-init', type=float, default=1.0,
                         help='Initial scalar gate applied to g_mix after fusion mix contraction.')
     parser.add_argument('--ictd-fix-gmix-gate-trainable', dest='ictd_fix_gmix_gate_trainable',
@@ -897,6 +911,12 @@ def main():
                         action='store_false',
                         help='Disable direct g_mix readout.')
     parser.set_defaults(ictd_fix_gmix_energy_readout=True)
+    parser.add_argument('--ictd-fix-layer-readout-output-init-std', type=float, default=0.003,
+                        help='Output init std for h_t layer energy readout Linear weights and '
+                             'fusion readout MainNet output layer. Default 0.003 keeps initial '
+                             'energy predictions near zero (MLIP standard practice). Set to 1.0 '
+                             'with --ictd-fix-readout-head-scale-init 0.0 for scale-zero + '
+                             'expressive-readout training.')
     parser.add_argument('--ictd-fix-gmix-readout-output-init-std', type=float, default=0.003,
                         help='Output init std for the g_mix readout Linear weight. '
                              'Default 0.003 (same as other readouts). Set to 0.1 for '
@@ -2241,6 +2261,7 @@ def main():
             "num_interaction=%d, route=%s, contraction_combine=%s, product_backend=%s, interaction_scale=%s, "
             "fusion_scale_init=%g, fusion_heads=%d, fusion_head_weight_mode=%s, "
             "fusion_input_scale_init=%g, fusion_input_scale_trainable=%s, "
+            "fusion_depth_attention=%s, "
             "gmix_gate_init=%g, gmix_gate_trainable=%s, "
             "gmix_block_rmsnorm=%s, gmix_block_rmsnorm_gamma_init=%g, "
             "readout_head_scale_init=%g, readout_head_scale_trainable=%s, "
@@ -2255,6 +2276,7 @@ def main():
             args.ictd_fix_fusion_head_weight_mode,
             args.ictd_fix_fusion_input_scale_init,
             args.ictd_fix_fusion_input_scale_trainable,
+            args.ictd_fix_fusion_depth_attention,
             args.ictd_fix_gmix_gate_init,
             args.ictd_fix_gmix_gate_trainable,
             args.ictd_fix_gmix_block_rmsnorm,
@@ -2291,6 +2313,7 @@ def main():
             ictd_fix_fusion_head_weight_mode=args.ictd_fix_fusion_head_weight_mode,
             ictd_fix_fusion_input_scale_init=args.ictd_fix_fusion_input_scale_init,
             ictd_fix_fusion_input_scale_trainable=args.ictd_fix_fusion_input_scale_trainable,
+            ictd_fix_fusion_depth_attention=args.ictd_fix_fusion_depth_attention,
             ictd_fix_gmix_gate_init=args.ictd_fix_gmix_gate_init,
             ictd_fix_gmix_gate_trainable=args.ictd_fix_gmix_gate_trainable,
             ictd_fix_gmix_block_rmsnorm=args.ictd_fix_gmix_block_rmsnorm,
@@ -2302,6 +2325,7 @@ def main():
             ictd_fix_interaction_rms_norm=args.ictd_fix_interaction_rms_norm,
             ictd_fix_gmix_energy_readout=args.ictd_fix_gmix_energy_readout,
             ictd_fix_gmix_readout_scale_init=args.ictd_fix_gmix_readout_scale_init,
+            ictd_fix_layer_readout_output_init_std=args.ictd_fix_layer_readout_output_init_std,
             ictd_fix_gmix_readout_output_init_std=args.ictd_fix_gmix_readout_output_init_std,
             polynomial_cutoff_p=args.polynomial_cutoff_p,
             save_contraction_order=args.ictd_save_contraction_order,

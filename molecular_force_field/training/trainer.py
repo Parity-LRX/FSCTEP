@@ -782,6 +782,7 @@ class Trainer:
                 "feature_spectral_gate_init",
                 "ictd_fix_readout_head_scale_init",
                 "ictd_fix_readout_head_scale_trainable",
+                "ictd_fix_fusion_depth_attention",
                 "ictd_fix_gmix_block_rmsnorm",
                 "ictd_fix_gmix_block_rmsnorm_gamma_init",
                 "ictd_fix_fusion_readout_mixed_channels",
