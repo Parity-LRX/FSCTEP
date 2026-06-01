@@ -913,8 +913,23 @@ MFFOutputs MFFTorchEngine::compute_with_cuda_graph(
       cg_cache_.nlocal == nlocal &&
       cg_cache_.need_atom_virial == need_atom_virial;
 
-  if (can_replay) {
-    // Overwrite pre-allocated input buffers with new step data, then replay.
+  if (!can_replay) {
+    // First call or sizes changed — (re)capture a graph for this shape. Capture runs
+    // on placeholder buffers, so we must STILL replay below with the real step data
+    // (the capture-run outputs correspond to the placeholder inputs, not this step).
+    capture_cuda_graph(nlocal, ntotal, nedges, need_atom_virial);
+    if (!cg_cache_.valid) {
+      // Capture failed; use_cuda_graph_ was already turned off — fall back to eager.
+      return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
+                                  external_tensor, fidelity_ids,
+                                  nlocal, ntotal, need_energy, need_atom_virial);
+    }
+  }
+
+  // Overwrite the static input buffers with this step's data, then replay. This runs on
+  // EVERY graph step — including the one right after a (re)capture — so the returned
+  // results always correspond to the actual inputs, never the placeholder capture run.
+  {
     c10::cuda::CUDAStreamGuard guard(cg_cache_.capture_stream);
     cg_cache_.pos_in.copy_(pos0);
     cg_cache_.A_in.copy_(A);
@@ -930,34 +945,8 @@ MFFOutputs MFFTorchEngine::compute_with_cuda_graph(
     }
     cg_cache_.graph.replay();
     cg_cache_.capture_stream.synchronize();
-
-    MFFOutputs out;
-    out.forces = cg_cache_.forces_out;
-    out.atom_energy = cg_cache_.atom_e_out;
-    out.global_phys = cg_cache_.global_phys_out;
-    out.atom_phys = cg_cache_.atom_phys_out;
-    out.global_phys_mask = cg_cache_.global_phys_mask_out;
-    out.atom_phys_mask = cg_cache_.atom_phys_mask_out;
-    out.reciprocal_source = cg_cache_.reciprocal_source_out;
-    out.atom_virial = cg_cache_.atom_vir_out;
-    if (need_energy) {
-      out.energy = cg_cache_.E_local_out.detach().to(torch::kCPU).item<double>();
-    }
-    return out;
   }
 
-  // Sizes changed or first call — attempt to capture a new graph.
-  capture_cuda_graph(nlocal, ntotal, nedges, need_atom_virial);
-
-  if (!cg_cache_.valid) {
-    // Capture failed; use_cuda_graph_ was already turned off.
-    // Fall through to eager path.
-    return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
-                                external_tensor, fidelity_ids,
-                                nlocal, ntotal, need_energy, need_atom_virial);
-  }
-
-  // The capture run produced valid results; return them directly.
   MFFOutputs out;
   out.forces = cg_cache_.forces_out;
   out.atom_energy = cg_cache_.atom_e_out;
@@ -998,16 +987,29 @@ void MFFTorchEngine::capture_cuda_graph(
     cg_cache_.fidelity_ids_in = torch::zeros({1}, iopt);
   }
 
-  // Warmup run (populates CUDA caching allocator and JIT caches).
-  // Must run with grad enabled so autograd kernels are exercised.
-  try {
-    run_forward_backward(cg_cache_.pos_in, cg_cache_.A_in,
-                         cg_cache_.edge_src_in, cg_cache_.edge_dst_in,
-                         cg_cache_.edge_shifts_in, cg_cache_.cell_in,
-                         cg_cache_.external_tensor_in, cg_cache_.fidelity_ids_in,
-                         nlocal, ntotal, false, need_atom_virial);
-  } catch (...) {
-    // Warmup may fail for degenerate inputs; proceed to capture.
+  // Warmup BEFORE capture (grad enabled, so autograd kernels are exercised too).
+  // SEVERAL passes are required, not one: TorchScript's profiling graph executor runs
+  // its optimization passes (e.g. EliminateCommonSubexpression, which compares constant
+  // tensors via torch.equal -> .item()) on the 2nd execution of a given shape. Those
+  // host syncs are illegal during capture, so we must run the model enough times here
+  // that the optimized plan is built and cached before we begin capturing. Configurable
+  // via MFF_CUDA_GRAPH_WARMUP (default 5).
+  int cg_warmup = 5;
+  if (const char* w = std::getenv("MFF_CUDA_GRAPH_WARMUP")) {
+    int v = std::atoi(w);
+    if (v > 0) cg_warmup = v;
+  }
+  for (int wi = 0; wi < cg_warmup; ++wi) {
+    try {
+      run_forward_backward(cg_cache_.pos_in, cg_cache_.A_in,
+                           cg_cache_.edge_src_in, cg_cache_.edge_dst_in,
+                           cg_cache_.edge_shifts_in, cg_cache_.cell_in,
+                           cg_cache_.external_tensor_in, cg_cache_.fidelity_ids_in,
+                           nlocal, ntotal, false, need_atom_virial);
+      if (device_.is_cuda()) torch::cuda::synchronize();
+    } catch (...) {
+      // Warmup may fail for degenerate inputs; proceed to capture.
+    }
   }
   if (device_.is_cuda()) torch::cuda::synchronize();
 
@@ -1021,12 +1023,15 @@ void MFFTorchEngine::capture_cuda_graph(
     c10::cuda::CUDAStreamGuard guard(cg_cache_.capture_stream);
     cg_cache_.graph.capture_begin();
 
+    // need_energy=false during capture: computing out.energy does E_local.item(), a
+    // host sync that is illegal during capture. The energy tensor is captured
+    // separately below (cg_cache_.E_local_out) and read with .item() after replay.
     auto result = run_forward_backward(
         cg_cache_.pos_in, cg_cache_.A_in,
         cg_cache_.edge_src_in, cg_cache_.edge_dst_in,
         cg_cache_.edge_shifts_in, cg_cache_.cell_in,
         cg_cache_.external_tensor_in, cg_cache_.fidelity_ids_in,
-        nlocal, ntotal, true, need_atom_virial);
+        nlocal, ntotal, /*need_energy=*/false, need_atom_virial);
 
     cg_cache_.forces_out = result.forces;
     cg_cache_.atom_e_out = result.atom_energy;
@@ -1050,13 +1055,17 @@ void MFFTorchEngine::capture_cuda_graph(
     cg_cache_.need_atom_virial = need_atom_virial;
     cg_cache_.valid = true;
   } catch (const std::exception& e) {
-    // Capture failed (Kokkos conflict, unsupported op, etc.) — fall back
-    // to eager mode permanently for this run.
+    // Capture failed (host sync during capture, unsupported op, etc.) — fall back
+    // to eager mode permanently for this run. End the capture first so the stream is
+    // not left stuck in "capturing" state (which would make the eager fallback's own
+    // CUDA calls fail too); ignore any secondary error from the cleanup.
+    try { cg_cache_.graph.capture_end(); } catch (...) {}
     use_cuda_graph_ = false;
     cg_cache_.valid = false;
     fprintf(stderr, "[MFFTorchEngine] CUDA Graph capture failed: %s\n"
                     "[MFFTorchEngine] Falling back to eager mode.\n", e.what());
   } catch (...) {
+    try { cg_cache_.graph.capture_end(); } catch (...) {}
     use_cuda_graph_ = false;
     cg_cache_.valid = false;
     fprintf(stderr, "[MFFTorchEngine] CUDA Graph capture failed (unknown error), "
@@ -1091,7 +1100,11 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   }
 
   auto edge_vec = pos.index_select(0, edge_dst) - pos.index_select(0, edge_src) + shift_leaf;
-  if (device_.is_cuda()) torch::cuda::synchronize();
+  // NOTE: this device sync is a pure timing barrier (only used under debug_timings).
+  // It MUST be gated: a device sync is illegal during CUDA-graph capture, and running
+  // it unconditionally both broke MFF_CUDA_GRAPH capture and added a needless sync to
+  // the eager hot path.
+  if (debug_timings && device_.is_cuda()) torch::cuda::synchronize();
   const auto t_after_prep = std::chrono::steady_clock::now();
 
   std::vector<torch::jit::IValue> inputs;
@@ -1110,7 +1123,7 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   maybe_dump_forward_inputs_once(inputs);
 
   auto core_out = core_.forward(inputs);
-  if (device_.is_cuda()) torch::cuda::synchronize();
+  if (debug_timings && device_.is_cuda()) torch::cuda::synchronize();  // timing-only; gated for capture-safety
   const auto t_after_forward = std::chrono::steady_clock::now();
   torch::Tensor atom_e;
   torch::Tensor global_phys;
@@ -1158,7 +1171,7 @@ MFFOutputs MFFTorchEngine::run_forward_backward(
   OptionalGilRelease no_gil;
   auto grads = torch::autograd::grad({E_local}, grad_inputs, {}, /*retain_graph=*/false,
                                      /*create_graph=*/false, /*allow_unused=*/true);
-  if (device_.is_cuda()) torch::cuda::synchronize();
+  if (debug_timings && device_.is_cuda()) torch::cuda::synchronize();  // timing-only; gated for capture-safety
   const auto t_after_grad = std::chrono::steady_clock::now();
   auto forces = -grads[0];
 
