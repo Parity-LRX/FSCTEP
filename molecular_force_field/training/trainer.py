@@ -146,6 +146,12 @@ class Trainer:
         # 2nd-order / double-backward) via torch._dynamo.compiled_autograd. Forward
         # stays eager (torch.compile's AOTAutograd cannot double-backward). Opt-in.
         train_compiled_autograd: bool = False,
+        # Fixed-shape CUDA-graph training: captures the full train step (forward ->
+        # forces/stress via create_graph -> loss -> backward) as a CUDA graph and
+        # replays it per batch. Numerically identical replay. Requires fixed shapes,
+        # single-GPU, smooth-l1, constant loss weights, no phys/fidelity/external;
+        # otherwise it transparently falls back to the eager train_epoch. Opt-in.
+        train_cuda_graph: bool = False,
         # 推理模式：保存到 checkpoint，evaluate/inference_ddp 可读取；TorchScript/LAMMPS 导出始终只输出能量和力
         inference_output_physical_tensors: bool = False,
         # 物理张量 loss 系数：{"charge": 1.0, "dipole": 2.0, ...}，未指定则 1.0；charge_per_atom 用 charge
@@ -244,6 +250,20 @@ class Trainer:
         self._compiled_autograd_warned = False
         self._ca_checked = False   # first-step probe done?
         self._ca_disabled = False  # permanently fell back to eager?
+        self.train_cuda_graph = bool(train_cuda_graph)
+        if self.train_cuda_graph and self.train_compiled_autograd:
+            # Both accelerate the same backward by different means; the cuda-graph path
+            # captures backward inside the graph (compiled-autograd never runs there).
+            # Prefer cuda-graph and turn the other off to avoid the unused bias-freeze.
+            logging.warning("train_cuda_graph and train_compiled_autograd are mutually exclusive; "
+                            "using cuda-graph and disabling compiled-autograd.")
+            self.train_compiled_autograd = False
+        self._cg_graph = None          # captured torch.cuda.CUDAGraph (lazy, first eligible batch)
+        self._cg_static_in = None      # dict of static input buffers we copy_ each batch
+        self._cg_static_out = None     # dict of stable output clones replay rewrites
+        self._cg_sig = None            # captured shape signature; batches must match
+        self._cg_disabled = False      # permanently fell back to eager (capture failed / ineligible)
+        self._cg_warned = False
         self._val_compiled_current = None
         self._val_compiled_ema = None
         self._val_compile_failed_current = False
@@ -1269,7 +1289,235 @@ class Trainer:
             logging.info(f"  Best validation metric (E_RMSE + b/a * F_RMSE): {self.best_val_loss:.6f}")
             logging.info(f"  Early stopping patience counter: {self.patience_counter}/{self.patience}")
             logging.info("=" * 80)
-    
+
+    @staticmethod
+    def _safe_smooth_l1(pred: torch.Tensor, target: torch.Tensor, *, beta: float = 0.5) -> torch.Tensor:
+        """Capture-safe SmoothL1 mean (weights=None case). Bit-identical to
+        smooth_l1_loss_stats(...)[0]: same elementwise loss, same .sum(), same
+        `loss_sum / normalizer.clamp_min(1e-12)`. The ONLY change is how the normalizer
+        is built: smooth_l1_loss_stats does torch.tensor(float(numel), device='cuda'),
+        a host->device scalar copy that breaks CUDA-graph capture; here the same value
+        (numel) is produced on-device via torch.ones_like(loss).sum() (an exact count
+        for these sizes), so the division is bit-for-bit the same."""
+        loss = F.smooth_l1_loss(pred, target, beta=beta, reduction="none")
+        loss_sum = loss.sum()
+        normalizer = torch.ones_like(loss).sum()
+        return loss_sum / normalizer.clamp_min(1e-12)
+
+    @staticmethod
+    def _det3x3(m: torch.Tensor) -> torch.Tensor:
+        """Explicit batched 3x3 determinant ([...,3,3] -> [...]). Capture-safe stand-in
+        for torch.det, which dispatches to cuSOLVER and can host-sync during CUDA-graph
+        capture. Cofactor expansion differs from LU by ~eps; used only for the stress
+        volume divisor on the cuda-graph path."""
+        a = m[..., 0, 0]; b = m[..., 0, 1]; c = m[..., 0, 2]
+        d = m[..., 1, 0]; e = m[..., 1, 1]; f = m[..., 1, 2]
+        g = m[..., 2, 0]; h = m[..., 2, 1]; i = m[..., 2, 2]
+        return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+    def _train_compute(self, pos, A, batch_idx, force_ref, target_energies,
+                       edge_src, edge_dst, edge_shifts, cell, stress_ref, extras,
+                       *, capture_safe: bool = False):
+        """Shared per-batch compute: forward + force/stress autograd + all losses.
+
+        Returns a dict with total_loss, the component losses, the predictions and the
+        rmse tensors. Deliberately does NOT zero grads, run backward, log energy
+        predictions, or run finite checks -- the caller owns those (they host-sync and
+        must stay outside any captured region). With capture_safe=False the body is a
+        verbatim extraction of the old train_epoch compute region (bit-identical). With
+        capture_safe=True it swaps in host-sync-free variants (_safe_smooth_l1, _det3x3)
+        so it can be captured into a CUDA graph; in that mode the caller guarantees no
+        fidelity weights / phys / external heads / weighted-mse so the results match."""
+        # Map atomic energies
+        mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
+        E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
+
+        # Apply per-molecule strain for stress computation
+        compute_stress = (self.c > 0)
+        if compute_stress:
+            num_mol = cell.shape[0]
+            strain = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device, requires_grad=True)
+            symmetric_strain = 0.5 * (strain + strain.transpose(-1, -2))
+            I3 = torch.eye(3, dtype=pos.dtype, device=self.device)
+            deformation = I3 + symmetric_strain  # [B, 3, 3]
+            deformation_per_atom = deformation[batch_idx]  # [N_atoms, 3, 3]
+            pos_input = torch.einsum('ni,nij->nj', pos, deformation_per_atom)
+            cell_input = torch.bmm(cell, deformation)
+        else:
+            strain = None
+            pos_input = pos
+            cell_input = cell
+
+        # Forward pass (optional external field + optional physical tensor heads)
+        base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+        forward_kwargs = {}
+        external_specs = getattr(base_e3, "external_tensor_specs", None)
+        num_fidelity_levels = int(getattr(base_e3, "num_fidelity_levels", 0) or 0)
+        fidelity_ids = None
+        if external_specs:
+            if "external_field" in extras:
+                ext = extras["external_field"]
+                if "born_effective_charge_per_atom" in extras and ext.ndim == 2 and ext.shape[-1] == 3:
+                    ext = ext.clone().detach().requires_grad_(True)
+                extras["external_field"] = ext
+            packed_external = pack_external_tensor_from_extras(
+                extras,
+                external_specs,
+                device=self.device,
+                dtype=pos_input.dtype,
+            )
+            if packed_external is not None:
+                forward_kwargs["external_tensor"] = packed_external
+        elif "external_field" in extras:
+            ext = extras["external_field"]
+            if "born_effective_charge_per_atom" in extras and ext.ndim == 2 and ext.shape[-1] == 3:
+                ext = ext.clone().detach().requires_grad_(True)
+            forward_kwargs["external_tensor"] = ext
+            extras["external_field"] = ext
+        if num_fidelity_levels > 0:
+            if "fidelity_id" not in extras:
+                raise ValueError("Model was configured with num_fidelity_levels but batch extras do not contain fidelity_id")
+            fidelity_ids = extras["fidelity_id"].to(self.device, dtype=torch.long).view(-1)
+            forward_kwargs["fidelity_ids"] = fidelity_ids
+
+        want_phys = any(
+            k in extras for k in ALL_PHYSICAL_TENSOR_NAMES
+        )
+        supports_phys = hasattr(base_e3, "physical_tensor_heads") and base_e3.physical_tensor_heads is not None
+
+        phys_pred = None
+        if want_phys and supports_phys:
+            try:
+                E_per_atom, phys_pred = self.e3trans(
+                    pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                    return_physical_tensors=True,
+                    **forward_kwargs,
+                )
+            except TypeError:
+                E_per_atom, phys_pred = self.e3trans(
+                    pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                    return_physical_tensors=True,
+                )
+        else:
+            try:
+                E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
+            except TypeError:
+                E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+        E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
+        E_mean = E_conv_mol + E_offset_mol
+
+        # Compute forces (and stress if enabled)
+        grad_targets = [pos]
+        if compute_stress:
+            grad_targets.append(strain)
+
+        grads = torch.autograd.grad(
+            E_mean.sum(),
+            grad_targets,
+            create_graph=True,
+            retain_graph=True
+        )
+
+        force_grads = grads[0]
+        fx_pred = self.train_dataset.restore_force(-force_grads[:, 0])
+        fy_pred = self.train_dataset.restore_force(-force_grads[:, 1])
+        fz_pred = self.train_dataset.restore_force(-force_grads[:, 2])
+        f_pred = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)
+
+        # Compute predicted stress: σ = (1/V) * dE/dε
+        if compute_stress:
+            stress_grads = grads[1]  # [B, 3, 3]
+            if capture_safe:
+                volume = torch.abs(self._det3x3(cell))  # [B]
+            else:
+                volume = torch.abs(torch.det(cell))  # [B]
+            volume = torch.clamp(volume, min=1e-10)
+            stress_pred = stress_grads / volume.view(-1, 1, 1)  # [B, 3, 3]
+        else:
+            stress_pred = None
+
+        force_ref_scaled = force_ref * self.force_shift_value
+        graph_fidelity_weights, atom_fidelity_weights = self._get_fidelity_weight_tensors(
+            fidelity_ids,
+            batch_idx,
+            dtype=pos.dtype,
+        )
+        if capture_safe:
+            force_loss = self._safe_smooth_l1(f_pred, force_ref_scaled)
+        else:
+            force_loss, _, _ = self._regression_loss_stats(
+                f_pred,
+                force_ref_scaled,
+                weights=atom_fidelity_weights,
+            )
+
+        with torch.no_grad():
+            force_rmse = torch.sqrt(self.criterion_2(f_pred.view(-1), force_ref_scaled.view(-1)))
+
+        # Stress loss
+        if compute_stress:
+            if capture_safe:
+                stress_loss = self._safe_smooth_l1(stress_pred, stress_ref)
+            else:
+                stress_loss, _, _ = self._regression_loss_stats(
+                    stress_pred,
+                    stress_ref,
+                    weights=graph_fidelity_weights,
+                )
+            with torch.no_grad():
+                stress_rmse = torch.sqrt(self.criterion_2(stress_pred.view(-1), stress_ref.view(-1)))
+        else:
+            stress_loss = torch.tensor(0.0, device=self.device)
+            stress_rmse = torch.tensor(0.0, device=self.device)
+
+        # Energy loss
+        num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
+        E_avg_pred = E_mean / num_atoms_per_mol
+        target_energy_avg = target_energies / num_atoms_per_mol
+        if capture_safe:
+            energy_loss = self._safe_smooth_l1(E_avg_pred, target_energy_avg)
+        else:
+            energy_loss, _, _ = self._regression_loss_stats(
+                E_avg_pred,
+                target_energy_avg,
+                weights=graph_fidelity_weights,
+            )
+
+        with torch.no_grad():
+            energy_rmse = torch.sqrt(self.criterion_2(E_mean, target_energies))
+            energy_rmse_avg = torch.sqrt(self.criterion_2(E_avg_pred, target_energy_avg))
+
+        # Total loss
+        total_loss = self.a * energy_loss + self.b * force_loss + self.c * stress_loss
+
+        # Optional: physical tensor supervised loss (Cartesian label -> ICTD irreps)
+        phys_loss = torch.tensor(0.0, device=self.device)
+        if want_phys and supports_phys and phys_pred is not None:
+            phys_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, base_e3)
+            phys_loss = phys_loss + self._compute_bec_consistency_loss(extras, phys_pred, batch_idx, base_e3, f_pred)
+            total_loss = total_loss + phys_loss
+        delta_reg_loss = self._compute_delta_regularization(base_e3)
+        if self.delta_regularization_weight > 0:
+            total_loss = total_loss + self.delta_regularization_weight * delta_reg_loss
+
+        return {
+            "total_loss": total_loss,
+            "energy_loss": energy_loss,
+            "force_loss": force_loss,
+            "stress_loss": stress_loss,
+            "phys_loss": phys_loss,
+            "delta_reg_loss": delta_reg_loss,
+            "energy_rmse": energy_rmse,
+            "energy_rmse_avg": energy_rmse_avg,
+            "force_rmse": force_rmse,
+            "stress_rmse": stress_rmse,
+            "E_mean": E_mean,
+            "f_pred": f_pred,
+            "E_avg_pred": E_avg_pred,
+            "target_energy_avg": target_energy_avg,
+            "stress_pred": stress_pred,
+        }
+
     def train_epoch(self, epoch):
         """Train for one epoch."""
         # Set epoch for distributed sampler
@@ -1428,147 +1676,16 @@ class Trainer:
             
             self.optimizer.zero_grad()
             
-            # Map atomic energies
-            mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
-            E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
-            
-            # Apply per-molecule strain for stress computation
-            compute_stress = (self.c > 0)
-            if compute_stress:
-                num_mol = cell.shape[0]
-                strain = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device, requires_grad=True)
-                symmetric_strain = 0.5 * (strain + strain.transpose(-1, -2))
-                I3 = torch.eye(3, dtype=pos.dtype, device=self.device)
-                deformation = I3 + symmetric_strain  # [B, 3, 3]
-                deformation_per_atom = deformation[batch_idx]  # [N_atoms, 3, 3]
-                pos_input = torch.einsum('ni,nij->nj', pos, deformation_per_atom)
-                cell_input = torch.bmm(cell, deformation)
-            else:
-                strain = None
-                pos_input = pos
-                cell_input = cell
+            out = self._train_compute(
+                pos, A, batch_idx, force_ref, target_energies,
+                edge_src, edge_dst, edge_shifts, cell, stress_ref, extras,
+            )
+            # Only these three are needed by the energy-prediction logging below;
+            # the rest of `out` is consumed inside _train_post_step.
+            E_mean = out["E_mean"]
+            E_avg_pred = out["E_avg_pred"]
+            target_energy_avg = out["target_energy_avg"]
 
-            # Forward pass (optional external field + optional physical tensor heads)
-            base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
-            forward_kwargs = {}
-            external_specs = getattr(base_e3, "external_tensor_specs", None)
-            num_fidelity_levels = int(getattr(base_e3, "num_fidelity_levels", 0) or 0)
-            fidelity_ids = None
-            if external_specs:
-                if "external_field" in extras:
-                    ext = extras["external_field"]
-                    if "born_effective_charge_per_atom" in extras and ext.ndim == 2 and ext.shape[-1] == 3:
-                        ext = ext.clone().detach().requires_grad_(True)
-                    extras["external_field"] = ext
-                packed_external = pack_external_tensor_from_extras(
-                    extras,
-                    external_specs,
-                    device=self.device,
-                    dtype=pos_input.dtype,
-                )
-                if packed_external is not None:
-                    forward_kwargs["external_tensor"] = packed_external
-            elif "external_field" in extras:
-                ext = extras["external_field"]
-                if "born_effective_charge_per_atom" in extras and ext.ndim == 2 and ext.shape[-1] == 3:
-                    ext = ext.clone().detach().requires_grad_(True)
-                forward_kwargs["external_tensor"] = ext
-                extras["external_field"] = ext
-            if num_fidelity_levels > 0:
-                if "fidelity_id" not in extras:
-                    raise ValueError("Model was configured with num_fidelity_levels but batch extras do not contain fidelity_id")
-                fidelity_ids = extras["fidelity_id"].to(self.device, dtype=torch.long).view(-1)
-                forward_kwargs["fidelity_ids"] = fidelity_ids
-
-            want_phys = any(
-                k in extras for k in ALL_PHYSICAL_TENSOR_NAMES
-            )
-            supports_phys = hasattr(base_e3, "physical_tensor_heads") and base_e3.physical_tensor_heads is not None
-
-            phys_pred = None
-            if want_phys and supports_phys:
-                try:
-                    E_per_atom, phys_pred = self.e3trans(
-                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
-                        return_physical_tensors=True,
-                        **forward_kwargs,
-                    )
-                except TypeError:
-                    E_per_atom, phys_pred = self.e3trans(
-                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
-                        return_physical_tensors=True,
-                    )
-            else:
-                try:
-                    E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
-                except TypeError:
-                    E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
-            E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
-            E_mean = E_conv_mol + E_offset_mol
-            
-            # Compute forces (and stress if enabled)
-            grad_targets = [pos]
-            if compute_stress:
-                grad_targets.append(strain)
-            
-            grads = torch.autograd.grad(
-                E_mean.sum(),
-                grad_targets,
-                create_graph=True,
-                retain_graph=True
-            )
-            
-            force_grads = grads[0]
-            fx_pred = self.train_dataset.restore_force(-force_grads[:, 0])
-            fy_pred = self.train_dataset.restore_force(-force_grads[:, 1])
-            fz_pred = self.train_dataset.restore_force(-force_grads[:, 2])
-            f_pred = torch.stack([fx_pred, fy_pred, fz_pred], dim=1)
-            
-            # Compute predicted stress: σ = (1/V) * dE/dε
-            if compute_stress:
-                stress_grads = grads[1]  # [B, 3, 3]
-                volume = torch.abs(torch.det(cell))  # [B]
-                volume = torch.clamp(volume, min=1e-10)
-                stress_pred = stress_grads / volume.view(-1, 1, 1)  # [B, 3, 3]
-            
-            force_ref_scaled = force_ref * self.force_shift_value
-            graph_fidelity_weights, atom_fidelity_weights = self._get_fidelity_weight_tensors(
-                fidelity_ids,
-                batch_idx,
-                dtype=pos.dtype,
-            )
-            force_loss, _, _ = self._regression_loss_stats(
-                f_pred,
-                force_ref_scaled,
-                weights=atom_fidelity_weights,
-            )
-            
-            with torch.no_grad():
-                force_rmse = torch.sqrt(self.criterion_2(f_pred.view(-1), force_ref_scaled.view(-1)))
-            
-            # Stress loss
-            if compute_stress:
-                stress_loss, _, _ = self._regression_loss_stats(
-                    stress_pred,
-                    stress_ref,
-                    weights=graph_fidelity_weights,
-                )
-                with torch.no_grad():
-                    stress_rmse = torch.sqrt(self.criterion_2(stress_pred.view(-1), stress_ref.view(-1)))
-            else:
-                stress_loss = torch.tensor(0.0, device=self.device)
-                stress_rmse = torch.tensor(0.0, device=self.device)
-
-            # Energy loss
-            num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
-            E_avg_pred = E_mean / num_atoms_per_mol
-            target_energy_avg = target_energies / num_atoms_per_mol
-            energy_loss, _, _ = self._regression_loss_stats(
-                E_avg_pred,
-                target_energy_avg,
-                weights=graph_fidelity_weights,
-            )
-            
             # Log energy predictions every N batches (only to log file, not console, only on main process)
             if self.is_main_process and self.batch_count % self.energy_log_frequency == 0:
                 # Get unique molecule indices in this batch
@@ -1600,135 +1717,14 @@ class Trainer:
                         f"Error={error_avg:8.4f} eV/atom"
                     )
             
-            with torch.no_grad():
-                energy_rmse = torch.sqrt(self.criterion_2(E_mean, target_energies))
-                energy_rmse_avg = torch.sqrt(self.criterion_2(E_avg_pred, target_energy_avg))
-
-            # Total loss
-            total_loss = self.a * energy_loss + self.b * force_loss + self.c * stress_loss
-
-            # Optional: physical tensor supervised loss (Cartesian label -> ICTD irreps)
-            phys_loss = torch.tensor(0.0, device=self.device)
-            if want_phys and supports_phys and phys_pred is not None:
-                phys_loss = self._compute_physical_tensor_loss(extras, phys_pred, batch_idx, base_e3)
-                phys_loss = phys_loss + self._compute_bec_consistency_loss(extras, phys_pred, batch_idx, base_e3, f_pred)
-                total_loss = total_loss + phys_loss
-            delta_reg_loss = self._compute_delta_regularization(base_e3)
-            if self.delta_regularization_weight > 0:
-                total_loss = total_loss + self.delta_regularization_weight * delta_reg_loss
-
-            self._ensure_finite_tensor(E_mean, "predicted_energy", epoch=epoch, batch_count=self.batch_count)
-            self._ensure_finite_tensor(f_pred, "predicted_force", epoch=epoch, batch_count=self.batch_count)
-            self._ensure_finite_tensor(energy_loss, "energy_loss", epoch=epoch, batch_count=self.batch_count)
-            self._ensure_finite_tensor(force_loss, "force_loss", epoch=epoch, batch_count=self.batch_count)
-            self._ensure_finite_tensor(total_loss, "total_loss", epoch=epoch, batch_count=self.batch_count)
-
-            self._train_step_backward(total_loss)
-            self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
-            
-            # Gradient clipping
-            if self.max_norm_value is not None and self.max_norm_value > 0:
-                torch.nn.utils.clip_grad_norm_(all_parameters, max_norm=self.max_norm_value, norm_type=2.0)
-            
-            if self.batch_count % self.gradient_log_interval == 0:
-                log_gradient_statistics(all_nets, self.batch_count, logging)
-            
-            self.optimizer.step()
-            self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
-
-            # Update EMA after optimizer step
-            if self.ema_enabled and self.e3trans_ema is not None:
-                with torch.no_grad():
-                    current = self.e3trans.module if self.distributed else self.e3trans
-                    for ema_param, cur_param in zip(self.e3trans_ema.parameters(), current.parameters()):
-                        ema_param.data.mul_(self.ema_decay).add_(cur_param.data, alpha=1.0 - self.ema_decay)
-            
-            # Update learning rate
-            for param_group in self.optimizer.param_groups:
-                if param_group['lr'] < self.min_learning_rate:
-                    param_group['lr'] = self.min_learning_rate
-            
-            if self.batch_count % self.vhat_clamp_interval == 0:
-                for param_group in self.optimizer.param_groups:
-                    for param in param_group['params']:
-                        state = self.optimizer.state[param]
-                        if 'v_hat' in state:
-                            current_max = state['v_hat'].max().item()
-                            state['v_hat'].clamp_(max=current_max * self.max_vhat_growth_factor)
-            
-            if self.lr_scheduler_type == 'plateau':
-                if self.batch_count <= self.warmup_batches:
-                    self.warmup_scheduler.step()
-            else:
-                self.scheduler.step()
-            
-            metric_sums["total_loss"] = metric_sums["total_loss"] + total_loss.detach()
-            metric_sums["energy_loss"] = metric_sums["energy_loss"] + energy_loss.detach()
-            metric_sums["energy_rmse"] = metric_sums["energy_rmse"] + energy_rmse.detach()
-            metric_sums["energy_rmse_avg"] = metric_sums["energy_rmse_avg"] + energy_rmse_avg.detach()
-            metric_sums["force_loss"] = metric_sums["force_loss"] + force_loss.detach()
-            metric_sums["force_rmse"] = metric_sums["force_rmse"] + force_rmse.detach()
-            metric_sums["stress_loss"] = metric_sums["stress_loss"] + stress_loss.detach()
-            metric_sums["stress_rmse"] = metric_sums["stress_rmse"] + stress_rmse.detach()
-            metric_sums["phys_loss"] = metric_sums["phys_loss"] + phys_loss.detach()
-            metric_sums["delta_reg_loss"] = metric_sums["delta_reg_loss"] + delta_reg_loss.detach()
-            
-            # Record batch time
-            batch_end_time = time.time()
-            batch_time = batch_end_time - batch_start_time
-            batch_times.append(batch_time)
-            
-            # Log training progress only to file, not console (only on main process)
-            if self.is_main_process:
-                if self.train_log_interval > 0:
-                    progress_interval = self.train_log_interval
-                else:
-                    progress_interval = max(1, min(10, total_batches // 20))  # Show at least 20 updates per epoch
-                if (batch_idx_loader + 1) % progress_interval == 0 or (batch_idx_loader + 1) == total_batches:
-                    current_energy_loss = float(energy_loss.detach().cpu())
-                    current_force_loss = float(force_loss.detach().cpu())
-                    current_stress_loss = float(stress_loss.detach().cpu())
-                    current_phys_loss = float(phys_loss.detach().cpu())
-                    current_delta_reg_loss = float(delta_reg_loss.detach().cpu())
-                    current_lr = self.optimizer.param_groups[0]['lr']
-                    avg_batch_time = np.mean(batch_times[-10:]) if len(batch_times) >= 10 else np.mean(batch_times)
-                    elapsed_time = batch_end_time - epoch_start_time
-                    # Estimate remaining time
-                    remaining_batches = total_batches - (batch_idx_loader + 1)
-                    eta = remaining_batches * avg_batch_time
-                    # Log to file only
-                    stress_log = f" | Stress Loss: {current_stress_loss:.6f}" if self.c > 0 else ""
-                    phys_log = f" | Phys Loss: {current_phys_loss:.6f}" if current_phys_loss > 0 else ""
-                    delta_reg_log = f" | DeltaReg: {current_delta_reg_loss:.6f}" if self.delta_regularization_weight > 0 else ""
-                    logging.info(
-                        f"Epoch {epoch} | Batch {batch_idx_loader + 1}/{total_batches} | "
-                        f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log}{phys_log}{delta_reg_log} | "
-                        f"LR: {current_lr:.2e} | Batch Count: {self.batch_count} | "
-                        f"Batch Time: {batch_time:.3f}s | Avg: {avg_batch_time:.3f}s | "
-                        f"Elapsed: {elapsed_time:.1f}s | ETA: {eta:.1f}s"
-                    )
-            
-            if self.batch_count % self.dump_frequency == 0:
-                if self.train_eval_sample_ratio > 0.0:
-                    full_train_metrics = self.compute_full_train_metrics(epoch)
-                else:
-                    # Use current batch loss directly (no extra forward pass)
-                    full_train_metrics = {
-                        'train_total_loss': float(total_loss.detach().cpu()),
-                        'train_energy_loss': float(energy_loss.detach().cpu()),
-                        'train_force_loss': float(force_loss.detach().cpu()),
-                        'train_stress_loss': float(stress_loss.detach().cpu()),
-                        'train_phys_loss': float(phys_loss.detach().cpu()),
-                        'train_energy_rmse': float(energy_rmse.detach().cpu()),
-                        'train_energy_mae': 0.0,
-                        'train_energy_rmse_avg': float(energy_rmse_avg.detach().cpu()),
-                        'train_energy_mae_avg': 0.0,
-                        'train_force_rmse': float(force_rmse.detach().cpu()),
-                        'train_force_mae': 0.0,
-                        'train_stress_rmse': float(stress_rmse.detach().cpu()),
-                        'train_stress_mae': 0.0,
-                    }
-                self.validate(epoch, full_train_metrics)
+            self._train_post_step(
+                out=out, epoch=epoch,
+                batch_idx_loader=batch_idx_loader, total_batches=total_batches,
+                all_parameters=all_parameters, all_nets=all_nets,
+                metric_sums=metric_sums, batch_times=batch_times,
+                epoch_start_time=epoch_start_time, batch_start_time=batch_start_time,
+                run_backward=True,
+            )
         
         # Log epoch summary
         epoch_end_time = time.time()
@@ -1756,6 +1752,423 @@ class Trainer:
             'avg_batch_time': avg_batch_time,
         }
     
+    def _train_post_step(self, *, out, epoch, batch_idx_loader, total_batches,
+                         all_parameters, all_nets, metric_sums, batch_times,
+                         epoch_start_time, batch_start_time, run_backward):
+        """Shared per-batch tail used by both train_epoch (eager) and
+        train_epoch_cuda_graph (replay): finite checks, backward (eager only), grad
+        clip, optimizer.step, EMA, LR clamp, vhat clamp, scheduler, metric accumulation,
+        progress logging and periodic eval. `out` is the dict from _train_compute (eager)
+        or the stable replay-output clones (cuda-graph). With run_backward=False the
+        backward already ran inside the replayed CUDA graph."""
+        total_loss = out["total_loss"]
+        energy_loss = out["energy_loss"]
+        force_loss = out["force_loss"]
+        stress_loss = out["stress_loss"]
+        phys_loss = out["phys_loss"]
+        delta_reg_loss = out["delta_reg_loss"]
+        energy_rmse = out["energy_rmse"]
+        energy_rmse_avg = out["energy_rmse_avg"]
+        force_rmse = out["force_rmse"]
+        stress_rmse = out["stress_rmse"]
+        E_mean = out["E_mean"]
+        f_pred = out["f_pred"]
+
+        self._ensure_finite_tensor(E_mean, "predicted_energy", epoch=epoch, batch_count=self.batch_count)
+        self._ensure_finite_tensor(f_pred, "predicted_force", epoch=epoch, batch_count=self.batch_count)
+        self._ensure_finite_tensor(energy_loss, "energy_loss", epoch=epoch, batch_count=self.batch_count)
+        self._ensure_finite_tensor(force_loss, "force_loss", epoch=epoch, batch_count=self.batch_count)
+        self._ensure_finite_tensor(total_loss, "total_loss", epoch=epoch, batch_count=self.batch_count)
+
+        if run_backward:
+            self._train_step_backward(total_loss)
+        self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
+
+        # Gradient clipping
+        if self.max_norm_value is not None and self.max_norm_value > 0:
+            torch.nn.utils.clip_grad_norm_(all_parameters, max_norm=self.max_norm_value, norm_type=2.0)
+
+        if self.batch_count % self.gradient_log_interval == 0:
+            log_gradient_statistics(all_nets, self.batch_count, logging)
+
+        self.optimizer.step()
+        self._ensure_finite_parameters(epoch=epoch, batch_count=self.batch_count)
+
+        # Update EMA after optimizer step
+        if self.ema_enabled and self.e3trans_ema is not None:
+            with torch.no_grad():
+                current = self.e3trans.module if self.distributed else self.e3trans
+                for ema_param, cur_param in zip(self.e3trans_ema.parameters(), current.parameters()):
+                    ema_param.data.mul_(self.ema_decay).add_(cur_param.data, alpha=1.0 - self.ema_decay)
+
+        # Update learning rate
+        for param_group in self.optimizer.param_groups:
+            if param_group['lr'] < self.min_learning_rate:
+                param_group['lr'] = self.min_learning_rate
+
+        if self.batch_count % self.vhat_clamp_interval == 0:
+            for param_group in self.optimizer.param_groups:
+                for param in param_group['params']:
+                    state = self.optimizer.state[param]
+                    if 'v_hat' in state:
+                        current_max = state['v_hat'].max().item()
+                        state['v_hat'].clamp_(max=current_max * self.max_vhat_growth_factor)
+
+        if self.lr_scheduler_type == 'plateau':
+            if self.batch_count <= self.warmup_batches:
+                self.warmup_scheduler.step()
+        else:
+            self.scheduler.step()
+
+        metric_sums["total_loss"] = metric_sums["total_loss"] + total_loss.detach()
+        metric_sums["energy_loss"] = metric_sums["energy_loss"] + energy_loss.detach()
+        metric_sums["energy_rmse"] = metric_sums["energy_rmse"] + energy_rmse.detach()
+        metric_sums["energy_rmse_avg"] = metric_sums["energy_rmse_avg"] + energy_rmse_avg.detach()
+        metric_sums["force_loss"] = metric_sums["force_loss"] + force_loss.detach()
+        metric_sums["force_rmse"] = metric_sums["force_rmse"] + force_rmse.detach()
+        metric_sums["stress_loss"] = metric_sums["stress_loss"] + stress_loss.detach()
+        metric_sums["stress_rmse"] = metric_sums["stress_rmse"] + stress_rmse.detach()
+        metric_sums["phys_loss"] = metric_sums["phys_loss"] + phys_loss.detach()
+        metric_sums["delta_reg_loss"] = metric_sums["delta_reg_loss"] + delta_reg_loss.detach()
+
+        # Record batch time
+        batch_end_time = time.time()
+        batch_time = batch_end_time - batch_start_time
+        batch_times.append(batch_time)
+
+        # Log training progress only to file, not console (only on main process)
+        if self.is_main_process:
+            if self.train_log_interval > 0:
+                progress_interval = self.train_log_interval
+            else:
+                progress_interval = max(1, min(10, total_batches // 20))  # Show at least 20 updates per epoch
+            if (batch_idx_loader + 1) % progress_interval == 0 or (batch_idx_loader + 1) == total_batches:
+                current_energy_loss = float(energy_loss.detach().cpu())
+                current_force_loss = float(force_loss.detach().cpu())
+                current_stress_loss = float(stress_loss.detach().cpu())
+                current_phys_loss = float(phys_loss.detach().cpu())
+                current_delta_reg_loss = float(delta_reg_loss.detach().cpu())
+                current_lr = self.optimizer.param_groups[0]['lr']
+                avg_batch_time = np.mean(batch_times[-10:]) if len(batch_times) >= 10 else np.mean(batch_times)
+                elapsed_time = batch_end_time - epoch_start_time
+                # Estimate remaining time
+                remaining_batches = total_batches - (batch_idx_loader + 1)
+                eta = remaining_batches * avg_batch_time
+                # Log to file only
+                stress_log = f" | Stress Loss: {current_stress_loss:.6f}" if self.c > 0 else ""
+                phys_log = f" | Phys Loss: {current_phys_loss:.6f}" if current_phys_loss > 0 else ""
+                delta_reg_log = f" | DeltaReg: {current_delta_reg_loss:.6f}" if self.delta_regularization_weight > 0 else ""
+                logging.info(
+                    f"Epoch {epoch} | Batch {batch_idx_loader + 1}/{total_batches} | "
+                    f"Energy Loss: {current_energy_loss:.6f} | Force Loss: {current_force_loss:.6f}{stress_log}{phys_log}{delta_reg_log} | "
+                    f"LR: {current_lr:.2e} | Batch Count: {self.batch_count} | "
+                    f"Batch Time: {batch_time:.3f}s | Avg: {avg_batch_time:.3f}s | "
+                    f"Elapsed: {elapsed_time:.1f}s | ETA: {eta:.1f}s"
+                )
+
+        if self.batch_count % self.dump_frequency == 0:
+            if self.train_eval_sample_ratio > 0.0:
+                full_train_metrics = self.compute_full_train_metrics(epoch)
+            else:
+                # Use current batch loss directly (no extra forward pass)
+                full_train_metrics = {
+                    'train_total_loss': float(total_loss.detach().cpu()),
+                    'train_energy_loss': float(energy_loss.detach().cpu()),
+                    'train_force_loss': float(force_loss.detach().cpu()),
+                    'train_stress_loss': float(stress_loss.detach().cpu()),
+                    'train_phys_loss': float(phys_loss.detach().cpu()),
+                    'train_energy_rmse': float(energy_rmse.detach().cpu()),
+                    'train_energy_mae': 0.0,
+                    'train_energy_rmse_avg': float(energy_rmse_avg.detach().cpu()),
+                    'train_energy_mae_avg': 0.0,
+                    'train_force_rmse': float(force_rmse.detach().cpu()),
+                    'train_force_mae': 0.0,
+                    'train_stress_rmse': float(stress_rmse.detach().cpu()),
+                    'train_stress_mae': 0.0,
+                }
+            self.validate(epoch, full_train_metrics)
+
+    # ----------------------- CUDA-graph training path -----------------------
+    def _cuda_graph_eligible(self):
+        """Return (ok, reason). The fixed-shape CUDA-graph training path only handles a
+        constrained-but-common config; anything else falls back to eager train_epoch.
+        We gate on things that would make a captured graph wrong or uncapturable: host
+        syncs, scalars baked into the graph (loss weights), or a changing param set."""
+        if self.device.type != "cuda":
+            return False, "device is not CUDA"
+        if self.distributed:
+            return False, "distributed/DDP is not supported"
+        if self.loss_function != "smooth-l1":
+            return False, f"loss_function={self.loss_function!r} (cuda-graph path is smooth-l1 only)"
+        if self.delta_regularization_weight and self.delta_regularization_weight > 0:
+            return False, "delta regularization is enabled"
+        # Loss weights a/b/c are baked into the captured graph -> require them constant.
+        if self.swa_start_epoch is not None:
+            return False, "SWA changes loss weights mid-training"
+        if self.update_param:
+            growth = float(getattr(self, "weight_a_growth", 1.0) or 1.0)
+            decay = float(getattr(self, "weight_b_decay", 1.0) or 1.0)
+            if growth != 1.0 or decay != 1.0:
+                return False, "continuous loss-weight growth/decay is enabled"
+        base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+        if getattr(base_e3, "external_tensor_specs", None):
+            return False, "model uses external-tensor heads"
+        if int(getattr(base_e3, "num_fidelity_levels", 0) or 0) > 0:
+            return False, "model uses fidelity levels"
+        if getattr(base_e3, "physical_tensor_heads", None) is not None:
+            return False, "model uses physical-tensor heads"
+        return True, "ok"
+
+    @staticmethod
+    def _batch_shape_sig(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, force_ref, target_energies, stress_ref):
+        return (
+            tuple(pos.shape), tuple(A.shape), tuple(batch_idx.shape),
+            tuple(edge_src.shape), tuple(edge_dst.shape), tuple(edge_shifts.shape),
+            tuple(cell.shape), tuple(force_ref.shape), tuple(target_energies.shape),
+            tuple(stress_ref.shape),
+        )
+
+    def _cg_zero_grads(self):
+        """Zero (in place, keeping the buffers) the grads the captured graph writes:
+        the trainable params and the static pos leaf. In-place is required so the
+        captured backward keeps accumulating into the same persistent .grad tensors."""
+        for p in self.e3trans.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+        sp = self._cg_static_in["pos"]
+        if sp.grad is not None:
+            sp.grad.zero_()
+
+    def _cg_capture(self, moved):
+        """Allocate static input buffers from this batch's tensors and capture the full
+        train step (forward -> forces/stress -> loss -> backward) into a CUDA graph.
+        Sets self._cg_graph / _cg_static_in / _cg_static_out / _cg_sig. Raises on any
+        capture failure (the caller falls back to eager)."""
+        # The model's per-step input validation host-syncs (.item()) and breaks capture;
+        # fixed-shape replay makes it redundant, so disable it on the backbone.
+        base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+        if hasattr(base_e3, "skip_input_validation"):
+            base_e3.skip_input_validation = True
+
+        static_in = {
+            "pos": moved["pos"].detach().clone().requires_grad_(True),
+            "A": moved["A"].clone(),
+            "batch_idx": moved["batch_idx"].clone(),
+            "edge_src": moved["edge_src"].clone(),
+            "edge_dst": moved["edge_dst"].clone(),
+            "edge_shifts": moved["edge_shifts"].clone(),
+            "cell": moved["cell"].clone(),
+            "force_ref": moved["force_ref"].clone(),
+            "target_energies": moved["target_energies"].clone(),
+            "stress_ref": moved["stress_ref"].clone(),
+        }
+        self._cg_static_in = static_in
+
+        def _step():
+            return self._train_compute(
+                static_in["pos"], static_in["A"], static_in["batch_idx"],
+                static_in["force_ref"], static_in["target_energies"],
+                static_in["edge_src"], static_in["edge_dst"], static_in["edge_shifts"],
+                static_in["cell"], static_in["stress_ref"], {},
+                capture_safe=True,
+            )
+
+        # Warmup on a side stream to stabilize allocator / cuDNN / autograd workspaces
+        # before capture (standard CUDA-graph training pattern).
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._cg_zero_grads()
+                warm = _step()
+                warm["total_loss"].backward()
+        torch.cuda.current_stream().wait_stream(s)
+        self._cg_zero_grads()
+
+        out_keys = ("total_loss", "energy_loss", "force_loss", "stress_loss",
+                    "phys_loss", "delta_reg_loss", "energy_rmse", "energy_rmse_avg",
+                    "force_rmse", "stress_rmse", "E_mean", "f_pred")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = _step()
+            out["total_loss"].backward()
+            # Stable output buffers the replay rewrites; cloned inside capture so the
+            # clone kernels are replayed (host reads these after each replay).
+            static_out = {k: out[k].detach().clone() for k in out_keys}
+        self._cg_graph = g
+        self._cg_static_out = static_out
+        self._cg_sig = self._batch_shape_sig(
+            static_in["pos"], static_in["A"], static_in["batch_idx"],
+            static_in["edge_src"], static_in["edge_dst"], static_in["edge_shifts"],
+            static_in["cell"], static_in["force_ref"], static_in["target_energies"],
+            static_in["stress_ref"],
+        )
+
+    def _cg_replay(self, moved):
+        """Copy this batch into the static buffers, zero grads in place, replay the
+        captured step, and return the stable output clones (now holding this batch's
+        results). Param .grad tensors are populated by the replayed backward."""
+        si = self._cg_static_in
+        with torch.no_grad():
+            for k, v in si.items():
+                v.copy_(moved[k])
+        self._cg_zero_grads()
+        self._cg_graph.replay()
+        return self._cg_static_out
+
+    def train_epoch_cuda_graph(self, epoch):
+        """Fixed-shape CUDA-graph training epoch. Captures the full train step once and
+        replays it per batch (optimizer.step stays eager). Replay is numerically
+        identical to eager for energy+force; for stress the volume divisor uses an
+        explicit 3x3 determinant (capture-safe) that differs from torch.det by ~eps.
+        Falls back to eager train_epoch when ineligible or if capture fails, and
+        per-batch when a batch's shape differs from the captured one."""
+        ok, reason = self._cuda_graph_eligible()
+        if not ok or self._cg_disabled:
+            if not self._cg_warned and self.is_main_process and not self._cg_disabled:
+                self._cg_warned = True
+                logging.info(f"train_cuda_graph not applicable ({reason}); using eager train_epoch.")
+            return self.train_epoch(epoch)
+
+        self.model.train()
+        self.e3trans.train()
+
+        metric_sums = {k: torch.tensor(0.0, device=self.device) for k in (
+            "total_loss", "energy_loss", "energy_rmse", "energy_rmse_avg",
+            "force_loss", "force_rmse", "stress_loss", "stress_rmse",
+            "phys_loss", "delta_reg_loss",
+        )}
+        num_effective_batches = 0
+        all_nets = [self.e3trans, self.model]
+        all_parameters = [param for net in all_nets for param in net.parameters()]
+        total_batches = len(self.train_loader)
+        epoch_start_time = time.time()
+        if self.is_main_process:
+            logging.info(f"Epoch {epoch} started (cuda-graph) - Total batches: {total_batches}")
+        batch_times = []
+
+        for batch_idx_loader, batch_data in enumerate(self.train_loader):
+            batch_start_time = time.time()
+            if batch_data is None:
+                continue
+            num_effective_batches += 1
+
+            extras = {}
+            if isinstance(batch_data, (list, tuple)) and len(batch_data) == 11:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref, extras) = batch_data
+            else:
+                (pos, A, batch_idx, force_ref, target_energies,
+                 edge_src, edge_dst, edge_shifts, cell, stress_ref) = batch_data
+
+            model_dtype = next(self.e3trans.parameters()).dtype
+            pos = pos.to(self.device, dtype=model_dtype)
+            A = A.to(self.device)
+            batch_idx = batch_idx.to(self.device)
+            force_ref = force_ref.to(self.device, dtype=model_dtype)
+            target_energies = target_energies.to(self.device, dtype=model_dtype)
+            edge_src = edge_src.to(self.device)
+            edge_dst = edge_dst.to(self.device)
+            edge_shifts = edge_shifts.to(self.device, dtype=model_dtype)
+            cell = cell.to(self.device, dtype=model_dtype)
+            stress_ref = stress_ref.to(self.device, dtype=model_dtype)
+
+            # The cuda-graph path does not handle batch extras (phys/external/fidelity);
+            # eligibility already excludes models that need them, but guard anyway.
+            if extras:
+                self._cg_disabled = True
+                if self.is_main_process:
+                    logging.warning("train_cuda_graph: batch carries extras; disabling cuda-graph, using eager.")
+                return self.train_epoch(epoch)
+
+            self.batch_count += 1
+
+            # EMA init is allowed (the EMA update itself stays eager in _train_post_step).
+            if self.ema_start_epoch is not None and epoch >= self.ema_start_epoch and not self.ema_enabled:
+                base = self.e3trans.module if self.distributed else self.e3trans
+                self.e3trans_ema = copy.deepcopy(base).to(self.device)
+                self.e3trans_ema.eval()
+                for p in self.e3trans_ema.parameters():
+                    p.requires_grad_(False)
+                self.ema_enabled = True
+                if self.is_main_process:
+                    logging.info(f"EMA initialized at epoch {epoch} with decay={self.ema_decay}")
+
+            moved = {
+                "pos": pos, "A": A, "batch_idx": batch_idx,
+                "edge_src": edge_src, "edge_dst": edge_dst, "edge_shifts": edge_shifts,
+                "cell": cell, "force_ref": force_ref,
+                "target_energies": target_energies, "stress_ref": stress_ref,
+            }
+            sig = self._batch_shape_sig(pos, A, batch_idx, edge_src, edge_dst,
+                                        edge_shifts, cell, force_ref, target_energies, stress_ref)
+
+            if self._cg_graph is None:
+                # First eligible batch: capture, then replay it once for this step.
+                try:
+                    self._cg_capture(moved)
+                except Exception as e:
+                    self._cg_disabled = True
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if self.is_main_process:
+                        logging.warning(
+                            f"train_cuda_graph capture failed ({type(e).__name__}: {e}); "
+                            "using eager train_epoch for the rest of training."
+                        )
+                    return self.train_epoch(epoch)
+                out = self._cg_replay(moved)
+                run_backward = False
+            elif sig == self._cg_sig:
+                out = self._cg_replay(moved)
+                run_backward = False
+            else:
+                # Shape changed -> data is not fixed-shape. Disable cuda-graph and run
+                # this batch (and the rest of training) eagerly.
+                self._cg_disabled = True
+                if self.is_main_process and not self._cg_warned:
+                    self._cg_warned = True
+                    logging.warning("train_cuda_graph: batch shape changed; data is not fixed-shape, using eager from here.")
+                self.optimizer.zero_grad()
+                pos.requires_grad_(True)
+                out = self._train_compute(
+                    pos, A, batch_idx, force_ref, target_energies,
+                    edge_src, edge_dst, edge_shifts, cell, stress_ref, {},
+                )
+                run_backward = True
+
+            self._train_post_step(
+                out=out, epoch=epoch,
+                batch_idx_loader=batch_idx_loader, total_batches=total_batches,
+                all_parameters=all_parameters, all_nets=all_nets,
+                metric_sums=metric_sums, batch_times=batch_times,
+                epoch_start_time=epoch_start_time, batch_start_time=batch_start_time,
+                run_backward=run_backward,
+            )
+
+        epoch_end_time = time.time()
+        epoch_time = epoch_end_time - epoch_start_time
+        avg_batch_time = np.mean(batch_times) if batch_times else 0
+        if self.is_main_process:
+            logging.info(
+                f"Epoch {epoch} finished (cuda-graph) - Total time: {epoch_time:.1f}s | "
+                f"Avg batch time: {avg_batch_time:.3f}s | Total batches: {len(batch_times)}"
+            )
+        denom = float(max(1, num_effective_batches))
+        return {
+            'total_loss': float((metric_sums['total_loss'] / denom).detach().cpu()),
+            'energy_loss': float((metric_sums['energy_loss'] / denom).detach().cpu()),
+            'energy_rmse': float((metric_sums['energy_rmse'] / denom).detach().cpu()),
+            'energy_rmse_avg': float((metric_sums['energy_rmse_avg'] / denom).detach().cpu()),
+            'force_loss': float((metric_sums['force_loss'] / denom).detach().cpu()),
+            'force_rmse': float((metric_sums['force_rmse'] / denom).detach().cpu()),
+            'stress_loss': float((metric_sums['stress_loss'] / denom).detach().cpu()),
+            'stress_rmse': float((metric_sums['stress_rmse'] / denom).detach().cpu()),
+            'phys_loss': float((metric_sums['phys_loss'] / denom).detach().cpu()),
+            'delta_reg_loss': float((metric_sums['delta_reg_loss'] / denom).detach().cpu()),
+            'epoch_time': epoch_time,
+            'avg_batch_time': avg_batch_time,
+        }
+
     def _gather_variable_tensors(self, local_tensor):
         """
         Gather tensors of variable sizes from all processes.
@@ -2788,7 +3201,10 @@ class Trainer:
         last_epoch = self.start_epoch - 1  # Track the last completed epoch
         for epoch in range(self.start_epoch, self.epoch_numbers + 1):
             last_epoch = epoch
-            metrics = self.train_epoch(epoch)
+            if self.train_cuda_graph:
+                metrics = self.train_epoch_cuda_graph(epoch)
+            else:
+                metrics = self.train_epoch(epoch)
             
             if self.is_main_process:
                 phys_log = f" | Phys Loss: {metrics.get('phys_loss', 0):.6f}" if metrics.get('phys_loss', 0) > 0 else ""

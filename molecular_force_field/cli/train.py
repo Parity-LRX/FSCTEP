@@ -1180,13 +1180,26 @@ def main():
     parser.add_argument('--compile-val-precache', action='store_true',
                         help='Run one eager forward on the first validation batch before compiling (recommended for ICTD).')
     parser.add_argument('--train-compiled-autograd', action='store_true',
-                        help='Compile the training-step force double-backward (create_graph) via '
+                        help='Compile the training-step force/stress double-backward (create_graph) via '
                              'torch._dynamo.compiled_autograd. Forward stays eager. Numerically identical results, '
-                             '~1.35-1.37x at >=1024 atoms/step. For the ictd-fix FUSION route it auto-freezes the '
-                             'fusion_readouts biases (additive energy terms whose None 2nd-order force grad blocks '
-                             'compiled-autograd; equivariance-safe) so the fusion route is also accelerated. If '
+                             '~1.35-1.37x at >=1024 atoms/step. Supports stress training (--stress-weight>0): stress '
+                             'is the same 2nd-order order as forces (d2E/dstrain/dparams) and compiles cleanly; '
+                             'validated numerically exact + equivariant (stress S(Rx)=R S(x) R^T). For the ictd-fix '
+                             'FUSION route it auto-freezes the fusion_readouts biases (additive energy terms whose '
+                             'None 2nd-order force/stress grad blocks compiled-autograd; equivariance-safe). If '
                              'compiled-autograd still fails for some model, the first step probes it and falls back '
                              'to eager (no crash). Requires torch>=2.4.')
+
+    parser.add_argument('--train-cuda-graph', action='store_true',
+                        help='Fixed-shape CUDA-graph training: capture the full train step (forward -> '
+                             'forces/stress -> loss -> backward) once and replay it per batch (optimizer.step '
+                             'stays eager). Replay is numerically identical to eager for energy+force; for stress '
+                             'the volume divisor uses an explicit 3x3 determinant (capture-safe) that differs from '
+                             'torch.det by ~eps. REQUIRES fixed shapes across batches, single-GPU, smooth-l1 loss, '
+                             'constant loss weights, and no phys/fidelity/external heads; anything else (incl. a '
+                             'shape change mid-run or a capture failure) transparently falls back to the eager '
+                             'train_epoch. Best for launch-bound (small-atom) regimes; limited benefit when '
+                             'compute-bound at large atom counts. Mutually exclusive with --train-compiled-autograd.')
 
     # 推理模式：保存到 checkpoint，供 evaluate/inference_ddp 使用；TorchScript/LAMMPS 导出始终只输出能量和力
     parser.add_argument('--inference-output-physical-tensors', action='store_true',
@@ -2882,6 +2895,7 @@ def main():
         compile_val_dynamic=args.compile_val_dynamic,
         compile_val_precache=args.compile_val_precache,
         train_compiled_autograd=args.train_compiled_autograd,
+        train_cuda_graph=args.train_cuda_graph,
         inference_output_physical_tensors=args.inference_output_physical_tensors,
         physical_tensor_weights=physical_tensor_weights,
         fidelity_loss_weights=fidelity_loss_weights,

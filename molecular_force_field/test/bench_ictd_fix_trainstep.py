@@ -202,6 +202,31 @@ def run_check(args) -> int:
     ok = (e_err <= tol) and (f_cov_err <= f_tol)
     print(f"[check] EQUIVARIANCE {'PASS' if ok else 'FAIL'} (e_tol={tol:.2e}, f_tol={f_tol:.2e})")
 
+    if args.stress:
+        def _stress(g):
+            p = g[0].detach().clone().requires_grad_(True)
+            A_, b_, es_, ed_, esh_, c_ = g[1], g[2], g[3], g[4], g[5], g[6]
+            nm = int(b_.max().item()) + 1
+            strn = torch.zeros(nm, 3, 3, device=device, dtype=dtype, requires_grad=True)
+            pin, cin = _apply_strain(p, c_, b_, strn)
+            out = model(pin, A_, b_, es_, ed_, esh_, cin)
+            if isinstance(out, tuple):
+                out = out[0]
+            sg = torch.autograd.grad(out.sum(), strn, create_graph=False)[0]
+            vol = _det3x3(c_).abs().clamp_min(1e-10)
+            return sg / vol.view(-1, 1, 1)
+        stress = _stress(graph)
+        # rotate BOTH positions and cell; stress is rank-2: S(Rx) = R S(x) R^T
+        graph_rot_full = (graph[0] @ R.T, graph[1], graph[2], graph[3], graph[4], graph[5], graph[6] @ R.T)
+        stress_r = _stress(graph_rot_full)
+        s_cov_err = (stress_r - torch.matmul(torch.matmul(R, stress), R.transpose(-1, -2))).abs().max().item()
+        s_scale = stress.abs().max().item()
+        s_tol = 1e-8 * max(1.0, s_scale)
+        s_ok = s_cov_err <= s_tol
+        print(f"[check] stress absmax={s_scale:.6e}  equivariance |S(Rx)-R S(x) R^T|_inf={s_cov_err:.3e}")
+        print(f"[check] STRESS-EQUIVARIANCE {'PASS' if s_ok else 'FAIL'} (s_tol={s_tol:.2e})")
+        ok = ok and s_ok
+
     if args.save_ref:
         torch.save({"energy": energy.detach().cpu(), "forces": forces.detach().cpu(),
                     "meta": vars(args)}, args.save_ref)
@@ -325,6 +350,27 @@ def run_bench(args) -> int:
             print(f"[profile] chrome trace -> {args.trace}")
 
     return 0
+
+
+def _det3x3(m: torch.Tensor) -> torch.Tensor:
+    """Explicit 3x3 determinant (capture-safe; avoids cuSOLVER in torch.det). m: [...,3,3]."""
+    return (
+        m[..., 0, 0] * (m[..., 1, 1] * m[..., 2, 2] - m[..., 1, 2] * m[..., 2, 1])
+        - m[..., 0, 1] * (m[..., 1, 0] * m[..., 2, 2] - m[..., 1, 2] * m[..., 2, 0])
+        + m[..., 0, 2] * (m[..., 1, 0] * m[..., 2, 1] - m[..., 1, 1] * m[..., 2, 0])
+    )
+
+
+def _apply_strain(pos: torch.Tensor, cell: torch.Tensor, batch: torch.Tensor, strain: torch.Tensor):
+    """Mirror the trainer's stress strain deformation: deformation = I + sym(strain),
+    pos_input = pos @ deformation_per_atom, cell_input = cell @ deformation. Returns
+    (pos_input, cell_input). strain has requires_grad so stress = dE/dstrain."""
+    sym = 0.5 * (strain + strain.transpose(-1, -2))
+    I3 = torch.eye(3, device=pos.device, dtype=pos.dtype)
+    deform = I3 + sym  # [M,3,3]
+    pos_input = torch.einsum("ni,nij->nj", pos, deform[batch])
+    cell_input = torch.bmm(cell, deform)
+    return pos_input, cell_input
 
 
 def _flat_grads(params) -> torch.Tensor:
@@ -454,6 +500,129 @@ def _compiled_autograd_ctx(compiler_fn):
     return fn(compiler_fn)
 
 
+def _param_vec(params) -> torch.Tensor:
+    return torch.cat([p.detach().double().flatten() for p in params])
+
+
+def run_cudagraph_train(args) -> int:
+    """Fixed-shape CUDA-graph TRAINING benchmark: capture the full train-step
+    compute (forward -> forces via create_graph -> loss -> backward) as a CUDA
+    graph, then run N optimizer steps by replaying it (optimizer.step stays eager).
+    Compares the loss trajectory + final weights vs an identical eager training run
+    (numerically identical replay), and reports ms/step speedup. Requires fixed
+    shapes; CUDA-graph does NOT need the fusion-bias freeze (the None bug is
+    compiled-autograd-only), so all params train."""
+    import copy
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        print("[cudagraph-train] requires CUDA"); return 1
+    dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    torch.manual_seed(0)
+    model = build_model(
+        channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
+        route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+    )
+    model.train()
+    model.skip_input_validation = True
+    graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
+    static_pos = graph[0].detach().clone().requires_grad_(True)
+    rest = tuple(graph[1:])
+    f_tgt = torch.zeros(args.atoms, 3, device=device, dtype=dtype)
+    e_tgt = torch.zeros((), device=device, dtype=dtype)
+    fw = 10.0
+    lr = 1e-3
+    N = int(args.train_steps)
+    params = [p for p in model.parameters() if p.requires_grad]
+    init_state = copy.deepcopy(model.state_dict())
+
+    def compute_step():
+        e_atom = model(static_pos, *rest)
+        if isinstance(e_atom, tuple):
+            e_atom = e_atom[0]
+        energy = e_atom.sum()
+        gpos = torch.autograd.grad(energy, static_pos, create_graph=True)[0]
+        forces = -gpos
+        loss = (energy - e_tgt) ** 2 + fw * ((forces - f_tgt) ** 2).mean()
+        loss.backward()
+        return loss.detach().clone()
+
+    def zero_all():
+        for p in params:
+            if p.grad is not None:
+                p.grad.zero_()
+        if static_pos.grad is not None:
+            static_pos.grad.zero_()
+
+    print(f"[cudagraph-train] device={device} dtype={dtype} atoms={args.atoms} edges={args.atoms*args.degree} "
+          f"channels={args.channels} lmax={args.lmax} route={args.route} steps={N}")
+    print(f"[cudagraph-train] gpu={torch.cuda.get_device_name(0)} torch={torch.__version__}")
+
+    # ---------- EAGER reference training ----------
+    model.load_state_dict(init_state)
+    opt = torch.optim.Adam(params, lr=lr)
+    for _ in range(3):  # warmup (perturbs params)
+        opt.zero_grad(set_to_none=True); compute_step(); opt.step()
+    model.load_state_dict(init_state)
+    opt = torch.optim.Adam(params, lr=lr)
+    eager_losses = []
+    _sync(device); t0 = time.perf_counter()
+    for _ in range(N):
+        opt.zero_grad(set_to_none=True)
+        loss = compute_step()
+        opt.step()
+        eager_losses.append(loss.item())
+    _sync(device); t_eager = (time.perf_counter() - t0) * 1e3 / N
+    eager_final = _param_vec(params).clone()
+
+    # ---------- GRAPHED training ----------
+    model.load_state_dict(init_state)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(args.warmup):
+            zero_all(); compute_step()
+    torch.cuda.current_stream().wait_stream(s)
+    zero_all()
+    g = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(g):
+            static_loss = compute_step()
+    except Exception as e:
+        import traceback
+        print(f"[cudagraph-train] CAPTURE FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return 1
+    print("[cudagraph-train] capture OK")
+    model.load_state_dict(init_state)  # reset params to init (warmup did no optimizer step; safe-reset)
+    opt_g = torch.optim.Adam(params, lr=lr)
+    graph_losses = []
+    _sync(device); t0 = time.perf_counter()
+    for _ in range(N):
+        zero_all()       # in-place: keep static grad buffers
+        g.replay()
+        opt_g.step()
+        graph_losses.append(static_loss.item())
+    _sync(device); t_graph = (time.perf_counter() - t0) * 1e3 / N
+    graph_final = _param_vec(params).clone()
+
+    # ---------- compare ----------
+    traj_dev = max(abs(a - b) for a, b in zip(eager_losses, graph_losses))
+    lscale = max(abs(x) for x in eager_losses) + 1e-30
+    dparam = (graph_final - eager_final).abs().max().item()
+    pscale = eager_final.abs().max().item() + 1e-30
+    print(f"[cudagraph-train] loss[0]  eager={eager_losses[0]:.6e} graph={graph_losses[0]:.6e}")
+    print(f"[cudagraph-train] loss[-1] eager={eager_losses[-1]:.6e} graph={graph_losses[-1]:.6e}")
+    print(f"[cudagraph-train] max loss-traj |d|={traj_dev:.3e} (rel {traj_dev/lscale:.3e}) over {N} steps")
+    print(f"[cudagraph-train] final weights max|d|={dparam:.3e} (rel {dparam/pscale:.3e})")
+    tol = 1e-9 if dtype == torch.float64 else 5e-3
+    ok = (dparam / pscale) <= tol
+    print(f"[cudagraph-train] NUMERICAL-MATCH {'PASS' if ok else 'FAIL'} (rel tol={tol:.1e})")
+    print(f"[cudagraph-train] eager  : {t_eager:8.3f} ms/step")
+    print(f"[cudagraph-train] graph  : {t_graph:8.3f} ms/step")
+    print(f"[cudagraph-train] SPEEDUP: {t_eager / max(t_graph,1e-9):6.2f}x")
+    return 0 if ok else 1
+
+
 def run_compile(args) -> int:
     """Test torch.compile (forward) and optional compiled-autograd (through the
     create_graph double-backward) at the compute-bound large-atom regime.
@@ -483,10 +652,16 @@ def run_compile(args) -> int:
               f"None 2nd-order force grad blocks compiled-autograd)")
     graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
     base_pos = graph[0].detach().clone()
-    rest = tuple(graph[1:])
+    rest = tuple(graph[1:])   # (A, batch, edge_src, edge_dst, edge_shifts, cell)
+    batch_idx = rest[1]
+    cell0 = rest[-1]
+    num_mols = int(batch_idx.max().item()) + 1
     f_tgt = torch.zeros(args.atoms, 3, device=device, dtype=dtype)
     e_tgt = torch.zeros((), device=device, dtype=dtype)
+    s_tgt = torch.zeros(num_mols, 3, 3, device=device, dtype=dtype)
     fw = 10.0
+    sw = float(args.stress_weight)
+
     params = [p for p in model.parameters() if p.requires_grad]
 
     def make_step(fwd, use_ca, ca_compiler):
@@ -494,13 +669,24 @@ def run_compile(args) -> int:
             for p in params:
                 p.grad = None
             pos = base_pos.detach().clone().requires_grad_(True)
-            e_atom = fwd(pos, *rest)
+            if args.stress:
+                strain = torch.zeros(num_mols, 3, 3, device=device, dtype=dtype, requires_grad=True)
+                pos_in, cell_in = _apply_strain(pos, cell0, batch_idx, strain)
+                e_atom = fwd(pos_in, rest[0], batch_idx, rest[2], rest[3], rest[4], cell_in)
+            else:
+                strain = None
+                e_atom = fwd(pos, *rest)
             if isinstance(e_atom, tuple):
                 e_atom = e_atom[0]
             energy = e_atom.sum()
-            gpos = torch.autograd.grad(energy, pos, create_graph=True)[0]
-            forces = -gpos
+            targets = [pos] if strain is None else [pos, strain]
+            grads = torch.autograd.grad(energy, targets, create_graph=True)
+            forces = -grads[0]
             loss = (energy - e_tgt) ** 2 + fw * ((forces - f_tgt) ** 2).mean()
+            if strain is not None:
+                volume = _det3x3(cell0).abs().clamp_min(1e-10)
+                stress = grads[1] / volume.view(-1, 1, 1)
+                loss = loss + sw * ((stress - s_tgt) ** 2).mean()
             if use_ca:
                 with _compiled_autograd_ctx(ca_compiler):
                     loss.backward()
@@ -511,7 +697,8 @@ def run_compile(args) -> int:
 
     print(f"[compile] device={device} dtype={dtype} atoms={args.atoms} edges={args.atoms*args.degree} "
           f"channels={args.channels} lmax={args.lmax} L={args.num_interaction} tf32={args.tf32} "
-          f"fullgraph={args.fullgraph} compiled_autograd={args.compiled_autograd} mode={args.compile_mode}")
+          f"fullgraph={args.fullgraph} compiled_autograd={args.compiled_autograd} mode={args.compile_mode} "
+          f"stress={args.stress}")
 
     # ---- eager reference ----
     eager_step = make_step(model, False, None)
@@ -713,6 +900,8 @@ def main() -> int:
     p.add_argument("--check", action="store_true", help="run numerical + equivariance check")
     p.add_argument("--bench", action="store_true", help="run timing / profiling")
     p.add_argument("--cudagraph", action="store_true", help="capture full step as CUDA graph; compare + time")
+    p.add_argument("--cudagraph-train", dest="cudagraph_train", action="store_true", help="fixed-shape CUDA-graph TRAINING benchmark (N optimizer steps via replay)")
+    p.add_argument("--train-steps", type=int, default=30, help="number of optimizer steps for --cudagraph-train")
     p.add_argument("--compile", dest="do_compile", action="store_true", help="torch.compile forward (+optional compiled-autograd); compare + time")
     p.add_argument("--fullgraph", action="store_true", help="torch.compile fullgraph=True")
     p.add_argument("--compiled-autograd", action="store_true", help="compile the backward via compiled-autograd")
@@ -721,6 +910,8 @@ def main() -> int:
     p.add_argument("--func", action="store_true", help="compute train-step grads via torch.func (functional VJP); compare+time")
     p.add_argument("--compile-func", action="store_true", help="torch.compile the torch.func double-grad")
     p.add_argument("--freeze-fusion-bias", action="store_true", help="freeze fusion_readouts biases (unblocks compiled-autograd on fusion)")
+    p.add_argument("--stress", action="store_true", help="also train stress (dE/dstrain): adds strain deformation + stress loss")
+    p.add_argument("--stress-weight", type=float, default=1.0, help="stress loss weight (with --stress)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--atoms", type=int, default=256)
     p.add_argument("--degree", type=int, default=24)
@@ -739,7 +930,7 @@ def main() -> int:
     p.add_argument("--compare-ref", default=None)
     args = p.parse_args()
 
-    if not (args.check or args.bench or args.cudagraph or args.do_compile or args.func):
+    if not (args.check or args.bench or args.cudagraph or args.cudagraph_train or args.do_compile or args.func):
         args.check = True
 
     rc = 0
@@ -749,6 +940,8 @@ def main() -> int:
         rc |= run_bench(args)
     if args.cudagraph:
         rc |= run_cudagraph(args)
+    if args.cudagraph_train:
+        rc |= run_cudagraph_train(args)
     if args.do_compile:
         rc |= run_compile(args)
     if args.func:
