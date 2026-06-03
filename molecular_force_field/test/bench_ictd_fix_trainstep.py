@@ -58,6 +58,7 @@ def build_model(
     product_backend: str,
     dtype: torch.dtype,
     device: torch.device,
+    correlation: int = 2,
 ) -> PureCartesianICTDFix:
     cfg = ModelConfig(dtype=dtype)
     cfg.channel_in = channels
@@ -85,7 +86,7 @@ def build_model(
         ictd_fix_product_backend=product_backend,
         ictd_fix_fusion_scale_init=1.0,
         ictd_fix_fusion_heads=1,
-        save_contraction_order=2,
+        save_contraction_order=correlation,
         avg_num_neighbors=float(24),
         internal_compute_dtype=dtype,
         device=device,
@@ -173,6 +174,7 @@ def run_check(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order,
     )
     model.eval()
     graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
@@ -249,7 +251,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def _time_section(fn, *, device, iters, warmup):
+def _time_section(fn, *, device, iters, warmup, label=None):
     for _ in range(warmup):
         fn()
     _sync(device)
@@ -260,6 +262,18 @@ def _time_section(fn, *, device, iters, warmup):
         fn()
         _sync(device)
         ts.append((time.perf_counter() - t0) * 1e3)
+    if label is not None:
+        # Print the FULL per-iter series + stats so steady-state is auditable:
+        # a recompile or cache miss shows up as a latency spike, and a flat
+        # series proves the reported median is the post-warmup steady speed.
+        import statistics as _st
+        srt = sorted(ts)
+        med = srt[len(srt) // 2]
+        spread = (max(ts) - min(ts)) / max(med, 1e-9)
+        print(f"[timing:{label}] n={len(ts)} warmup={warmup} min={min(ts):.3f} "
+              f"median={med:.3f} mean={_st.mean(ts):.3f} max={max(ts):.3f} "
+              f"std={_st.pstdev(ts):.3f} ms  (max-min)/median={spread:.2f}")
+        print(f"[timing:{label}] per-iter ms: " + " ".join(f"{t:.2f}" for t in ts))
     ts.sort()
     return ts[len(ts) // 2]  # median ms
 
@@ -271,6 +285,7 @@ def run_bench(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order,
     )
     model.train()
     graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
@@ -389,6 +404,7 @@ def run_cudagraph(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order,
     )
     model.eval()
     model.skip_input_validation = True  # remove host syncs so forward is capturable
@@ -521,6 +537,7 @@ def run_cudagraph_train(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order,
     )
     model.train()
     model.skip_input_validation = True
@@ -639,6 +656,7 @@ def run_compile(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order,
     )
     model.eval()
     model.skip_input_validation = True
@@ -727,11 +745,15 @@ def run_compile(args) -> int:
         cmodel = torch.compile(model, dynamic=False, fullgraph=args.fullgraph,
                                mode=(None if args.compile_mode == "default" else args.compile_mode))
         comp_step = make_step(cmodel, False, ca_compiler)
+    cold_ms = []
     t_compile0 = time.perf_counter()
     try:
-        for _ in range(3):  # triggers compilation
+        for _ in range(5):  # triggers compilation; time each iter to expose the compile cliff
+            _sync(device)
+            _c0 = time.perf_counter()
             comp_step()
-        torch.cuda.synchronize()
+            _sync(device)
+            cold_ms.append((time.perf_counter() - _c0) * 1e3)
     except Exception as ex:
         import traceback
         print(f"[compile] COMPILED STEP FAILED: {type(ex).__name__}: {ex}")
@@ -740,6 +762,8 @@ def run_compile(args) -> int:
     compile_secs = time.perf_counter() - t_compile0
     gb = _count_graph_breaks()
     print(f"[compile] compiled OK; warmup+compile {compile_secs:.1f}s; graph_breaks={gb}")
+    print(f"[compile] cold per-iter ms (compile lands on iter0, then converges to steady): "
+          + " ".join(f"{t:.1f}" for t in cold_ms))
 
     # ---- numerics ----
     loss_c, forces_c = comp_step()
@@ -756,12 +780,13 @@ def run_compile(args) -> int:
     ok = (rloss <= tol) and (rgrad <= tol)
     print(f"[compile] NUMERICAL-MATCH {'PASS' if ok else 'FAIL'} (rel tol={tol:.1e})")
 
-    # ---- timing ----
-    t_eager = _time_section(lambda: eager_step(), device=device, iters=args.iters, warmup=args.warmup)
-    t_comp = _time_section(lambda: comp_step(), device=device, iters=args.iters, warmup=args.warmup)
+    # ---- timing (steady-state: warmup excluded, full per-iter series printed) ----
+    _ca_lbl = "compiled-autograd" if args.compiled_autograd else "compiled"
+    t_eager = _time_section(lambda: eager_step(), device=device, iters=args.iters, warmup=args.warmup, label="eager")
+    t_comp = _time_section(lambda: comp_step(), device=device, iters=args.iters, warmup=args.warmup, label=_ca_lbl)
     print(f"[compile] eager full step : {t_eager:8.3f} ms")
     print(f"[compile] compiled step   : {t_comp:8.3f} ms")
-    print(f"[compile] SPEEDUP         : {t_eager / max(t_comp,1e-9):6.2f}x")
+    print(f"[compile] SPEEDUP         : {t_eager / max(t_comp,1e-9):6.2f}x  (steady-state median, compile excluded)")
     return 0 if ok else 1
 
 
@@ -788,6 +813,7 @@ def run_func(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order,
     )
     model.eval()
     model.skip_input_validation = True
@@ -895,6 +921,34 @@ def run_func(args) -> int:
     return 0 if ok else 1
 
 
+def run_paths(args) -> int:
+    """Print the ICTD-U symmetric-contraction path counts (each U's last axis = the
+    number of independent coupling paths/weights for that degree+output_l), so the
+    correlation->2 path reduction is quantified. No model build / no CUDA needed."""
+    from molecular_force_field.models.ictd_irreps import ictd_u_matrix_so3
+    lmax = args.lmax
+    print(f"[paths] lmax={lmax}  ICTD-U symmetric-contraction path counts (U last-axis = #paths)")
+    per_deg: dict = {}
+    for L in range(lmax + 1):
+        cells = []
+        for d in range(1, 4):
+            U = ictd_u_matrix_so3(lmax=lmax, output_l=L, correlation=d, dtype=torch.float64)
+            n = int(U.shape[-1])
+            per_deg.setdefault(d, {})[L] = n
+            cells.append(f"deg{d}={n:>6d} U{tuple(U.shape)}")
+        print(f"[paths] output_l={L}: " + "   ".join(cells))
+    sum_d = {d: sum(per_deg[d].values()) for d in per_deg}
+    print(f"[paths] per-degree total paths (summed over output_l 0..{lmax}): "
+          + "  ".join(f"deg{d}={sum_d[d]}" for d in sorted(sum_d)))
+    print(f"[paths] cubic vs quadratic term: deg3={sum_d[3]} vs deg2={sum_d[2]} "
+          f"= {sum_d[3]/max(sum_d[2],1):.2f}x more paths in the degree-3 term")
+    tot2 = sum_d[1] + sum_d[2]
+    tot3 = sum_d[1] + sum_d[2] + sum_d[3]
+    print(f"[paths] whole-model paths  corr=2: {tot2}   corr=3: {tot3}   "
+          f"corr3/corr2 = {tot3/max(tot2,1):.2f}x  (operands: deg2=4 OK for fused_tp, deg3=5 NOT)")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--check", action="store_true", help="run numerical + equivariance check")
@@ -908,6 +962,7 @@ def main() -> int:
     p.add_argument("--compile-mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--tf32", action="store_true", help="allow TF32 matmul (changes numerics)")
     p.add_argument("--func", action="store_true", help="compute train-step grads via torch.func (functional VJP); compare+time")
+    p.add_argument("--paths", action="store_true", help="print ICTD-U symmetric-contraction path counts per degree (no model build / no CUDA)")
     p.add_argument("--compile-func", action="store_true", help="torch.compile the torch.func double-grad")
     p.add_argument("--freeze-fusion-bias", action="store_true", help="freeze fusion_readouts biases (unblocks compiled-autograd on fusion)")
     p.add_argument("--stress", action="store_true", help="also train stress (dE/dstrain): adds strain deformation + stress loss")
@@ -918,6 +973,9 @@ def main() -> int:
     p.add_argument("--channels", type=int, default=64)
     p.add_argument("--lmax", type=int, default=2)
     p.add_argument("--num-interaction", type=int, default=2)
+    p.add_argument("--contraction-order", dest="contraction_order", type=int, default=2,
+                   help="symmetric-contraction correlation/body-order (degree). 3=production default; "
+                        "2=cheaper (back in fused_tp's bilinear zone, far fewer paths)")
     p.add_argument("--route", default="baseline", choices=["baseline", "fusion"])
     p.add_argument("--product-backend", default="ictd-pure-u")
     p.add_argument("--dtype", default="float32", choices=["float32", "float64"])
@@ -930,10 +988,12 @@ def main() -> int:
     p.add_argument("--compare-ref", default=None)
     args = p.parse_args()
 
-    if not (args.check or args.bench or args.cudagraph or args.cudagraph_train or args.do_compile or args.func):
+    if not (args.check or args.bench or args.cudagraph or args.cudagraph_train or args.do_compile or args.func or args.paths):
         args.check = True
 
     rc = 0
+    if args.paths:
+        rc |= run_paths(args)
     if args.check:
         rc |= run_check(args)
     if args.bench:

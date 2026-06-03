@@ -40,6 +40,9 @@ from molecular_force_field.models.pure_cartesian_ictd_layers_full import (
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     resolve_save_multiple_mix_channels,
 )
+from molecular_force_field.models.pure_cartesian_ictd_mace_baseline import (
+    PureCartesianICTDMaceBaseline,
+)
 from molecular_force_field.models.e3nn_layers_channelwise import (
     E3_TransformerLayer_multi as E3_TransformerLayer_multi_channelwise,
 )
@@ -756,7 +759,7 @@ def main():
                         help='Number of radial basis functions for the main message-passing stack. '
                              'If not set, restore from checkpoint when available, else use 8.')
     parser.add_argument('--tensor-product-mode', type=str, default=None,
-                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'spherical-fix', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-macereadout', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-multiple-nocross', 'pure-cartesian-ictd-save-multiple-noshallowreadout', 'pure-cartesian-ictd-save-o3', 'pure-cartesian-ictd-fix', 'pure-cartesian-ictd-fix-so2', 'pure-cartesian-ictd-escn-so2', 'pure-cartesian-ictd-node-so2'],
+                        choices=['spherical', 'spherical-save', 'spherical-save-cue', 'spherical-fix', 'partial-cartesian', 'partial-cartesian-loose', 'pure-cartesian', 'pure-cartesian-sparse', 'pure-cartesian-sparse-save', 'pure-cartesian-ictd', 'pure-cartesian-ictd-o3', 'pure-cartesian-ictd-save', 'pure-cartesian-ictd-save-macereadout', 'pure-cartesian-ictd-save-multiple', 'pure-cartesian-ictd-save-multiple-nocross', 'pure-cartesian-ictd-save-multiple-noshallowreadout', 'pure-cartesian-ictd-save-o3', 'pure-cartesian-ictd-fix', 'pure-cartesian-ictd-mace-baseline', 'pure-cartesian-ictd-fix-so2', 'pure-cartesian-ictd-escn-so2', 'pure-cartesian-ictd-node-so2'],
                         help='Tensor product mode. If not set, restore from checkpoint when available, else use spherical. '
                              '"spherical" uses e3nn spherical harmonics (default), '
                              '"spherical-save" uses channelwise edge convolution (e3nn backend; fewer params, same irreps), '
@@ -2359,6 +2362,42 @@ def main():
             device=device,
             **common_invariant_kwargs,
             **common_long_range_kwargs,
+        ).to(device)
+    elif args.tensor_product_mode == 'pure-cartesian-ictd-mace-baseline':
+        logging.info(
+            "Using PURE Cartesian ICTD MACE-BASELINE mode (route=baseline, native-MACE "
+            "symmetric contraction, NO fusion; extracted clean baseline), num_interaction=%d, "
+            "interaction_scale=%s, interaction_rms_norm=%s, readout_head_scale_init=%g, "
+            "readout_head_scale_trainable=%s",
+            args.num_interaction,
+            args.ictd_fix_interaction_scale,
+            args.ictd_fix_interaction_rms_norm,
+            args.ictd_fix_readout_head_scale_init,
+            args.ictd_fix_readout_head_scale_trainable,
+        )
+        e3trans = PureCartesianICTDMaceBaseline(
+            max_embed_radius=config.max_radius,
+            main_number_of_basis=config.number_of_basis_main,
+            hidden_dim_conv=config.channel_in,
+            atomic_numbers=(list(config.atomic_energy_keys) if getattr(config, "atomic_energy_keys", None) is not None else None),
+            max_atomvalue=config.max_atomvalue,
+            num_interaction=args.num_interaction,
+            lmax=config.lmax,
+            function_type_main=config.function_type,
+            polynomial_cutoff_p=args.polynomial_cutoff_p,
+            save_contraction_order=args.ictd_save_contraction_order,
+            avg_num_neighbors=resolved_avg_num_neighbors,
+            ictd_save_tp_mode=args.ictd_save_tp_mode,
+            ictd_tp_path_policy=args.ictd_tp_path_policy,
+            ictd_tp_max_rank_other=args.ictd_tp_max_rank_other,
+            internal_compute_dtype=config.internal_compute_dtype,
+            equivariant_post_linear=args.equivariant_post_linear,
+            ictd_fix_interaction_scale=args.ictd_fix_interaction_scale,
+            ictd_fix_interaction_rms_norm=args.ictd_fix_interaction_rms_norm,
+            ictd_fix_readout_head_scale_init=args.ictd_fix_readout_head_scale_init,
+            ictd_fix_readout_head_scale_trainable=args.ictd_fix_readout_head_scale_trainable,
+            ictd_fix_layer_readout_output_init_std=args.ictd_fix_layer_readout_output_init_std,
+            device=device,
         ).to(device)
     elif args.tensor_product_mode == 'pure-cartesian-ictd-fix-so2':
         logging.info(

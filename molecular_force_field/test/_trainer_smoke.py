@@ -40,9 +40,10 @@ def _make_batch(atoms, degree, dtype, seed):
     return (pos, A, batch_idx, force_ref, target_energies, edge_src, edge_dst, edge_shifts, cell, stress_ref)
 
 
-def build_trainer(route, dtype, device, atoms, ckpt_dir, *, stress=False, **extra):
-    e3 = build_model(channels=16, lmax=2, num_interaction=2, route=route,
-                     product_backend="ictd-pure-u", dtype=dtype, device=device)
+def build_trainer(route, dtype, device, atoms, ckpt_dir, *, stress=False, e3=None, **extra):
+    if e3 is None:
+        e3 = build_model(channels=16, lmax=2, num_interaction=2, route=route,
+                         product_backend="ictd-pure-u", dtype=dtype, device=device)
     batches = [_make_batch(atoms, 16, dtype, seed=i) for i in range(4)]
     ds = _DummyDataset(len(batches))
     trainer = Trainer(
@@ -107,6 +108,29 @@ def run_cg_compare(label, route, dtype, device, atoms, ckpt_dir, *, stress=False
     return ok
 
 
+def run_ca_check(label, route, dtype, device, atoms, ckpt_dir, *, stress=False):
+    """Build a real Trainer with --train-compiled-autograd ON, run one epoch, and verify:
+    compiled-autograd actually ENGAGED (did not fall back to eager), the fusion_readouts
+    biases froze (4 for fusion / 0 for baseline), losses finite, and trainable weights moved."""
+    torch.manual_seed(0)
+    trainer = build_trainer(route, dtype, device, atoms, ckpt_dir, stress=stress,
+                            train_compiled_autograd=True)
+    frozen = [n for n, p in trainer.e3trans.named_parameters()
+              if (not p.requires_grad) and ("fusion_readouts" in n) and n.endswith(".bias")]
+    w0 = [p.detach().clone() for p in trainer.e3trans.parameters() if p.requires_grad]
+    m = trainer.train_epoch(0)
+    el, fl = float(m["energy_loss"]), float(m["force_loss"])
+    finite = (el == el) and (fl == fl) and abs(el) < 1e30 and abs(fl) < 1e30
+    ca_used = bool(getattr(trainer, "_ca_checked", False)) and not bool(getattr(trainer, "_ca_disabled", True))
+    moved = any(not torch.equal(a, b) for a, b in
+                zip(w0, [p for p in trainer.e3trans.parameters() if p.requires_grad]))
+    exp_frozen = 4 if route == "fusion" else 0
+    ok = finite and ca_used and moved and (len(frozen) == exp_frozen)
+    print(f"[ca-smoke] {label:30s} CA_used={ca_used} frozen_bias={len(frozen)}(exp {exp_frozen}) "
+          f"el={el:.4e} fl={fl:.4e} finite={finite} moved={moved} {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with tempfile.TemporaryDirectory() as ckpt_dir:
@@ -118,6 +142,10 @@ def main():
         ok &= run_cg_compare("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
         ok &= run_cg_compare("fusion energy+force+stress", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
         ok &= run_cg_compare("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
+        # --train-compiled-autograd must actually engage (not silently fall back to eager).
+        ok &= run_ca_check("fusion +compiled-autograd", "fusion", torch.float64, device, 48, ckpt_dir)
+        ok &= run_ca_check("fusion+stress +CA", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
+        ok &= run_ca_check("baseline +CA", "baseline", torch.float64, device, 48, ckpt_dir)
     print(f"[smoke] {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
