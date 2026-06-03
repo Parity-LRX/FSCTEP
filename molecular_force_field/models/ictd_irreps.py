@@ -38,6 +38,7 @@ from molecular_force_field.models.ictd_irreps_cuda import (
     ensure_grouped_tp_cuda_ext_supported,
     normalize_ictd_tp_backend,
 )
+from molecular_force_field.models import ictd_disk_cache
 
 # ---------------------------------------------------------------------------
 # torch.compile (Dynamo) integration helpers
@@ -1142,10 +1143,19 @@ def build_cg_tensor(l1: int, l2: int, l3: int) -> torch.Tensor:
     This is an SO(3)-equivariant intertwiner by construction.
     Uses vectorized matrix ops instead of Python loops for speed.
     """
-    L = l1 + l2
+    # Parity-forbidden / out-of-range paths are exact zeros and trivially cheap;
+    # compute inline rather than store them in the on-disk cache.
     if not (abs(l1 - l2) <= l3 <= l1 + l2) or ((l1 + l2 + l3) % 2 == 1):
         return torch.zeros(2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1, dtype=torch.float64)
+    # L2 on-disk cache (float64 canonical) sitting under the L1 lru_cache above.
+    return ictd_disk_cache.load_or_compute(
+        "cg", (int(l1), int(l2), int(l3)), lambda: _build_cg_tensor_compute(l1, l2, l3)
+    )
 
+
+def _build_cg_tensor_compute(l1: int, l2: int, l3: int) -> torch.Tensor:
+    """Exact float64 computation behind build_cg_tensor (see its docstring)."""
+    L = l1 + l2
     proj = build_harmonic_projectors(Lmax=L)
     P_L_l3 = proj.P[(L, l3)]  # (2l3+1, DL)
     B1 = _harmonic_basis_t(l1, dtype=torch.float64)  # (D1, 2l1+1)
@@ -1218,7 +1228,31 @@ def build_full_cg_tensor_so3(l1: int, l2: int, l3: int) -> torch.Tensor:
     l3 = int(l3)
     if not (abs(l1 - l2) <= l3 <= l1 + l2):
         return torch.zeros(2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1, dtype=torch.float64)
+    return ictd_disk_cache.load_or_compute(
+        "cg_full", (l1, l2, l3), lambda: _build_full_cg_tensor_so3_compute(l1, l2, l3)
+    )
 
+
+def _robust_svd_vh(A: torch.Tensor) -> torch.Tensor:
+    """Vh of SVD(A), robust to LAPACK gesdd non-convergence.
+
+    torch's default gesdd driver can raise "failed to converge ... ill-conditioned"
+    on these equivariance-constraint matrices for larger l (observed on macOS
+    Accelerate); fall back to numpy (LAPACK gesvd) -- slower but reliably convergent.
+    Pure float64; the caller sign-fixes the null vector, so the result is canonical
+    regardless of which backend produced it.
+    """
+    try:
+        _, _, vh = torch.linalg.svd(A)
+        return vh
+    except Exception:
+        import numpy as _np
+        _, _, vh_np = _np.linalg.svd(A.detach().cpu().double().numpy(), full_matrices=True)
+        return torch.from_numpy(vh_np).to(A)
+
+
+def _build_full_cg_tensor_so3_compute(l1: int, l2: int, l3: int) -> torch.Tensor:
+    """Exact float64 computation behind build_full_cg_tensor_so3 (see its docstring)."""
     d1, d2, d3 = 2 * l1 + 1, 2 * l2 + 1, 2 * l3 + 1
     n_unknown = d3 * d1 * d2
     equations: List[torch.Tensor] = []
@@ -1240,7 +1274,7 @@ def build_full_cg_tensor_so3(l1: int, l2: int, l3: int) -> torch.Tensor:
         equations.append(A)
 
     A = torch.cat(equations, dim=0)
-    _, _, vh = torch.linalg.svd(A)
+    vh = _robust_svd_vh(A)
     Cmat = vh[-1].reshape(d3, d1 * d2)
     C = Cmat.T.reshape(d1, d2, d3).contiguous()
     max_idx = int(C.abs().argmax().item())
@@ -1326,14 +1360,25 @@ def _ictd_u_matrix_so3_cached(
     output_l: int,
     correlation: int,
     irrep_normalization: str,
-    dtype_name: str,
 ) -> torch.Tensor:
-    if dtype_name == "float32":
-        dtype = torch.float32
-    elif dtype_name == "float64":
-        dtype = torch.float64
-    else:
-        raise ValueError(f"Unsupported cached dtype_name={dtype_name!r}")
+    """Float64 canonical U matrix: L1 lru_cache over the L2 on-disk cache."""
+    return ictd_disk_cache.load_or_compute(
+        "u_so3",
+        (int(lmax), int(output_l), int(correlation), str(irrep_normalization)),
+        lambda: _ictd_u_matrix_so3_compute(
+            int(lmax), int(output_l), int(correlation), str(irrep_normalization)
+        ),
+    )
+
+
+def _ictd_u_matrix_so3_compute(
+    lmax: int,
+    output_l: int,
+    correlation: int,
+    irrep_normalization: str,
+) -> torch.Tensor:
+    """Exact float64 build of the MACE-style symmetric-contraction U from ICTD CG."""
+    dtype = torch.float64
     basis = _ictd_so3_coupled_basis(
         lmax=int(lmax),
         correlation=int(correlation),
@@ -1364,19 +1409,21 @@ def ictd_u_matrix_so3(
     irrep_normalization: str = "component",
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """MACE-style symmetric-contraction U matrix generated purely from ICTD CG tensors."""
+    """MACE-style symmetric-contraction U matrix generated purely from ICTD CG tensors.
+
+    Built and cached in float64 (the canonical high-precision value); the requested
+    dtype is produced by a final cast. float64 -> bit-identical to the previous
+    behaviour; float32 -> a downcast of the float64 build (>= as accurate as the old
+    native-float32 path).
+    """
     dtype = torch.get_default_dtype() if dtype is None else dtype
-    if dtype == torch.float64:
-        dtype_name = "float64"
-    else:
-        dtype_name = "float32"
-    return _ictd_u_matrix_so3_cached(
+    u64 = _ictd_u_matrix_so3_cached(
         int(lmax),
         int(output_l),
         int(correlation),
         str(irrep_normalization),
-        dtype_name,
-    ).to(dtype=dtype)
+    )
+    return u64.to(dtype=dtype)
 
 
 class HarmonicElementwiseProduct(nn.Module):
