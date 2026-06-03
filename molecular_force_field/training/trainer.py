@@ -648,8 +648,27 @@ class Trainer:
             total_loss.backward()
             return
         if self._ca_checked:
-            with self._compiled_autograd_ctx():
-                total_loss.backward()
+            try:
+                with self._compiled_autograd_ctx():
+                    total_loss.backward()
+            except Exception as e:
+                # The step-1 probe proved CA on the first batch's shape, but a LATER batch
+                # whose atom/edge count differs triggers a dynamic-shape recompile, and that
+                # recompile can still hit a torch compiled_autograd limitation -- e.g.
+                # CopySlices base.sizes() -> !has_symbolic_sizes_strides_ INTERNAL ASSERT.
+                # This affects ANY loss once shapes vary (mae and smooth-l1 alike), not just
+                # MAE. Without this guard it crashes training. Disable CA, drop this batch's
+                # partial grads (skip it), and use eager backward for the rest of training.
+                self._ca_disabled = True
+                self.optimizer.zero_grad(set_to_none=True)
+                if not self._compiled_autograd_warned:
+                    self._compiled_autograd_warned = True
+                    logging.warning(
+                        "train_compiled_autograd failed on a later step (a varying-shape recompile hit "
+                        "a torch compiled_autograd limitation, e.g. CopySlices under symbolic shapes); "
+                        "disabling compiled-autograd and using eager backward for the rest of training. "
+                        f"This one batch is skipped. Error: {e}"
+                    )
             return
         # First step: probe. Retain the graph so we can fall back to eager.
         try:
