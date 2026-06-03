@@ -2470,10 +2470,16 @@ class EdgeWeightedPathPreservingTensorProduct(EdgeWeightedPathTensorProduct):
                     f"(..., {self.num_paths}, {self.channels}), got {tuple(gates.shape)}"
                 )
 
-        out: Dict[int, torch.Tensor] = {}
-        for l in range(self.lmax + 1):
-            out_channels_l = self.channels * int(self.path_counts_by_l.get(l, 0))
-            out[l] = torch.zeros(*batch_shape, out_channels_l, 2 * l + 1, device=device, dtype=dtype)
+        # Out-of-place assembly: collect each path's contribution and the channel indices
+        # it occupies, then index_add them into a fresh zero tensor per l. This replaces
+        # the in-place slice write `out[l3][..., c0:c1, :] = out[l3][..., c0:c1, :] + seg`,
+        # whose CopySlices autograd node makes torch compiled_autograd assert under
+        # dynamic/varying batch shapes (CopySlices base.sizes() -> !has_symbolic_sizes_strides_).
+        # Each path occupies a distinct channel block (path-preserving), so index_add into a
+        # zero tensor is pure placement (0 + seg, no float re-ordering) -- bit-identical to
+        # the previous accumulation, and it handles skipped (missing-input) paths as zeros.
+        seg_by_l: Dict[int, List[torch.Tensor]] = {l: [] for l in range(self.lmax + 1)}
+        idx_by_l: Dict[int, List[torch.Tensor]] = {l: [] for l in range(self.lmax + 1)}
 
         proj_list = self._get_proj_group_list(device=device, dtype=dtype)
         w = self.weight.to(device=device, dtype=compute_dtype)
@@ -2507,8 +2513,16 @@ class EdgeWeightedPathPreservingTensorProduct(EdgeWeightedPathTensorProduct):
                     seg = seg * gates[..., p_idx, :].unsqueeze(-1)
                 seg = seg.to(dtype=dtype) if seg.dtype != dtype else seg
                 c0 = int(self.path_offset[p_idx]) * self.channels
-                c1 = c0 + self.channels
-                out[l3][..., c0:c1, :] = out[l3][..., c0:c1, :] + seg
+                seg_by_l[l3].append(seg)
+                idx_by_l[l3].append(torch.arange(c0, c0 + self.channels, device=device))
+
+        out: Dict[int, torch.Tensor] = {}
+        for l in range(self.lmax + 1):
+            out_channels_l = self.channels * int(self.path_counts_by_l.get(l, 0))
+            base = torch.zeros(*batch_shape, out_channels_l, 2 * l + 1, device=device, dtype=dtype)
+            if seg_by_l[l]:
+                base = base.index_add(-2, torch.cat(idx_by_l[l]), torch.cat(seg_by_l[l], dim=-2))
+            out[l] = base
 
         return out
 
