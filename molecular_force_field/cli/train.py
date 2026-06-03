@@ -529,8 +529,9 @@ def main():
     parser.add_argument('--force-weight', '-b', type=float, default=10.0,
                         help='Initial weight for force loss (default: 10.0)')
     parser.add_argument('--loss-function', type=str, default='smooth-l1',
-                        choices=['smooth-l1', 'weighted-mse'],
-                        help='Regression loss for energy/force/stress terms (default: smooth-l1)')
+                        choices=['smooth-l1', 'weighted-mse', 'mae'],
+                        help='Regression loss for energy/force/stress terms (default: smooth-l1). '
+                             '"mae" = mean absolute error (L1), applied to energy, force, and stress.')
     parser.add_argument('--update-param', type=int, default=1000,
                         help='Interval (in batches) to update loss weights a and b (default: 1000). Use 0 to disable dynamic weight updates.')
     parser.add_argument('--weight-a-growth', type=float, default=1.05,

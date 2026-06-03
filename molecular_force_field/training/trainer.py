@@ -32,6 +32,7 @@ from molecular_force_field.utils.fidelity import (
     flatten_per_fidelity_metrics,
     get_graph_fidelity_weights,
     init_per_fidelity_metric_sums,
+    mae_loss_stats,
     smooth_l1_loss_stats,
     update_per_fidelity_metric_sums,
 )
@@ -235,9 +236,9 @@ class Trainer:
         self.bec_derivative_weight = float(bec_derivative_weight)
         self.bec_consistency_weight = float(bec_consistency_weight)
         self.loss_function = str(loss_function).lower()
-        if self.loss_function not in {"smooth-l1", "weighted-mse"}:
+        if self.loss_function not in {"smooth-l1", "weighted-mse", "mae"}:
             raise ValueError(
-                f"Unsupported loss_function={loss_function!r}; expected 'smooth-l1' or 'weighted-mse'"
+                f"Unsupported loss_function={loss_function!r}; expected 'smooth-l1', 'weighted-mse', or 'mae'"
             )
 
         # Validation-only compile settings
@@ -574,6 +575,8 @@ class Trainer:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.loss_function == "weighted-mse":
             return weighted_mse_loss_stats(pred, target, weights=weights)
+        if self.loss_function == "mae":
+            return mae_loss_stats(pred, target, weights=weights)
         return smooth_l1_loss_stats(pred, target, beta=0.5, weights=weights)
 
     def _cudagraph_step_begin_if_available(self):
@@ -1453,6 +1456,7 @@ class Trainer:
 
         with torch.no_grad():
             force_rmse = torch.sqrt(self.criterion_2(f_pred.view(-1), force_ref_scaled.view(-1)))
+            force_mae = F.l1_loss(f_pred.view(-1), force_ref_scaled.view(-1))
 
         # Stress loss
         if compute_stress:
@@ -1466,9 +1470,11 @@ class Trainer:
                 )
             with torch.no_grad():
                 stress_rmse = torch.sqrt(self.criterion_2(stress_pred.view(-1), stress_ref.view(-1)))
+                stress_mae = F.l1_loss(stress_pred.view(-1), stress_ref.view(-1))
         else:
             stress_loss = torch.tensor(0.0, device=self.device)
             stress_rmse = torch.tensor(0.0, device=self.device)
+            stress_mae = torch.tensor(0.0, device=self.device)
 
         # Energy loss
         num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
@@ -1486,6 +1492,8 @@ class Trainer:
         with torch.no_grad():
             energy_rmse = torch.sqrt(self.criterion_2(E_mean, target_energies))
             energy_rmse_avg = torch.sqrt(self.criterion_2(E_avg_pred, target_energy_avg))
+            energy_mae = F.l1_loss(E_mean, target_energies)
+            energy_mae_avg = F.l1_loss(E_avg_pred, target_energy_avg)
 
         # Total loss
         total_loss = self.a * energy_loss + self.b * force_loss + self.c * stress_loss
@@ -1511,6 +1519,10 @@ class Trainer:
             "energy_rmse_avg": energy_rmse_avg,
             "force_rmse": force_rmse,
             "stress_rmse": stress_rmse,
+            "energy_mae": energy_mae,
+            "energy_mae_avg": energy_mae_avg,
+            "force_mae": force_mae,
+            "stress_mae": stress_mae,
             "E_mean": E_mean,
             "f_pred": f_pred,
             "E_avg_pred": E_avg_pred,
@@ -1536,6 +1548,10 @@ class Trainer:
             "force_rmse": torch.tensor(0.0, device=self.device),
             "stress_loss": torch.tensor(0.0, device=self.device),
             "stress_rmse": torch.tensor(0.0, device=self.device),
+            "energy_mae": torch.tensor(0.0, device=self.device),
+            "energy_mae_avg": torch.tensor(0.0, device=self.device),
+            "force_mae": torch.tensor(0.0, device=self.device),
+            "stress_mae": torch.tensor(0.0, device=self.device),
             "phys_loss": torch.tensor(0.0, device=self.device),
             "delta_reg_loss": torch.tensor(0.0, device=self.device),
         }
@@ -1746,6 +1762,10 @@ class Trainer:
             'force_rmse': float((metric_sums['force_rmse'] / denom).detach().cpu()),
             'stress_loss': float((metric_sums['stress_loss'] / denom).detach().cpu()),
             'stress_rmse': float((metric_sums['stress_rmse'] / denom).detach().cpu()),
+            'energy_mae': float((metric_sums['energy_mae'] / denom).detach().cpu()),
+            'energy_mae_avg': float((metric_sums['energy_mae_avg'] / denom).detach().cpu()),
+            'force_mae': float((metric_sums['force_mae'] / denom).detach().cpu()),
+            'stress_mae': float((metric_sums['stress_mae'] / denom).detach().cpu()),
             'phys_loss': float((metric_sums['phys_loss'] / denom).detach().cpu()),
             'delta_reg_loss': float((metric_sums['delta_reg_loss'] / denom).detach().cpu()),
             'epoch_time': epoch_time,
@@ -1771,6 +1791,10 @@ class Trainer:
         energy_rmse_avg = out["energy_rmse_avg"]
         force_rmse = out["force_rmse"]
         stress_rmse = out["stress_rmse"]
+        energy_mae = out["energy_mae"]
+        energy_mae_avg = out["energy_mae_avg"]
+        force_mae = out["force_mae"]
+        stress_mae = out["stress_mae"]
         E_mean = out["E_mean"]
         f_pred = out["f_pred"]
 
@@ -1828,6 +1852,10 @@ class Trainer:
         metric_sums["force_rmse"] = metric_sums["force_rmse"] + force_rmse.detach()
         metric_sums["stress_loss"] = metric_sums["stress_loss"] + stress_loss.detach()
         metric_sums["stress_rmse"] = metric_sums["stress_rmse"] + stress_rmse.detach()
+        metric_sums["energy_mae"] = metric_sums["energy_mae"] + energy_mae.detach()
+        metric_sums["energy_mae_avg"] = metric_sums["energy_mae_avg"] + energy_mae_avg.detach()
+        metric_sums["force_mae"] = metric_sums["force_mae"] + force_mae.detach()
+        metric_sums["stress_mae"] = metric_sums["stress_mae"] + stress_mae.detach()
         metric_sums["phys_loss"] = metric_sums["phys_loss"] + phys_loss.detach()
         metric_sums["delta_reg_loss"] = metric_sums["delta_reg_loss"] + delta_reg_loss.detach()
 
@@ -1878,13 +1906,13 @@ class Trainer:
                     'train_stress_loss': float(stress_loss.detach().cpu()),
                     'train_phys_loss': float(phys_loss.detach().cpu()),
                     'train_energy_rmse': float(energy_rmse.detach().cpu()),
-                    'train_energy_mae': 0.0,
+                    'train_energy_mae': float(energy_mae.detach().cpu()),
                     'train_energy_rmse_avg': float(energy_rmse_avg.detach().cpu()),
-                    'train_energy_mae_avg': 0.0,
+                    'train_energy_mae_avg': float(energy_mae_avg.detach().cpu()),
                     'train_force_rmse': float(force_rmse.detach().cpu()),
-                    'train_force_mae': 0.0,
+                    'train_force_mae': float(force_mae.detach().cpu()),
                     'train_stress_rmse': float(stress_rmse.detach().cpu()),
-                    'train_stress_mae': 0.0,
+                    'train_stress_mae': float(stress_mae.detach().cpu()),
                 }
             self.validate(epoch, full_train_metrics)
 
@@ -1987,7 +2015,8 @@ class Trainer:
 
         out_keys = ("total_loss", "energy_loss", "force_loss", "stress_loss",
                     "phys_loss", "delta_reg_loss", "energy_rmse", "energy_rmse_avg",
-                    "force_rmse", "stress_rmse", "E_mean", "f_pred")
+                    "force_rmse", "stress_rmse", "energy_mae", "energy_mae_avg",
+                    "force_mae", "stress_mae", "E_mean", "f_pred")
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             out = _step()
@@ -2036,6 +2065,7 @@ class Trainer:
         metric_sums = {k: torch.tensor(0.0, device=self.device) for k in (
             "total_loss", "energy_loss", "energy_rmse", "energy_rmse_avg",
             "force_loss", "force_rmse", "stress_loss", "stress_rmse",
+            "energy_mae", "energy_mae_avg", "force_mae", "stress_mae",
             "phys_loss", "delta_reg_loss",
         )}
         num_effective_batches = 0
@@ -2163,6 +2193,10 @@ class Trainer:
             'force_rmse': float((metric_sums['force_rmse'] / denom).detach().cpu()),
             'stress_loss': float((metric_sums['stress_loss'] / denom).detach().cpu()),
             'stress_rmse': float((metric_sums['stress_rmse'] / denom).detach().cpu()),
+            'energy_mae': float((metric_sums['energy_mae'] / denom).detach().cpu()),
+            'energy_mae_avg': float((metric_sums['energy_mae_avg'] / denom).detach().cpu()),
+            'force_mae': float((metric_sums['force_mae'] / denom).detach().cpu()),
+            'stress_mae': float((metric_sums['stress_mae'] / denom).detach().cpu()),
             'phys_loss': float((metric_sums['phys_loss'] / denom).detach().cpu()),
             'delta_reg_loss': float((metric_sums['delta_reg_loss'] / denom).detach().cpu()),
             'epoch_time': epoch_time,
@@ -3213,7 +3247,9 @@ class Trainer:
                     f"Avg Energy Loss: {metrics['energy_loss']:.6f} | "
                     f"Avg Force Loss: {metrics['force_loss']:.6f}{phys_log} | "
                     f"Energy RMSE: {metrics['energy_rmse']:.6f} | "
+                    f"Energy MAE: {metrics.get('energy_mae', 0):.6f} | "
                     f"Force RMSE: {metrics['force_rmse']:.6f} | "
+                    f"Force MAE: {metrics.get('force_mae', 0):.6f} | "
                     f"Epoch Time: {metrics['epoch_time']:.1f}s | "
                     f"Avg Batch Time: {metrics['avg_batch_time']:.3f}s"
                 )

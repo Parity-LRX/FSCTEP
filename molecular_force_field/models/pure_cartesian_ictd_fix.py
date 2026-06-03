@@ -31,6 +31,7 @@ from molecular_force_field.models.pure_cartesian_ictd_layers import (
 from molecular_force_field.models._mace_symmetric_contraction import MaceSymmetricContraction
 from molecular_force_field.models.mlp import MainNet
 from molecular_force_field.utils.scatter import scatter
+from molecular_force_field.models.long_range import build_long_range_module
 
 
 _CONTRACTION_BATCH_EXAMPLE = 10
@@ -1705,8 +1706,8 @@ class PureCartesianICTDFix(nn.Module):
                 "ictd_fix_fusion_head_weight_mode must be 'softmax' or 'free', "
                 f"got {ictd_fix_fusion_head_weight_mode!r}"
             )
-        if long_range_mode != "none" or feature_spectral_mode != "none":
-            raise NotImplementedError("pure-cartesian-ictd-fix currently supports only long_range_mode=none and feature_spectral_mode=none")
+        if feature_spectral_mode != "none":
+            raise NotImplementedError("pure-cartesian-ictd-fix currently supports only feature_spectral_mode=none (long_range is wired)")
 
         self.channels = int(hidden_dim_conv)
         self.lmax = int(lmax)
@@ -2043,6 +2044,50 @@ class PureCartesianICTDFix(nn.Module):
             self.gmix_energy_readout = None
             self.gmix_readout_head_scale = None
 
+        # --- long-range interaction module (None when mode=="none"; no-op when off,
+        # so the flagship's numerics + checkpoints are unchanged with long_range off).
+        # Fed the final per-atom SCALAR descriptor (scalar_last for fusion /
+        # layer_states[-1] for baseline, both invariant -> equivariance-safe);
+        # energy_scale inits to 0 -> zero contribution at init.
+        self.long_range_mode = str(long_range_mode)
+        self.long_range_module = build_long_range_module(
+            mode=self.long_range_mode,
+            feature_dim=self.channels,
+            hidden_dim=long_range_hidden_dim,
+            boundary=long_range_boundary,
+            neutralize=long_range_neutralize,
+            filter_hidden_dim=long_range_filter_hidden_dim,
+            kmax=long_range_kmax,
+            mesh_size=long_range_mesh_size,
+            slab_padding_factor=long_range_slab_padding_factor,
+            include_k0=long_range_include_k0,
+            source_channels=long_range_source_channels,
+            backend=long_range_backend,
+            reciprocal_backend=long_range_reciprocal_backend,
+            energy_partition=long_range_energy_partition,
+            green_mode=long_range_green_mode,
+            assignment=long_range_assignment,
+            mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+            theta=long_range_theta,
+            leaf_size=long_range_leaf_size,
+            multipole_order=long_range_multipole_order,
+            far_source_dim=long_range_far_source_dim,
+            far_num_shells=long_range_far_num_shells,
+            far_shell_growth=long_range_far_shell_growth,
+            far_tail=long_range_far_tail,
+            far_tail_bins=long_range_far_tail_bins,
+            far_stats=long_range_far_stats,
+            far_max_radius_multiplier=long_range_far_max_radius_multiplier,
+            far_source_norm=long_range_far_source_norm,
+            far_gate_init=long_range_far_gate_init,
+            cutoff_radius=self.max_radius,
+        )
+        self.long_range_exports_reciprocal_source = (
+            bool(getattr(self.long_range_module, "exports_reciprocal_source", False))
+            if self.long_range_module is not None
+            else False
+        )
+
     def _readout_head_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
         if self.readout_head_scales is None:
             # new_zeros(()) is a device memset (no host->device copy) so this stays
@@ -2230,10 +2275,36 @@ class PureCartesianICTDFix(nn.Module):
             combined_features = torch.cat([combined_features, g_mix], dim=-1)
 
         out = total_energy.sum(dim=-1, keepdim=True)
+
+        # --- long-range additive term (skipped entirely when module is None) ---
+        reciprocal_source = None
+        if self.long_range_module is not None:
+            # final per-atom INVARIANT descriptor [N, channels] (in scope for both routes):
+            # baseline last layer_state is already scalar; fusion last_preproduct is full-SO3 -> take l=0.
+            last_state = layer_states[-1]
+            if last_state.shape[-1] == self.channels:
+                lr_feat = last_state
+            else:
+                lr_feat = _split_irreps(last_state, self.channels, self.lmax)[0].reshape(last_state.shape[0], self.channels)
+            defer = False
+            if return_reciprocal_source and self.long_range_exports_reciprocal_source:
+                long_range_energy, reciprocal_source = self.long_range_module(
+                    lr_feat, pos, batch, cell, edge_src=edge_src, edge_dst=edge_dst, return_source=True
+                )
+                defer = reciprocal_source.numel() > 0
+            else:
+                long_range_energy = self.long_range_module(
+                    lr_feat, pos, batch, cell, edge_src=edge_src, edge_dst=edge_dst
+                )
+            if long_range_energy is not None and not defer:
+                out = out + long_range_energy
+
         if return_combined_features:
             if return_reciprocal_source:
-                return out, combined_features, out.new_empty((out.size(0), 0))
+                rs = reciprocal_source if reciprocal_source is not None else out.new_empty((out.size(0), 0))
+                return out, combined_features, rs
             return out, combined_features
         if return_reciprocal_source:
-            return out, out.new_empty((out.size(0), 0))
+            rs = reciprocal_source if reciprocal_source is not None else out.new_empty((out.size(0), 0))
+            return out, rs
         return out

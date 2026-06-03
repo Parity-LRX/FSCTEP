@@ -59,6 +59,7 @@ def build_model(
     dtype: torch.dtype,
     device: torch.device,
     correlation: int = 2,
+    **extra,
 ) -> PureCartesianICTDFix:
     cfg = ModelConfig(dtype=dtype)
     cfg.channel_in = channels
@@ -90,6 +91,7 @@ def build_model(
         avg_num_neighbors=float(24),
         internal_compute_dtype=dtype,
         device=device,
+        **extra,
     ).to(device=device, dtype=dtype)
     return model
 
