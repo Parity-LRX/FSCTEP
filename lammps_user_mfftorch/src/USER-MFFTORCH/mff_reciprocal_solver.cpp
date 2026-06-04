@@ -989,16 +989,20 @@ ReciprocalOutputs MFFReciprocalSolver::compute_replicated_atoms(
   auto filtered_mesh_complex = torch::fft::ifftn(mesh_fft * spectral_weights.unsqueeze(-1), {}, {0, 1, 2});
   auto filtered_mesh = torch::view_as_real(filtered_mesh_complex).select(-1, 0);
   auto gathered = gather_from_mesh_full(frac, filtered_mesh, inputs.pbc);
-  auto energy = 0.5 * (global_source * gathered).sum() /
-                (geom.volume * static_cast<double>(mesh_size_ * mesh_size_ * mesh_size_));
+  // Reciprocal normalization: the filtered field already carries ifftn's implicit 1/N
+  // (N = mesh^3); the physical potential is (1/V) * sum_k S(k)(4pi/k^2) e^{ikr} = (N/V) * field,
+  // so E = 0.5 * q . field * (mesh^3 / V). Previously this divided by (V * mesh^3), i.e. mesh^6
+  // too small -- the C++ counterpart of the Python apply_green_kernel 1/mesh^3 bug. Matches the
+  // fixed Python so exported reciprocal_source charges reproduce the training energy.
+  const double recip_scale = static_cast<double>(mesh_size_ * mesh_size_ * mesh_size_) / geom.volume;
+  auto energy = 0.5 * (global_source * gathered).sum() * recip_scale;
   auto grads = torch::autograd::grad({energy}, {global_pos}, {}, false, false, false);
   auto global_forces = -grads[0].detach();
 
   out.forces_local = global_forces.narrow(0, displs[world_rank], local_n).clone();
   auto gathered_local = gathered.narrow(0, displs[world_rank], local_n).clone();
   out.atom_energy_local =
-      (0.5 * (local_source * gathered_local).sum(-1)) /
-      static_cast<double>(geom.volume * mesh_size_ * mesh_size_ * mesh_size_);
+      0.5 * (local_source * gathered_local).sum(-1) * recip_scale;
   if (!inputs.need_energy) {
     out.atom_energy_local = torch::zeros({local_n}, options);
     return out;
@@ -1060,7 +1064,9 @@ ReciprocalOutputs MFFReciprocalSolver::compute_mesh_backend(
   auto local_gy = local_fields.narrow(1, 2 * channels, channels);
   auto local_gz = local_fields.narrow(1, 3 * channels, channels);
 
-  const double norm = geom.volume * static_cast<double>(mesh_size_ * mesh_size_ * mesh_size_);
+  // Field carries ifftn's implicit 1/N (N = mesh^3); physical potential is (N/V) * field, so the
+  // divisor must be V/mesh^3 (was V*mesh^3 = mesh^6 too small). Matches the fixed Python.
+  const double norm = geom.volume / static_cast<double>(mesh_size_ * mesh_size_ * mesh_size_);
   auto force_x = -(local_source * local_gx).sum(-1) / norm;
   auto force_y = -(local_source * local_gy).sum(-1) / norm;
   auto force_z = -(local_source * local_gz).sum(-1) / norm;

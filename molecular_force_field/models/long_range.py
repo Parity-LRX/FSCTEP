@@ -1723,6 +1723,12 @@ class MeshLongRangeKernel3D(nn.Module):
         mesh_complex = torch.fft.fftn(mesh, dim=(0, 1, 2))
         spectral_weights, alpha, volume, real_cutoff = self._build_reciprocal_spectral_weights(cell, dtype=mesh_dtype)
         filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1), dim=(0, 1, 2))
+        # Compensate torch.fft.ifftn's 1/N normalization (N = mesh_size**3). The forward FFT of
+        # the spread charges already yields the structure factor S(k), so the iFFT's 1/N factor
+        # is spurious here -- without it the reciprocal potential/energy comes out mesh_size**3
+        # too small (verified exactly: E_mesh * mesh_size**3 == the analytic bare reciprocal sum,
+        # and full_ewald reproduces the NaCl Madelung constant to ~0.1% only with this factor).
+        filtered = filtered * (float(self.mesh_size) ** 3)
         return filtered.real, alpha, volume, real_cutoff
 
     def _compute_real_space_potential(
