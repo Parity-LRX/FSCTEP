@@ -488,6 +488,7 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
           content, "\"reciprocal_source_slab_padding_factor\"", reciprocal_source_slab_padding_factor_);
       (void)parse_string_from_metadata(content, "\"long_range_green_mode\"", long_range_green_mode_);
       (void)parse_string_from_metadata(content, "\"long_range_runtime_backend\"", long_range_runtime_backend_);
+      (void)parse_int64_from_metadata(content, "\"long_range_mesh_size\"", long_range_mesh_size_);
       (void)parse_string_from_metadata(content, "\"tensor_product_mode\"", tensor_product_mode_);
       (void)parse_string_from_metadata(content, "\"long_range_source_kind\"", long_range_source_kind_);
       (void)parse_int64_from_metadata(content, "\"long_range_source_channels\"", long_range_source_channels_);

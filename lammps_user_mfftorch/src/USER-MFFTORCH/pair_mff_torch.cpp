@@ -299,6 +299,10 @@ void PairMFFTorch::init_style() {
     engine_->load_core(core_pt_path_, device_str_);
     if (reciprocal_solver_) {
       auto cfg = reciprocal_solver_->config();
+      // Use the exported (training) mesh size so the deployed reciprocal grid matches training.
+      // Previously the engine never read long_range_mesh_size from the export, so the solver was
+      // stuck at its default/env mesh (16) regardless of the trained grid.
+      cfg.mesh_size = static_cast<int>(engine_->long_range_mesh_size());
       cfg.slab_padding_factor = static_cast<int>(engine_->reciprocal_source_slab_padding_factor());
       cfg.green_mode = (engine_->long_range_green_mode() == "learned_poisson")
                            ? mfftorch::ReciprocalGreenMode::LearnedPoisson
