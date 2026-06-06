@@ -904,6 +904,59 @@ torch::Tensor MFFReciprocalSolver::build_local_spectral_weights(
   return cached_local_spectral_weights_cpu_.to(options.device(), options.dtype());
 }
 
+torch::Tensor MFFReciprocalSolver::multipole_reciprocal_energy(
+    const torch::Tensor& global_pos,
+    const torch::Tensor& packed_source,
+    const EffectiveGeometry& geom,
+    const std::array<int, 3>& pbc,
+    const torch::Device& device) const {
+  // |S(k)|^2 PME route, mirrors Python MeshLongRangeKernel3D.multipole_energy:
+  //   S(k) = q~ + i k.mu~ - 1/2 k.Q~.k ;  E = (1/2V) sum_{k!=0} green(k)/|W(k)|^2 |S(k)|^2.
+  // No iFFT (so free of the 1/N issue); packed source channel-last [q | dipole_xyz | quad_3x3].
+  const int C = source_channels_;
+  auto frac = torch::matmul(global_pos, geom.inv_cell);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (pbc[axis] == 1) {
+      auto frac_axis = frac.select(1, axis);
+      frac.select(1, axis).copy_(frac_axis - torch::floor(frac_axis));
+    }
+  }
+  // k_cart = 2*pi * m @ inv(cell)^T (transpose required for k.mu / k.Q.k equivariance).
+  auto cpu_opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  auto eff_cpu = geom.effective_cell.to(torch::kCPU, torch::kFloat32).contiguous();
+  auto freq = build_integer_frequencies(cpu_opt);
+  auto grids = torch::meshgrid({freq, freq, freq}, "ij");
+  auto integer_k = torch::stack({grids[0], grids[1], grids[2]}, -1).reshape({-1, 3});
+  auto inv_cell_cpu = torch::linalg_inv(eff_cpu);
+  auto k_cart = (2.0 * M_PI * torch::matmul(integer_k, inv_cell_cpu.transpose(0, 1))).to(device);
+  auto k_norm = torch::linalg_vector_norm(k_cart, 2, -1);
+  // CIC assignment window (stencil exponent 2): W = prod_axes sinc(m/mesh)^2, deconvolve by 1/W^2.
+  auto w1d = torch::sinc(freq / static_cast<double>(mesh_size_)).pow(2).to(device);
+  auto window = (w1d.view({mesh_size_, 1, 1}) * w1d.view({1, mesh_size_, 1}) *
+                 w1d.view({1, 1, mesh_size_})).reshape({-1});
+  auto wdeconv = torch::reciprocal(window.clamp_min(1.0e-6).square());
+  auto safe = k_norm.clamp_min(k_norm_floor_);
+  auto spectral = (4.0 * M_PI) / (safe * safe) / geom.volume * wdeconv;
+  spectral = torch::where(k_norm > k_norm_floor_, spectral, torch::zeros_like(spectral));
+  auto q = packed_source.narrow(1, 0, C);
+  auto S = torch::fft::fftn(spread_to_mesh_full(frac, q, pbc), {}, {0, 1, 2}).reshape({-1, C});
+  int off = C;
+  if (max_multipole_l_ >= 1) {
+    auto mu = packed_source.narrow(1, off, 3 * C);
+    auto mut = torch::fft::fftn(spread_to_mesh_full(frac, mu, pbc), {}, {0, 1, 2}).reshape({-1, C, 3});
+    auto kmu = torch::einsum("kx,kcx->kc", {k_cart.to(mut.dtype()), mut});
+    S = S + kmu.mul(c10::complex<double>(0.0, 1.0));  // + i k.mu
+    off += 3 * C;
+  }
+  if (max_multipole_l_ >= 2) {
+    auto qf = packed_source.narrow(1, off, 9 * C);
+    auto qt = torch::fft::fftn(spread_to_mesh_full(frac, qf, pbc), {}, {0, 1, 2}).reshape({-1, C, 3, 3});
+    auto kc = k_cart.to(qt.dtype());
+    S = S - 0.5 * torch::einsum("kx,kcxy,ky->kc", {kc, qt, kc});  // - 1/2 k.Q.k
+  }
+  return 0.5 * (spectral.unsqueeze(-1) * S.abs().square()).sum();
+}
+
 ReciprocalOutputs MFFReciprocalSolver::compute_replicated_atoms(
     const ReciprocalInputs& inputs,
     const EffectiveGeometry& geom,
@@ -975,6 +1028,21 @@ ReciprocalOutputs MFFReciprocalSolver::compute_replicated_atoms(
           torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
           .clone()
           .to(device);
+  if (max_multipole_l_ > 0) {
+    // Latent multipole reciprocal (|S|^2 PME); packed source = [q | dipole_xyz | quad_3x3].
+    auto energy = multipole_reciprocal_energy(global_pos, global_source, geom, inputs.pbc, device);
+    auto grads = torch::autograd::grad({energy}, {global_pos}, {}, false, false, false);
+    auto global_forces = -grads[0].detach();
+    out.forces_local = global_forces.narrow(0, displs[world_rank], local_n).clone();
+    if (inputs.need_energy) {
+      const double total_energy = energy.detach().to(torch::kCPU).item<double>();
+      out.atom_energy_local = torch::full({local_n}, total_energy / static_cast<double>(global_n), options);
+      out.energy = (world_rank == 0) ? total_energy : 0.0;
+    } else {
+      out.atom_energy_local = torch::zeros({local_n}, options);
+    }
+    return out;
+  }
   auto inv_cell = geom.inv_cell;
   auto frac = torch::matmul(global_pos, inv_cell);
   for (int axis = 0; axis < 3; ++axis) {

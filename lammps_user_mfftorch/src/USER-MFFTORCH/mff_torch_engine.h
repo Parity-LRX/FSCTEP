@@ -57,6 +57,7 @@ class MFFTorchEngine {
   const std::string& long_range_green_mode() const { return long_range_green_mode_; }
   const std::string& long_range_runtime_backend() const { return long_range_runtime_backend_; }
   int64_t long_range_mesh_size() const { return long_range_mesh_size_; }
+  int64_t long_range_max_multipole_l() const { return long_range_max_multipole_l_; }
   const std::string& long_range_source_kind() const { return long_range_source_kind_; }
   int64_t long_range_source_channels() const { return long_range_source_channels_; }
   const std::string& long_range_source_layout() const { return long_range_source_layout_; }
@@ -125,6 +126,7 @@ class MFFTorchEngine {
   std::string long_range_green_mode_ = "poisson";
   std::string long_range_runtime_backend_ = "none";
   int64_t long_range_mesh_size_ = 16;
+  int64_t long_range_max_multipole_l_ = 0;
   std::string tensor_product_mode_;
   std::string long_range_source_kind_ = "none";
   int64_t long_range_source_channels_ = 0;

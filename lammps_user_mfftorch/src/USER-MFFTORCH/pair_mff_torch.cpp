@@ -303,6 +303,8 @@ void PairMFFTorch::init_style() {
       // Previously the engine never read long_range_mesh_size from the export, so the solver was
       // stuck at its default/env mesh (16) regardless of the trained grid.
       cfg.mesh_size = static_cast<int>(engine_->long_range_mesh_size());
+      cfg.max_multipole_l = static_cast<int>(engine_->long_range_max_multipole_l());
+      cfg.source_channels = static_cast<int>(engine_->reciprocal_source_channels());
       cfg.slab_padding_factor = static_cast<int>(engine_->reciprocal_source_slab_padding_factor());
       cfg.green_mode = (engine_->long_range_green_mode() == "learned_poisson")
                            ? mfftorch::ReciprocalGreenMode::LearnedPoisson

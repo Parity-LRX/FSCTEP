@@ -38,6 +38,8 @@ struct ReciprocalConfig {
   int slab_padding_factor = 2;
   ReciprocalBackend backend = ReciprocalBackend::Auto;
   ReciprocalGreenMode green_mode = ReciprocalGreenMode::Poisson;
+  int max_multipole_l = 0;   // 0=monopole; 1=+dipole; 2=+dipole+quadrupole (packed source)
+  int source_channels = 1;   // latent monopole channels C; packed width = C*(1 + 3[l>=1] + 9[l>=2])
 };
 
 struct ReciprocalInputs {
@@ -80,6 +82,8 @@ class MFFReciprocalSolver {
     neutralize_ = config_.neutralize;
     gpu_aware_mpi_ = config_.gpu_aware_mpi;
     k_norm_floor_ = config_.k_norm_floor;
+    max_multipole_l_ = config_.max_multipole_l;
+    source_channels_ = config_.source_channels;
   }
   const ReciprocalConfig& config() const { return config_; }
   int mesh_size() const { return mesh_size_; }
@@ -131,6 +135,8 @@ class MFFReciprocalSolver {
   bool neutralize_ = true;
   bool gpu_aware_mpi_ = false;
   double k_norm_floor_ = 1.0e-6;
+  int max_multipole_l_ = 0;
+  int source_channels_ = 1;
   mutable torch::Tensor cached_integer_freq_cpu_;
   mutable SpectralCacheKey spectral_cache_key_;
   mutable SparsePartitionCacheKey sparse_partition_cache_key_;
@@ -205,6 +211,12 @@ class MFFReciprocalSolver {
       const AxisPartition& y_part,
       int world_rank,
       torch::TensorOptions options) const;
+  torch::Tensor multipole_reciprocal_energy(
+      const torch::Tensor& global_pos,
+      const torch::Tensor& packed_source,
+      const EffectiveGeometry& geom,
+      const std::array<int, 3>& pbc,
+      const torch::Device& device) const;
   ReciprocalOutputs compute_replicated_atoms(
       const ReciprocalInputs& inputs,
       const EffectiveGeometry& geom,
