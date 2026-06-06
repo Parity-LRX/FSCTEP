@@ -137,6 +137,12 @@ const char* MFFReciprocalSolver::backend_name(ReciprocalBackend backend) {
 }
 
 ReciprocalBackend MFFReciprocalSolver::resolve_backend(int world_size) const {
+  // Latent multipoles (dipole/quadrupole) are only implemented on the replicated-atoms
+  // path (compute_replicated_atoms -> multipole_reciprocal_energy); the mesh/slab backends
+  // handle the monopole packed source only. Force replicated when multipoles are present so
+  // the packed [q|mu|Q] source is decoded correctly (single rank: equivalent to mesh;
+  // multi rank: replicates all atoms -- correct, scalable mesh multipole is a follow-up).
+  if (max_multipole_l_ > 0) return ReciprocalBackend::ReplicatedAtoms;
   if (config_.backend != ReciprocalBackend::Auto) return config_.backend;
   if (world_size > 1) return ReciprocalBackend::DistributedSlabFFT;
   return ReciprocalBackend::MeshReduce;
@@ -247,6 +253,12 @@ torch::Tensor MFFReciprocalSolver::neutralize_local_source(
                   .clone()
                   .to(device, torch::kFloat32) /
               global_n;
+  if (max_multipole_l_ > 0 && source_channels_ < static_cast<int>(source.size(1))) {
+    // Latent multipoles: net-neutralize only the leading monopole (q) columns; the
+    // dipole/quadrupole columns of the packed source must pass through untouched
+    // (Python neutralizes q only, leaving mu/Q raw before the |S(k)|^2 PME route).
+    mean.narrow(0, source_channels_, source.size(1) - source_channels_).zero_();
+  }
   return source - mean.unsqueeze(0);
 }
 
