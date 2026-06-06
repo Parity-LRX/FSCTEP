@@ -264,7 +264,10 @@ class FeatureSpectralFilterGrid(nn.Module):
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         effective_cell = self._effective_cell(cell, dtype=dtype)
         inv_cell = torch.linalg.inv(effective_cell)
-        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell)
+        # k = 2*pi * m @ inv(cell)^T (transpose required for O(3) equivariance on non-orthogonal
+        # cells; without it |k| -- hence the radial filter -- is not rotation-invariant). No-op for
+        # orthogonal cells. Matches the long-range build_k_norms / _build_k_cart_flat convention.
+        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell.transpose(-1, -2))
         return torch.linalg.vector_norm(k_cart, dim=-1).reshape(self.mesh_size, self.mesh_size, self.mesh_size)
 
     def forward(self, mesh: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
