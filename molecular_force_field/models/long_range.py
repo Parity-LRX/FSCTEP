@@ -1653,7 +1653,11 @@ class MeshLongRangeKernel3D(nn.Module):
         kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         inv_cell = torch.linalg.inv(effective_cell)
-        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell)
+        # Physical reciprocal vector for integer index m is k = 2*pi * m @ inv(cell)^T (so that
+        # k.r == 2*pi * m . frac). The transpose is required for O(3) equivariance on non-orthogonal
+        # cells -- without it |k| is not rotation-invariant (matches _build_k_cart_flat and the C++
+        # build_local_k_cart). On orthogonal cells inv(cell) is symmetric so this is a no-op.
+        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell.transpose(-1, -2))
         k_norms = torch.linalg.vector_norm(k_cart, dim=-1).reshape(self.mesh_size, self.mesh_size, self.mesh_size)
         volume = torch.abs(torch.linalg.det(effective_cell)).clamp_min(self.k_norm_floor)
         return k_norms, volume

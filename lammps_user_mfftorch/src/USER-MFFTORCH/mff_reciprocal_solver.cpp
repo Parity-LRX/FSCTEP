@@ -871,8 +871,11 @@ torch::Tensor MFFReciprocalSolver::build_local_k_cart(
     auto grids = torch::meshgrid({freq, freq_y, freq}, "ij");
     auto integer_k = torch::stack({grids[0], grids[1], grids[2]}, -1).reshape({-1, 3});
     auto inv_cell = torch::linalg_inv(effective_cell_cpu);
+    // k = 2*pi * m @ inv(cell)^T -- the transpose is required for O(3) equivariance on
+    // non-orthogonal cells (without it |k| is not rotation-invariant). Matches Python
+    // build_k_norms / _build_k_cart_flat and multipole_reciprocal_energy; no-op for orthogonal cells.
     cached_local_k_cart_cpu_ =
-        (2.0 * M_PI * torch::matmul(integer_k, inv_cell))
+        (2.0 * M_PI * torch::matmul(integer_k, inv_cell.transpose(0, 1)))
             .reshape({mesh_size_, y_part.counts[world_rank], mesh_size_, 3});
     cached_local_spectral_weights_cpu_ = torch::Tensor();
     spectral_cache_key_.effective_cell_values = flatten_cell_values(effective_cell_cpu);
