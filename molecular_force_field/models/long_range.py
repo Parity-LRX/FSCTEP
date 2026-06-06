@@ -1658,6 +1658,82 @@ class MeshLongRangeKernel3D(nn.Module):
         volume = torch.abs(torch.linalg.det(effective_cell)).clamp_min(self.k_norm_floor)
         return k_norms, volume
 
+    def _build_k_cart_flat(self, cell: torch.Tensor, *, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cartesian k-vectors (mesh^3, 3), their norms (mesh^3,), and the (effective) cell volume.
+
+        Same lattice/convention as build_k_norms, but keeps the k vectors (needed for the multipole
+        k.mu / k.Q.k terms)."""
+        effective_cell = _effective_cell_for_boundary(
+            cell, boundary=self.boundary, slab_padding_factor=self.slab_padding_factor, dtype=dtype
+        )
+        freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
+        kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+        integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
+        inv_cell = torch.linalg.inv(effective_cell)
+        # Physical reciprocal vector for integer index m is k = 2*pi * m @ inv(cell)^T, so that
+        # k.r == 2*pi * m . frac (frac = pos @ inv(cell)) -- matches the spread/FFT phase. Using
+        # inv(cell) (no transpose) only coincides for symmetric cells; a rotated cell breaks the
+        # k.mu / k.Q.k equivariance otherwise.
+        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell.transpose(-1, -2))
+        k_norms = torch.linalg.vector_norm(k_cart, dim=-1)
+        volume = torch.abs(torch.linalg.det(effective_cell)).clamp_min(self.k_norm_floor)
+        return k_cart, k_norms, volume
+
+    def multipole_energy(
+        self,
+        pos: torch.Tensor,
+        batch: torch.Tensor,
+        cell: torch.Tensor,
+        source: torch.Tensor,
+        dipole: torch.Tensor | None,
+        quadrupole: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Reciprocal energy from latent monopole(+dipole)(+quadrupole) via the |S(k)|^2 PME route.
+
+        S(k) = FFT(spread q) + i k . FFT(spread mu) - 1/2 k . FFT(spread Q) . k
+        E    = (1/2V) sum_{k!=0} [green(k) / |W(k)|^2] |S(k)|^2          (W = assignment window)
+
+        This route computes the energy directly in k-space (no iFFT), so it is free of the
+        iFFT 1/N normalization that the potential route needs compensated, and it reduces to the
+        plain reciprocal monopole sum when dipole/quadrupole are None. Per-graph, uniform partition.
+        """
+        atom_energy = source.new_zeros((source.size(0), 1))
+        for graph_idx in range(cell.size(0)):
+            node_index = torch.nonzero(batch == graph_idx, as_tuple=False).view(-1)
+            n_local = int(node_index.numel())
+            if n_local == 0:
+                continue
+            local_pos = pos.index_select(0, node_index)
+            local_source = source.index_select(0, node_index)
+            src_c = int(local_source.size(1))
+            frac = _prepare_frac_for_boundary(
+                local_pos, cell[graph_idx], boundary=self.boundary, slab_padding_factor=self.slab_padding_factor
+            )
+            k_cart, k_norms_flat, volume = self._build_k_cart_flat(cell[graph_idx], dtype=local_pos.dtype)
+            green = self.green_kernel(k_norms_flat)
+            window = self._build_assignment_window(device=local_pos.device, dtype=local_pos.dtype).reshape(-1)
+            wdeconv = torch.reciprocal(window.clamp_min(self.assignment_window_floor).square())
+            spectral = green / volume * wdeconv
+            spectral = torch.where(k_norms_flat > self.k_norm_floor, spectral, torch.zeros_like(spectral))
+
+            def _spread_fft(field: torch.Tensor) -> torch.Tensor:
+                mesh = _spread_source_to_mesh(
+                    frac, field, mesh_size=self.mesh_size, assignment=self.assignment,
+                    assignment_offsets=self.assignment_offsets, boundary=self.boundary,
+                )
+                return torch.fft.fftn(mesh, dim=(0, 1, 2)).reshape(-1, field.size(1))
+
+            S = _spread_fft(local_source).reshape(-1, src_c)  # (K, src) complex
+            if dipole is not None:
+                mut = _spread_fft(dipole.index_select(0, node_index).reshape(n_local, src_c * 3)).reshape(-1, src_c, 3)
+                S = S + 1j * torch.einsum("kx,ksx->ks", k_cart.to(mut.dtype), mut)
+            if quadrupole is not None:
+                qt = _spread_fft(quadrupole.index_select(0, node_index).reshape(n_local, src_c * 9)).reshape(-1, src_c, 3, 3)
+                S = S - 0.5 * torch.einsum("kx,ksxy,ky->ks", k_cart.to(qt.dtype), qt, k_cart.to(qt.dtype))
+            e_graph = 0.5 * (spectral.unsqueeze(-1) * S.abs().square()).sum()
+            atom_energy.index_copy_(0, node_index, (e_graph / n_local).reshape(1, 1).expand(n_local, 1))
+        return atom_energy
+
     def _can_use_spectral_cache(self, cell: torch.Tensor, *, dtype: torch.dtype) -> bool:
         if self.green_mode != "poisson" or self.training or torch.is_grad_enabled():
             return False
@@ -1814,6 +1890,86 @@ class MeshLongRangeKernel3D(nn.Module):
         return atom_energy
 
 
+def _build_multipole_transforms() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fixed transforms from the model's harmonic l-blocks to Cartesian multipoles, derived once
+    from the model's OWN direction_harmonics so the (l=1 / l=2) basis convention is exact.
+
+    Returns (Minv, Lqinv, E5):
+      - Minv (3,3): maps an l=1 harmonic 3-vector -> Cartesian vector (dipole direction).
+      - Lqinv (5,5): maps l=2 harmonic 5-coords -> Cartesian sym-traceless coords on E5.
+      - E5 (5,3,3): orthonormal symmetric-traceless 3x3 basis (Cartesian quadrupole reconstruction).
+    """
+    from molecular_force_field.models.ictd_irreps import direction_harmonics
+
+    f64 = torch.float64
+    e = torch.eye(3, dtype=f64)
+    M = torch.stack([direction_harmonics(e[i], 1) for i in range(3)], dim=1)  # harm = M @ cart
+    Minv = torch.inverse(M)
+    s2, s6 = math.sqrt(2.0), math.sqrt(6.0)
+    E5 = torch.stack([
+        torch.tensor([[0, 1, 0], [1, 0, 0], [0, 0, 0]], dtype=f64) / s2,
+        torch.tensor([[0, 0, 1], [0, 0, 0], [1, 0, 0]], dtype=f64) / s2,
+        torch.tensor([[0, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=f64) / s2,
+        torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 0]], dtype=f64) / s2,
+        torch.tensor([[-1, 0, 0], [0, -1, 0], [0, 0, 2]], dtype=f64) / s6,
+    ])
+    gen = torch.Generator().manual_seed(12345)
+    ns = torch.randn(5, 3, generator=gen, dtype=f64)
+    ns = ns / ns.norm(dim=-1, keepdim=True)
+    i3 = torch.eye(3, dtype=f64)
+    ts = torch.einsum("aij,nij->na", E5, torch.einsum("ni,nj->nij", ns, ns) - i3 / 3.0)
+    hs = direction_harmonics(ns, 2)
+    Lq = hs.transpose(0, 1) @ torch.inverse(ts.transpose(0, 1))   # harmonic = Lq @ t_cartesian
+    return Minv, torch.inverse(Lq), E5
+
+
+class LatentMultipoleHead(nn.Module):
+    """Equivariant heads mapping the model's harmonic l=1/l=2 features to Cartesian latent
+    dipoles (1o) / quadrupoles (2e). Gates are zero-initialised so multipoles start at 0."""
+
+    def __init__(self, feature_dim: int, channels: int, source_channels: int, max_multipole_l: int):
+        super().__init__()
+        self.max_multipole_l = int(max_multipole_l)
+        self.source_channels = int(source_channels)
+        minv, lqinv, e5 = _build_multipole_transforms()
+        if self.max_multipole_l >= 1:
+            self.dipole_mix = nn.Parameter(torch.randn(source_channels, channels) * (channels ** -0.5))
+            self.dipole_gate = nn.Linear(feature_dim, source_channels)
+            nn.init.zeros_(self.dipole_gate.weight)
+            nn.init.zeros_(self.dipole_gate.bias)
+            self.register_buffer("dipole_minv", minv, persistent=True)
+        if self.max_multipole_l >= 2:
+            self.quad_mix = nn.Parameter(torch.randn(source_channels, channels) * (channels ** -0.5))
+            self.quad_gate = nn.Linear(feature_dim, source_channels)
+            nn.init.zeros_(self.quad_gate.weight)
+            nn.init.zeros_(self.quad_gate.bias)
+            self.register_buffer("quad_lqinv", lqinv, persistent=True)
+            self.register_buffer("quad_e5", e5, persistent=True)
+
+    def forward(
+        self,
+        invariant_features: torch.Tensor,
+        l1_features: torch.Tensor | None,
+        l2_features: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        dipole = quadrupole = None
+        if self.max_multipole_l >= 1:
+            if l1_features is None:
+                raise ValueError("max_multipole_l>=1 requires l1_features (the model's l=1 block)")
+            dh = torch.einsum("ncx,sc->nsx", l1_features, self.dipole_mix.to(l1_features.dtype))
+            dipole_dir = torch.einsum("nsx,yx->nsy", dh, self.dipole_minv.to(l1_features.dtype))
+            dipole = self.dipole_gate(invariant_features).unsqueeze(-1) * dipole_dir
+        if self.max_multipole_l >= 2:
+            if l2_features is None:
+                raise ValueError("max_multipole_l>=2 requires l2_features (the model's l=2 block)")
+            qh = torch.einsum("ncm,sc->nsm", l2_features, self.quad_mix.to(l2_features.dtype))
+            qc = torch.einsum("nsm,pm->nsp", qh, self.quad_lqinv.to(l2_features.dtype))
+            quad_tensor = torch.einsum("nsp,pij->nsij", qc, self.quad_e5.to(l2_features.dtype))
+            gate = self.quad_gate(invariant_features).unsqueeze(-1).unsqueeze(-1)
+            quadrupole = gate * quad_tensor
+        return dipole, quadrupole
+
+
 class LatentReciprocalLongRange(nn.Module):
     """Periodic reciprocal-space prototype closer to a learnable Green's function."""
 
@@ -1835,6 +1991,8 @@ class LatentReciprocalLongRange(nn.Module):
         green_mode: str = "poisson",
         assignment: str = "cic",
         mesh_fft_full_ewald: bool = False,
+        max_multipole_l: int = 0,
+        multipole_feature_channels: int = 0,
     ):
         super().__init__()
         if reciprocal_backend not in {"direct_kspace", "mesh_fft"}:
@@ -1889,6 +2047,15 @@ class LatentReciprocalLongRange(nn.Module):
             # Keep the default contribution near zero so the module can be enabled
             # in existing workflows without destabilizing outputs before training.
             self.energy_scale = nn.Parameter(torch.tensor(0.0))
+        self.max_multipole_l = int(max_multipole_l)
+        if self.max_multipole_l > 0:
+            if self.reciprocal_backend != "mesh_fft":
+                raise ValueError("max_multipole_l>0 currently requires reciprocal_backend='mesh_fft'")
+            self.multipole_head = LatentMultipoleHead(
+                feature_dim, int(multipole_feature_channels), self.source_channels, self.max_multipole_l
+            )
+        else:
+            self.multipole_head = None
 
     @property
     def num_k(self) -> int:
@@ -1912,15 +2079,34 @@ class LatentReciprocalLongRange(nn.Module):
         *,
         edge_src: torch.Tensor | None = None,
         edge_dst: torch.Tensor | None = None,
+        l1_features: torch.Tensor | None = None,
+        l2_features: torch.Tensor | None = None,
         return_source: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         source = self.source_head(invariant_features)
         source = self._neutralize_source(source, batch, cell)
-        atom_energy = self.kernel(pos, batch, cell, source)
+        dipole = None
+        quadrupole = None
+        if self.max_multipole_l > 0 and self.multipole_head is not None:
+            dipole, quadrupole = self.multipole_head(invariant_features, l1_features, l2_features)
+            atom_energy = self.kernel.multipole_energy(pos, batch, cell, source, dipole, quadrupole)
+        else:
+            atom_energy = self.kernel(pos, batch, cell, source)
         if self.energy_scale is not None:
             atom_energy = self.energy_scale * atom_energy
         if return_source:
-            return atom_energy, source
+            # For multipole export, pack [q | dipole_xyz | quad_3x3] channel-last so the LAMMPS
+            # reciprocal solver can rebuild q/mu/Q from the single exported source tensor. Layout
+            # per source channel: 1 (monopole) + 3 (dipole) + 9 (quadrupole) when max_multipole_l=2.
+            export_source = source
+            if self.max_multipole_l > 0:
+                parts = [source]
+                if dipole is not None:
+                    parts.append(dipole.reshape(dipole.size(0), -1))
+                if quadrupole is not None:
+                    parts.append(quadrupole.reshape(quadrupole.size(0), -1))
+                export_source = torch.cat(parts, dim=-1)
+            return atom_energy, export_source
         return atom_energy
 
 
@@ -1988,6 +2174,8 @@ def build_long_range_module(
     far_source_norm: bool = True,
     far_gate_init: float = 0.0,
     cutoff_radius: float = 5.0,
+    max_multipole_l: int = 0,
+    multipole_feature_channels: int = 0,
 ) -> nn.Module | None:
     if mode == "none":
         return None
@@ -2048,6 +2236,8 @@ def build_long_range_module(
             green_mode=green_mode,
             assignment=assignment,
             mesh_fft_full_ewald=mesh_fft_full_ewald,
+            max_multipole_l=max_multipole_l,
+            multipole_feature_channels=multipole_feature_channels,
         )
     raise ValueError(f"Unsupported long_range_mode: {mode!r}")
 

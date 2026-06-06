@@ -1076,6 +1076,9 @@ def main():
     parser.add_argument('--no-long-range-mesh-fft-full-ewald', dest='long_range_mesh_fft_full_ewald', action='store_false',
                         help='Keep mesh_fft on the faster reciprocal-only path (default).')
     parser.set_defaults(long_range_mesh_fft_full_ewald=None)
+    parser.add_argument('--long-range-max-multipole-l', dest='long_range_max_multipole_l', type=int, default=0,
+                        help='Latent multipole order for reciprocal-spectral long-range (mesh_fft): '
+                             '0=monopole only (LES-equivalent), 1=+dipole, 2=+dipole+quadrupole. Default 0.')
     parser.add_argument('--long-range-theta', type=float, default=None,
                         help='Opening-angle parameter for --long-range-backend tree_fmm. '
                              'Smaller values are more accurate and more expensive. '
@@ -1275,6 +1278,7 @@ def main():
             "long_range_green_mode": args.long_range_green_mode,
             "long_range_assignment": args.long_range_assignment,
             "long_range_mesh_fft_full_ewald": args.long_range_mesh_fft_full_ewald,
+            "long_range_max_multipole_l": getattr(args, "long_range_max_multipole_l", 0),
             "long_range_theta": args.long_range_theta,
             "long_range_leaf_size": args.long_range_leaf_size,
             "long_range_multipole_order": args.long_range_multipole_order,
@@ -1336,6 +1340,7 @@ def main():
     args.long_range_green_mode = resolved_arch["long_range_green_mode"]
     args.long_range_assignment = resolved_arch["long_range_assignment"]
     args.long_range_mesh_fft_full_ewald = resolved_arch["long_range_mesh_fft_full_ewald"]
+    args.long_range_max_multipole_l = resolved_arch.get("long_range_max_multipole_l", 0)
     args.long_range_theta = resolved_arch["long_range_theta"]
     args.long_range_leaf_size = resolved_arch["long_range_leaf_size"]
     args.long_range_multipole_order = resolved_arch["long_range_multipole_order"]
@@ -1964,6 +1969,7 @@ def main():
         long_range_green_mode=args.long_range_green_mode,
         long_range_assignment=args.long_range_assignment,
         long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+        long_range_max_multipole_l=args.long_range_max_multipole_l,
         long_range_theta=args.long_range_theta,
         long_range_leaf_size=args.long_range_leaf_size,
         long_range_multipole_order=args.long_range_multipole_order,
@@ -2146,6 +2152,7 @@ def main():
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
             long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+            long_range_max_multipole_l=args.long_range_max_multipole_l,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -2257,6 +2264,7 @@ def main():
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
             long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+            long_range_max_multipole_l=args.long_range_max_multipole_l,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,
@@ -2812,6 +2820,7 @@ def main():
             long_range_green_mode=args.long_range_green_mode,
             long_range_assignment=args.long_range_assignment,
             long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+            long_range_max_multipole_l=args.long_range_max_multipole_l,
             long_range_theta=args.long_range_theta,
             long_range_leaf_size=args.long_range_leaf_size,
             long_range_multipole_order=args.long_range_multipole_order,

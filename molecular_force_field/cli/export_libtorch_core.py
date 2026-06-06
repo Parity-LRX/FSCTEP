@@ -725,6 +725,12 @@ def _export_single_core(
         "long_range_boundary": str(getattr(metadata_model, "long_range_boundary", "nonperiodic")),
         "long_range_backend": str(getattr(metadata_model, "long_range_backend", "dense_pairwise")),
         "long_range_mesh_size": int(getattr(metadata_model, "long_range_mesh_size", 16)),
+        # Latent multipole order: 0=monopole only; 1=+dipole; 2=+dipole+quadrupole. The exported
+        # reciprocal_source is packed channel-last as [q | dipole_xyz | quad_3x3] per source channel,
+        # so the C++ reciprocal solver rebuilds q/mu/Q using this + reciprocal_source_channels.
+        "long_range_max_multipole_l": int(
+            getattr(getattr(metadata_model, "long_range_module", None), "max_multipole_l", 0)
+        ),
         "long_range_slab_padding_factor": int(getattr(metadata_model, "long_range_slab_padding_factor", 2)),
         "long_range_reciprocal_backend": str(getattr(metadata_model, "long_range_reciprocal_backend", "direct_kspace")),
         "long_range_energy_partition": str(getattr(metadata_model, "long_range_energy_partition", "potential")),

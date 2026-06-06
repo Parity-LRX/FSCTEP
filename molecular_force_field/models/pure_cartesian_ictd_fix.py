@@ -1620,6 +1620,7 @@ class PureCartesianICTDFix(nn.Module):
         long_range_green_mode: str = "poisson",
         long_range_assignment: str = "cic",
         long_range_mesh_fft_full_ewald: bool = False,
+        long_range_max_multipole_l: int = 0,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
         long_range_multipole_order: int = 0,
@@ -2068,6 +2069,8 @@ class PureCartesianICTDFix(nn.Module):
             green_mode=long_range_green_mode,
             assignment=long_range_assignment,
             mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+            max_multipole_l=long_range_max_multipole_l,
+            multipole_feature_channels=self.channels,
             theta=long_range_theta,
             leaf_size=long_range_leaf_size,
             multipole_order=long_range_multipole_order,
@@ -2282,19 +2285,30 @@ class PureCartesianICTDFix(nn.Module):
             # final per-atom INVARIANT descriptor [N, channels] (in scope for both routes):
             # baseline last layer_state is already scalar; fusion last_preproduct is full-SO3 -> take l=0.
             last_state = layer_states[-1]
+            l1_feat = None
+            l2_feat = None
             if last_state.shape[-1] == self.channels:
                 lr_feat = last_state
             else:
-                lr_feat = _split_irreps(last_state, self.channels, self.lmax)[0].reshape(last_state.shape[0], self.channels)
+                lr_splits = _split_irreps(last_state, self.channels, self.lmax)
+                lr_feat = lr_splits[0].reshape(last_state.shape[0], self.channels)
+                # latent multipoles tap the SAME last_state basis: l=1 (1o) -> dipole, l=2 (2e) -> quadrupole
+                mp_l = int(getattr(self.long_range_module, "max_multipole_l", 0))
+                if mp_l >= 1 and self.lmax >= 1:
+                    l1_feat = lr_splits[1]
+                if mp_l >= 2 and self.lmax >= 2:
+                    l2_feat = lr_splits[2]
             defer = False
             if return_reciprocal_source and self.long_range_exports_reciprocal_source:
                 long_range_energy, reciprocal_source = self.long_range_module(
-                    lr_feat, pos, batch, cell, edge_src=edge_src, edge_dst=edge_dst, return_source=True
+                    lr_feat, pos, batch, cell, edge_src=edge_src, edge_dst=edge_dst,
+                    l1_features=l1_feat, l2_features=l2_feat, return_source=True
                 )
                 defer = reciprocal_source.numel() > 0
             else:
                 long_range_energy = self.long_range_module(
-                    lr_feat, pos, batch, cell, edge_src=edge_src, edge_dst=edge_dst
+                    lr_feat, pos, batch, cell, edge_src=edge_src, edge_dst=edge_dst,
+                    l1_features=l1_feat, l2_features=l2_feat
                 )
             if long_range_energy is not None and not defer:
                 out = out + long_range_energy
