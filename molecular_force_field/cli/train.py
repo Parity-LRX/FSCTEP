@@ -934,6 +934,13 @@ def main():
                         action='store_false',
                         help='Keep interaction message_norm / sc_norm as Identity (default).')
     parser.set_defaults(ictd_fix_interaction_rms_norm=False)
+    parser.add_argument('--ictd-fix-interaction-attn-heads', type=int, default=0,
+                        help='Heads for the optional equivariant neighbor-attention scatter in each '
+                             'interaction block (DPA-4/SeZM-style envelope-gated zeta-softmax). Default 0 '
+                             '= plain envelope scatter-sum (byte-identical). >0 = attention-weighted '
+                             'neighbor aggregation: weights from l=0 invariants (q=dst, k=src), smooth at '
+                             'the cutoff (env^2-gated + zeta-bias so forces stay continuous). channels '
+                             'must be divisible by the head count.')
     parser.add_argument('--ictd-fix-gmix-energy-readout',
                         dest='ictd_fix_gmix_energy_readout',
                         action='store_true',
@@ -2407,6 +2414,7 @@ def main():
             ictd_fix_fusion_readout_mixed_channels=args.ictd_fix_fusion_readout_mixed_channels,
             ictd_fix_fusion_pre_product_norm=args.ictd_fix_fusion_pre_product_norm,
             ictd_fix_interaction_rms_norm=args.ictd_fix_interaction_rms_norm,
+            ictd_fix_interaction_attn_heads=args.ictd_fix_interaction_attn_heads,
             ictd_fix_gmix_energy_readout=args.ictd_fix_gmix_energy_readout,
             ictd_fix_gmix_readout_scale_init=args.ictd_fix_gmix_readout_scale_init,
             ictd_fix_layer_readout_output_init_std=args.ictd_fix_layer_readout_output_init_std,
