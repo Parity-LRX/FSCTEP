@@ -316,6 +316,10 @@ class H5Dataset(Dataset):
         extra_label_paths: Dict[str, str] | None = None,
         # Optional: per-node label file (HDF5 with sample_0, sample_1, ... each with charge_per_atom etc.)
         extra_per_node_label_path: str | None = None,
+        # Pad each frame's edge list to a fixed E_max with out-of-cutoff dummy edges, so every
+        # batch has a FIXED shape (enables CUDA-graph / fixed-shape compiled-autograd). The dummies
+        # are zeroed by the model's edge_mask (edge_length<=max_radius) -> numerically a no-op.
+        pad_edges_to_max: bool = False,
     ):
         """
         Initialize H5 dataset.
@@ -338,8 +342,14 @@ class H5Dataset(Dataset):
                 f"Please run 'mff-preprocess' first to generate the required data files."
             )
         
+        self.pad_edges_to_max = bool(pad_edges_to_max)
         with h5py.File(self.file_path, 'r') as f:
             self.num_samples = len(f.keys())
+            # E_max for fixed-shape edge padding: prefer the preprocess-summarized attr, else
+            # (datasets made before this feature) scan the per-frame edge lengths once at load.
+            self.max_edges = int(f.attrs.get('max_edges', 0))
+            if self.pad_edges_to_max and self.max_edges <= 0:
+                self.max_edges = max((int(f[k]['edge_src'].shape[0]) for k in f.keys()), default=0)
 
         self._extra_labels: Dict[str, torch.Tensor] = {}
         if extra_label_paths:
@@ -414,6 +424,19 @@ class H5Dataset(Dataset):
             'cell': torch.from_numpy(g['cell'][:]).double(),
             'stress': stress,
         }
+        if self.pad_edges_to_max:
+            E = int(out['edge_src'].shape[0])
+            target = max(self.max_edges, E)  # never truncate; an over-E_max frame just grows the shape
+            if target > E:
+                npad = target - E
+                z = torch.zeros(npad, dtype=torch.long)
+                out['edge_src'] = torch.cat([out['edge_src'], z])
+                out['edge_dst'] = torch.cat([out['edge_dst'], z])
+                # dummy edges src=dst=0 with a huge fractional shift: |edge|=shift*cell >> max_radius
+                # -> zeroed by the model's edge_mask (edge_length<=max_radius); numerically a no-op.
+                pad_shift = torch.zeros(npad, 3, dtype=torch.float64)
+                pad_shift[:, 0] = 1.0e3
+                out['edge_shifts'] = torch.cat([out['edge_shifts'], pad_shift], dim=0)
         # Prefer in-H5 datasets when present, else fall back to extra_label_paths.
         for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in g:

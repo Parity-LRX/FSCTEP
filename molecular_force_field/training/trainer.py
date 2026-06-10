@@ -147,6 +147,7 @@ class Trainer:
         # 2nd-order / double-backward) via torch._dynamo.compiled_autograd. Forward
         # stays eager (torch.compile's AOTAutograd cannot double-backward). Opt-in.
         train_compiled_autograd: bool = False,
+        compiled_autograd_dynamic: bool = True,
         # Fixed-shape CUDA-graph training: captures the full train step (forward ->
         # forces/stress via create_graph -> loss -> backward) as a CUDA graph and
         # replays it per batch. Numerically identical replay. Requires fixed shapes,
@@ -248,6 +249,10 @@ class Trainer:
         self.compile_val_dynamic = bool(compile_val_dynamic)
         self.compile_val_precache = bool(compile_val_precache)
         self.train_compiled_autograd = bool(train_compiled_autograd)
+        # dynamic=True compiles once for variable shapes but HANGS on this model's large
+        # double-backward graph; with pad-edges-to-max (fixed shape) use dynamic=False (compiles
+        # the concrete shape once, no hang). Configurable via --train-ca-static.
+        self._ca_dynamic = bool(compiled_autograd_dynamic)
         self._compiled_autograd_warned = False
         self._ca_checked = False   # first-step probe done?
         self._ca_disabled = False  # permanently fell back to eager?
@@ -265,6 +270,8 @@ class Trainer:
         self._cg_sig = None            # captured shape signature; batches must match
         self._cg_disabled = False      # permanently fell back to eager (capture failed / ineligible)
         self._cg_warned = False
+        self._cg_recaptures = 0        # option-2 high-water-mark: re-captures done on shape growth
+        self._cg_recapture_budget = 8  # cap re-captures; beyond this, shapes truly thrash -> eager
         self._val_compiled_current = None
         self._val_compiled_ema = None
         self._val_compile_failed_current = False
@@ -603,7 +610,7 @@ class Trainer:
 
             def _compiler(gm, **kw):
                 # dynamic=True: training batches vary in atom/edge count.
-                return torch.compile(gm, dynamic=True)
+                return torch.compile(gm, dynamic=self._ca_dynamic)
 
             return enable(_compiler)
         except Exception as e:  # pragma: no cover - safety net
@@ -2170,13 +2177,37 @@ class Trainer:
             elif sig == self._cg_sig:
                 out = self._cg_replay(moved)
                 run_backward = False
+            elif self._cg_recaptures < self._cg_recapture_budget:
+                # Shape grew (e.g. an over-E_max frame past the padded high-water-mark). Option-2:
+                # RE-CAPTURE at the new shape instead of giving up. With auto-scanned pad-to-E_max
+                # this branch is never hit (all frames are fixed-shape); it is the safety net for
+                # online / unseen-larger frames. Budget-capped to avoid thrash if shapes truly vary.
+                self._cg_recaptures += 1
+                try:
+                    self._cg_capture(moved)  # re-capture at the new shape; overwrites buffers + sig
+                except Exception as e:
+                    self._cg_disabled = True
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if self.is_main_process:
+                        logging.warning(
+                            f"train_cuda_graph re-capture failed ({type(e).__name__}: {e}); "
+                            "using eager train_epoch for the rest of training."
+                        )
+                    return self.train_epoch(epoch)
+                if self.is_main_process:
+                    logging.info(
+                        "train_cuda_graph: batch shape grew -> re-captured "
+                        f"(#{self._cg_recaptures}/{self._cg_recapture_budget})."
+                    )
+                out = self._cg_replay(moved)
+                run_backward = False
             else:
-                # Shape changed -> data is not fixed-shape. Disable cuda-graph and run
-                # this batch (and the rest of training) eagerly.
+                # Shapes keep changing past the re-capture budget -> not fixed-shape (padding off or
+                # truly variable). Disable cuda-graph and run eagerly from here.
                 self._cg_disabled = True
                 if self.is_main_process and not self._cg_warned:
                     self._cg_warned = True
-                    logging.warning("train_cuda_graph: batch shape changed; data is not fixed-shape, using eager from here.")
+                    logging.warning("train_cuda_graph: shapes keep changing past the re-capture budget; using eager from here.")
                 self.optimizer.zero_grad()
                 pos.requires_grad_(True)
                 out = self._train_compute(

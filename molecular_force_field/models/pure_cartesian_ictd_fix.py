@@ -1596,7 +1596,13 @@ class ICTDResidualInteractionBlock(nn.Module):
         env2 = edge_env.reshape(-1, 1).to(dtype=logit.dtype).clamp_min(0.0).square()  # (E, 1)
         # group max over dst's edges, floored at 0 (the zeta term sits at logit 0) for
         # overflow-free exp shifts: exp(logit-gmax)<=exp(0)=1 and exp(-gmax)<=1.
-        gmax = scatter(logit, edge_dst, dim=0, dim_size=num_nodes, reduce="max").clamp_min(0.0)  # (N, H)
+        # per-dst max over incoming logits (softmax stability shift). Use torch-native
+        # scatter_reduce(amax) which returns ONLY values -- torch_scatter's scatter_max returns a
+        # non-differentiable argmax that breaks compiled-autograd (non_differentiable assert) AND
+        # CUDA-graph capture. Numerically identical (same max). clamp_min(0): the zeta term sits at 0.
+        gmax = logit.new_zeros(num_nodes, H).scatter_reduce_(
+            0, edge_dst.unsqueeze(-1).expand(-1, H), logit, reduce="amax", include_self=False
+        ).clamp_min(0.0)  # (N, H)
         ex = env2 * torch.exp(logit - gmax[edge_dst])  # (E, H)
         denom = scatter(ex, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")  # (N, H)
         zeta = F.softplus(self.attn_z_bias_raw).reshape(1, H).to(dtype=logit.dtype)

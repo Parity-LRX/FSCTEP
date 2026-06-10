@@ -1240,6 +1240,11 @@ def main():
                              'None 2nd-order force/stress grad blocks compiled-autograd; equivariance-safe). If '
                              'compiled-autograd still fails for some model, the first step probes it and falls back '
                              'to eager (no crash). Requires torch>=2.4.')
+    parser.add_argument('--train-ca-static', action='store_true',
+                        help='Compile compiled-autograd with dynamic=False (concrete fixed shape) instead '
+                             'of dynamic=True. dynamic=True compiles once for variable shapes but HANGS on '
+                             'this model\'s large double-backward graph; pair --train-ca-static with '
+                             '--pad-edges-to-max so the (now fixed) shape compiles once cleanly.')
 
     parser.add_argument('--train-cuda-graph', action='store_true',
                         help='Fixed-shape CUDA-graph training: capture the full train step (forward -> '
@@ -1251,6 +1256,14 @@ def main():
                              'shape change mid-run or a capture failure) transparently falls back to the eager '
                              'train_epoch. Best for launch-bound (small-atom) regimes; limited benefit when '
                              'compute-bound at large atom counts. Mutually exclusive with --train-compiled-autograd.')
+    parser.add_argument('--pad-edges-to-max', action='store_true',
+                        help='Pad every frame\'s edge list to a fixed E_max (the dataset\'s longest neighbor '
+                             'list, summarized at preprocess into the h5 `max_edges` attr, else scanned once at '
+                             'load) with out-of-cutoff dummy edges, so all batches have a FIXED shape. The dummies '
+                             'are zeroed by the model\'s edge_mask (edge_length<=max_radius) -> numerically a no-op '
+                             '(validated bit-identical). This is what makes a variable-NEIGHBOR-count dataset '
+                             '(fixed atoms, moving neighbors) usable with --train-cuda-graph / fixed-shape '
+                             'compiled-autograd. Auto-enabled when --train-cuda-graph is set.')
 
     # 推理模式：保存到 checkpoint，供 evaluate/inference_ddp 使用；TorchScript/LAMMPS 导出始终只输出能量和力
     parser.add_argument('--inference-output-physical-tensors', action='store_true',
@@ -1851,22 +1864,26 @@ def main():
             'train', data_dir=args.data_dir, file_path=args.train_data,
             extra_label_paths=extra_label_paths,
             extra_per_node_label_path=args.extra_per_node_file,
+            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph),
         )
         val_dataset = H5Dataset(
             'val', data_dir=args.data_dir, file_path=args.valid_data,
             extra_label_paths=extra_label_paths,
             extra_per_node_label_path=args.extra_per_node_file,
+            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph),
         )
     else:
         train_dataset = H5Dataset(
             args.train_prefix, data_dir=args.data_dir,
             extra_label_paths=extra_label_paths,
             extra_per_node_label_path=args.extra_per_node_file,
+            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph),
         )
         val_dataset = H5Dataset(
             args.val_prefix, data_dir=args.data_dir,
             extra_label_paths=extra_label_paths,
             extra_per_node_label_path=args.extra_per_node_file,
+            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph),
         )
 
     resolved_avg_num_neighbors = args.avg_num_neighbors
@@ -3006,6 +3023,7 @@ def main():
         compile_val_dynamic=args.compile_val_dynamic,
         compile_val_precache=args.compile_val_precache,
         train_compiled_autograd=args.train_compiled_autograd,
+        compiled_autograd_dynamic=(not args.train_ca_static),
         train_cuda_graph=args.train_cuda_graph,
         inference_output_physical_tensors=args.inference_output_physical_tensors,
         physical_tensor_weights=physical_tensor_weights,
