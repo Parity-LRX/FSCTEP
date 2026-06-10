@@ -87,6 +87,28 @@ def _compute_avg_num_neighbors_from_h5(dataset: H5Dataset) -> float:
     return float(total_edges) / float(max(total_nodes, 1))
 
 
+def _compute_force_rms_from_h5(dataset: H5Dataset) -> float:
+    """RMS of all training force components (MACE-style rms_forces_scaling) from the training H5.
+
+    Used as a fixed scalar scale on the network (short-range) energy output when
+    --energy-output-scale-mode force-rms is set. Forces are E0-independent (E0 is a per-atom
+    constant -> zero force), so this statistic is clean. Equivariance-safe: a scalar prefactor
+    on the O(3)-invariant energy; forces scale by the same factor.
+    """
+    import h5py
+
+    total_sq = 0.0
+    total_count = 0
+    with h5py.File(dataset.file_path, "r") as h5_file:
+        for key in h5_file.keys():
+            forces = np.asarray(h5_file[key]["force"][:], dtype=np.float64)
+            total_sq += float(np.sum(np.square(forces)))
+            total_count += int(forces.size)
+    if total_count == 0:
+        return 1.0
+    return float(np.sqrt(total_sq / float(total_count)))
+
+
 def _configure_determinism(
     seed: int,
     *,
@@ -789,6 +811,15 @@ def main():
                         help='Route for --tensor-product-mode pure-cartesian-ictd-fix, pure-cartesian-ictd-fix-so2, or spherical-fix. '
                              '"baseline" keeps pure MACE-style layerwise readout only. '
                              '"fusion" adds an extra cross-layer fusion correction head in parallel.')
+    parser.add_argument('--energy-output-scale-mode', type=str, default='none',
+                        choices=['none', 'force-rms'],
+                        help='Optional fixed scalar scale on the network (short-range) energy output, '
+                             'applied as E_sr = scale * readout (forces scale by the same factor). '
+                             'Opt-in switch for pure-cartesian-ictd-fix. '
+                             '"none" (default) = no scaling, byte-identical to before (None buffer, not in state_dict). '
+                             '"force-rms" sets scale = RMS of training force components (MACE ScaleShiftMACE-style '
+                             'rms_forces_scaling), computed once from the training set. Equivariance-safe (scalar on an '
+                             'invariant energy); E0 is added afterward and is not scaled.')
     parser.add_argument('--ictd-fix-contraction-combine', type=str, default='softmax',
                         choices=['softmax', 'free', 'path-free'],
                         help='Order-combination ablation for --tensor-product-mode pure-cartesian-ictd-fix. '
@@ -915,6 +946,12 @@ def main():
                         action='store_false',
                         help='Disable direct g_mix readout.')
     parser.set_defaults(ictd_fix_gmix_energy_readout=True)
+    parser.add_argument('--ictd-fix-gmix-output-lmax', type=int, default=None,
+                        help='Output lmax of the fusion gmix contraction (multiple_contraction_mix). '
+                             'Default None => equals --lmax (byte-identical). Set higher (e.g. 3 with '
+                             'lmax=2) so the gmix symmetric contraction emits higher-l angular features '
+                             '(coupled from the already message-passed backbone features) into product5, '
+                             'at near-zero backbone cost. Requires the mixed-channels fusion readout (default on).')
     parser.add_argument('--ictd-fix-layer-readout-output-init-std', type=float, default=0.003,
                         help='Output init std for h_t layer energy readout Linear weights and '
                              'fusion readout MainNet output layer. Default 0.003 keeps initial '
@@ -1831,6 +1868,20 @@ def main():
         if rank == 0:
             logging.info("Computed average number of neighbors: %.12g", resolved_avg_num_neighbors)
 
+    # Optional force-RMS energy output scale (opt-in switch); computed once from the training set.
+    resolved_energy_output_scale = 1.0
+    energy_output_scale_enabled = (
+        getattr(args, "energy_output_scale_mode", "none") == "force-rms"
+        and args.tensor_product_mode == "pure-cartesian-ictd-fix"
+    )
+    if energy_output_scale_enabled:
+        resolved_energy_output_scale = _compute_force_rms_from_h5(train_dataset)
+        if rank == 0:
+            logging.info(
+                "Energy output scale ON (force-rms): scale = RMS(train forces) = %.12g",
+                resolved_energy_output_scale,
+            )
+
     # --- DataLoaders and distributed samplers ---
     if args.distributed:
         train_sampler = DistributedSampler(
@@ -2360,6 +2411,7 @@ def main():
             ictd_fix_gmix_readout_scale_init=args.ictd_fix_gmix_readout_scale_init,
             ictd_fix_layer_readout_output_init_std=args.ictd_fix_layer_readout_output_init_std,
             ictd_fix_gmix_readout_output_init_std=args.ictd_fix_gmix_readout_output_init_std,
+            ictd_fix_gmix_output_lmax=args.ictd_fix_gmix_output_lmax,
             polynomial_cutoff_p=args.polynomial_cutoff_p,
             save_contraction_order=args.ictd_save_contraction_order,
             save_multiple_mix_channels=args.ictd_save_multiple_mix_channels,
@@ -2368,6 +2420,8 @@ def main():
             internal_compute_dtype=config.internal_compute_dtype,
             equivariant_post_linear=args.equivariant_post_linear,
             avg_num_neighbors=resolved_avg_num_neighbors,
+            energy_output_scale=resolved_energy_output_scale,
+            energy_output_scale_enabled=energy_output_scale_enabled,
             device=device,
             **common_invariant_kwargs,
             **common_long_range_kwargs,

@@ -1179,11 +1179,16 @@ class ICTDPureUFusionMixBlockSO3(nn.Module):
         hidden_channels: int,
         lmax: int,
         correlation: int = 3,
+        output_lmax: int | None = None,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_channels = int(hidden_channels)
         self.lmax = int(lmax)
+        # Output lmax may exceed the input lmax: the symmetric contraction builds
+        # per-output-l U tensors via ictd_u_matrix_so3(lmax=input, output_l=l),
+        # so e.g. l=3 outputs are coupled from l<=2 inputs (1o(x)2e->3o, ...).
+        self.output_lmax = self.lmax if output_lmax is None else int(output_lmax)
         self.reduce = EquivariantChannelLinearSO3Rect(
             self.in_channels,
             self.hidden_channels,
@@ -1194,10 +1199,10 @@ class ICTDPureUFusionMixBlockSO3(nn.Module):
             num_elements=int(num_elements),
             channels=self.hidden_channels,
             lmax=self.lmax,
-            target_lmax=self.lmax,
+            target_lmax=self.output_lmax,
             correlation=int(correlation),
         )
-        self.linear = o3.Linear(_hidden_irreps(self.hidden_channels, self.lmax), _hidden_irreps(self.hidden_channels, self.lmax))
+        self.linear = o3.Linear(_hidden_irreps(self.hidden_channels, self.output_lmax), _hidden_irreps(self.hidden_channels, self.output_lmax))
 
     def forward(self, x: torch.Tensor, node_attrs: torch.Tensor) -> torch.Tensor:
         reduced = self.reduce(x)
@@ -1221,11 +1226,13 @@ class ICTDBridgeUFusionMixBlockSO3(nn.Module):
         hidden_channels: int,
         lmax: int,
         correlation: int = 3,
+        output_lmax: int | None = None,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.hidden_channels = int(hidden_channels)
         self.lmax = int(lmax)
+        self.output_lmax = self.lmax if output_lmax is None else int(output_lmax)
         self.reduce = EquivariantChannelLinearSO3Rect(
             self.in_channels,
             self.hidden_channels,
@@ -1236,12 +1243,12 @@ class ICTDBridgeUFusionMixBlockSO3(nn.Module):
             num_elements=int(num_elements),
             channels=self.hidden_channels,
             lmax=self.lmax,
-            target_lmax=self.lmax,
+            target_lmax=self.output_lmax,
             correlation=int(correlation),
         )
         self.linear = o3.Linear(
-            _hidden_irreps(self.hidden_channels, self.lmax),
-            _hidden_irreps(self.hidden_channels, self.lmax),
+            _hidden_irreps(self.hidden_channels, self.output_lmax),
+            _hidden_irreps(self.hidden_channels, self.output_lmax),
         )
 
     def forward(self, x: torch.Tensor, node_attrs: torch.Tensor) -> torch.Tensor:
@@ -1324,20 +1331,33 @@ class FusionProduct5ReadoutSO3Mixed(nn.Module):
         output_init_std: float = 0.003,
         internal_compute_dtype: torch.dtype | None = None,
         pre_product_norm: bool = False,
+        lmax_per_block: list[int] | tuple[int, ...] | None = None,
     ):
         super().__init__()
         self.channels_per_block = tuple(int(c) for c in channels_per_block)
-        self.lmax = int(lmax)
         self.num_feature_blocks = len(self.channels_per_block)
         if self.num_feature_blocks < 1:
             raise ValueError("channels_per_block must contain at least one feature block")
         if any(c < 1 for c in self.channels_per_block):
             raise ValueError(f"channels_per_block entries must be positive, got {self.channels_per_block}")
+        # Per-block input lmax. Default: every block shares `lmax` (byte-identical
+        # to the uniform path). When a block emits a higher lmax (e.g. a gmix block
+        # with output_lmax>backbone lmax), the product runs at max(lmax_per_block)
+        # and blocks lacking a given l contribute zeros there.
+        if lmax_per_block is None:
+            self.lmax_per_block = tuple(int(lmax) for _ in self.channels_per_block)
+        else:
+            self.lmax_per_block = tuple(int(l) for l in lmax_per_block)
+            if len(self.lmax_per_block) != self.num_feature_blocks:
+                raise ValueError(
+                    f"lmax_per_block length {len(self.lmax_per_block)} != num_feature_blocks {self.num_feature_blocks}"
+                )
+        self.lmax = max(self.lmax_per_block)
         self.total_channels = int(sum(self.channels_per_block))
         self.pre_product_norm = bool(pre_product_norm)
         self.pre_product_norms = (
             nn.ModuleList(
-                [SO3BlockRMSNorm(channels=int(c), lmax=self.lmax) for c in self.channels_per_block]
+                [SO3BlockRMSNorm(channels=int(c), lmax=int(lb)) for c, lb in zip(self.channels_per_block, self.lmax_per_block)]
             )
             if self.pre_product_norm
             else None
@@ -1357,13 +1377,21 @@ class FusionProduct5ReadoutSO3Mixed(nn.Module):
         if self.pre_product_norms is not None:
             features = [norm(x) for x, norm in zip(features, self.pre_product_norms)]
         split_features = [
-            _split_irreps(x, channels, self.lmax)
-            for x, channels in zip(features, self.channels_per_block)
+            _split_irreps(x, channels, lb)
+            for x, channels, lb in zip(features, self.channels_per_block, self.lmax_per_block)
         ]
-        t_blocks = {
-            l: torch.cat([blocks[l] for blocks in split_features], dim=-2)
-            for l in range(self.lmax + 1)
-        }
+        t_blocks: dict[int, torch.Tensor] = {}
+        for l in range(self.lmax + 1):
+            parts = []
+            for blocks, channels, lb in zip(split_features, self.channels_per_block, self.lmax_per_block):
+                if l <= lb:
+                    parts.append(blocks[l])
+                else:
+                    lead = blocks[0].shape[:-2]
+                    parts.append(
+                        torch.zeros(*lead, int(channels), 2 * l + 1, dtype=blocks[0].dtype, device=blocks[0].device)
+                    )
+            t_blocks[l] = torch.cat(parts, dim=-2)
         f_prod5 = self.product_5(t_blocks, t_blocks)
         return self.proj_total(f_prod5)
 
@@ -1667,11 +1695,14 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_gmix_energy_readout: bool = True,
         ictd_fix_gmix_readout_scale_init: float | None = None,
         ictd_fix_gmix_readout_output_init_std: float = 0.003,
+        ictd_fix_gmix_output_lmax: int | None = None,
         ictd_fix_layer_readout_output_init_std: float = 0.003,
         polynomial_cutoff_p: int | None = 6,
         save_contraction_order: int = 3,
         save_multiple_mix_channels: int | None = None,
         avg_num_neighbors: float | None = None,
+        energy_output_scale: float = 1.0,
+        energy_output_scale_enabled: bool = False,
     ):
         super().__init__()
         if embed_size is None:
@@ -1749,6 +1780,18 @@ class PureCartesianICTDFix(nn.Module):
             if ictd_fix_gmix_readout_scale_init is None
             else float(ictd_fix_gmix_readout_scale_init)
         )
+        # Fusion gmix output lmax: the gmix (multiple_contraction_mix) symmetric
+        # contraction can emit a HIGHER output lmax than the backbone input lmax,
+        # giving product5 extra higher-l angular invariants from the (already
+        # message-passed) backbone features, at near-zero backbone cost. Default
+        # = lmax => byte-identical to before.
+        self.ictd_fix_gmix_output_lmax = (
+            self.lmax if ictd_fix_gmix_output_lmax is None else int(ictd_fix_gmix_output_lmax)
+        )
+        if self.ictd_fix_gmix_output_lmax < self.lmax:
+            raise ValueError(
+                f"ictd_fix_gmix_output_lmax ({self.ictd_fix_gmix_output_lmax}) must be >= lmax ({self.lmax})"
+            )
         self.polynomial_cutoff_p = (
             None
             if polynomial_cutoff_p is None or int(polynomial_cutoff_p) <= 0
@@ -1912,12 +1955,18 @@ class PureCartesianICTDFix(nn.Module):
             )
             fusion_mix_cls = ICTDBridgeUFusionMixBlockSO3 if self.lmax > 3 else ICTDPureUFusionMixBlockSO3
             self.ictd_fix_fusion_mix_backend = "ictd-bridge-u" if self.lmax > 3 else "ictd-pure-u"
+            if self.ictd_fix_gmix_output_lmax != self.lmax and not self.ictd_fix_fusion_readout_mixed_channels:
+                raise NotImplementedError(
+                    "ictd_fix_gmix_output_lmax != lmax requires ictd_fix_fusion_readout_mixed_channels=True "
+                    "(the mixed product5 readout handles per-block lmax; the uniform path does not)."
+                )
             self.multiple_contraction_mix = fusion_mix_cls(
                 num_elements=self.num_elements,
                 in_channels=self.channels * self.num_interaction,
                 hidden_channels=self.save_multiple_mix_channels,
                 lmax=self.lmax,
                 correlation=save_contraction_order,
+                output_lmax=self.ictd_fix_gmix_output_lmax,
             )
             self.multiple_contract_fuse = (
                 nn.Identity()
@@ -1957,7 +2006,7 @@ class PureCartesianICTDFix(nn.Module):
             if self.ictd_fix_gmix_block_rmsnorm:
                 self.gmix_block_rmsnorm_gamma = nn.Parameter(
                     torch.full(
-                        (self.lmax + 1,),
+                        (self.ictd_fix_gmix_output_lmax + 1,),
                         self.ictd_fix_gmix_block_rmsnorm_gamma_init,
                         dtype=torch.get_default_dtype(),
                     )
@@ -1969,6 +2018,7 @@ class PureCartesianICTDFix(nn.Module):
                 fusion_readout_kwargs = dict(
                     channels_per_block=[self.channels] * self.num_interaction + [self.save_multiple_mix_channels],
                     lmax=self.lmax,
+                    lmax_per_block=[self.lmax] * self.num_interaction + [self.ictd_fix_gmix_output_lmax],
                     hidden_sizes=main_hidden_sizes3,
                     output_init_std=self.ictd_fix_layer_readout_output_init_std,
                     internal_compute_dtype=internal_compute_dtype,
@@ -2016,7 +2066,7 @@ class PureCartesianICTDFix(nn.Module):
             if self.ictd_fix_gmix_energy_readout:
                 self.gmix_energy_readout = EquivariantScalarReadoutSO3(
                     self.save_multiple_mix_channels,
-                    self.lmax,
+                    self.ictd_fix_gmix_output_lmax,
                     output_init_std=self.ictd_fix_gmix_readout_output_init_std,
                 )
                 if self.ictd_fix_readout_head_scale_trainable:
@@ -2091,6 +2141,23 @@ class PureCartesianICTDFix(nn.Module):
             else False
         )
 
+        # Optional fixed scalar scale on the network (short-range) energy output
+        # (MACE ScaleShiftMACE-style rms_forces_scaling). OFF by default -> registered as a
+        # None buffer, which is EXCLUDED from state_dict (old checkpoints load unchanged with
+        # strict=True) and the forward path stays byte-identical. When ON: E_sr = scale * readout,
+        # so forces scale by the same factor. Equivariance-safe (scalar prefactor on an
+        # O(3)-invariant energy); E0 is added afterward (outside the model) and is NOT scaled.
+        self.energy_output_scale_enabled = bool(energy_output_scale_enabled)
+        if self.energy_output_scale_enabled:
+            # Store at full (float64) precision; cast to the compute dtype at use in forward.
+            # (Storing in the default float32 would round the scale and perturb energies ~1e-8.)
+            self.register_buffer(
+                "energy_output_scale",
+                torch.tensor(float(energy_output_scale), dtype=torch.float64),
+            )
+        else:
+            self.register_buffer("energy_output_scale", None)
+
     def _readout_head_scale(self, index: int, ref: torch.Tensor) -> torch.Tensor:
         if self.readout_head_scales is None:
             # new_zeros(()) is a device memset (no host->device copy) so this stays
@@ -2115,7 +2182,7 @@ class PureCartesianICTDFix(nn.Module):
         return _so3_block_rmsnorm(
             g_mix,
             int(channels),
-            self.lmax,
+            self.ictd_fix_gmix_output_lmax,
             self.gmix_block_rmsnorm_gamma,
         )
 
@@ -2278,6 +2345,13 @@ class PureCartesianICTDFix(nn.Module):
             combined_features = torch.cat([combined_features, g_mix], dim=-1)
 
         out = total_energy.sum(dim=-1, keepdim=True)
+
+        # Optional fixed scalar force-RMS scale on the short-range energy (MACE-style).
+        # None when disabled -> byte-identical (no multiply). Applied BEFORE the long-range
+        # add so it scales only the network/interaction energy (E0 and the long-range term
+        # stay unscaled, matching ScaleShiftMACE where scale multiplies the interaction energy).
+        if self.energy_output_scale is not None:
+            out = out * self.energy_output_scale.to(dtype=out.dtype, device=out.device)
 
         # --- long-range additive term (skipped entirely when module is None) ---
         reciprocal_source = None

@@ -62,7 +62,13 @@ def _right_action_matrices(rotation: torch.Tensor, lmax: int) -> list[torch.Tens
     return [torch.linalg.lstsq(y[l], y_rot[l]).solution.contiguous() for l in range(lmax + 1)]
 
 
-def _small_fix_model(*, route: str, readout_head_scale_trainable: bool = False) -> PureCartesianICTDFix:
+def _small_fix_model(
+    *,
+    route: str,
+    readout_head_scale_trainable: bool = False,
+    lmax: int = 1,
+    gmix_output_lmax: int | None = None,
+) -> PureCartesianICTDFix:
     return PureCartesianICTDFix(
         max_embed_radius=4.0,
         main_max_radius=4.0,
@@ -80,12 +86,13 @@ def _small_fix_model(*, route: str, readout_head_scale_trainable: bool = False) 
         num_layers=1,
         num_interaction=2,
         function_type_main="bessel",
-        lmax=1,
+        lmax=lmax,
         ictd_fix_route=route,
         ictd_fix_product_backend="ictd-pure-u",
         ictd_fix_fusion_scale_init=1.0,
         ictd_fix_fusion_heads=1,
         ictd_fix_readout_head_scale_trainable=readout_head_scale_trainable,
+        ictd_fix_gmix_output_lmax=gmix_output_lmax,
         save_contraction_order=2,
         avg_num_neighbors=4.0,
     ).to(dtype=torch.float64)
@@ -147,6 +154,83 @@ def test_fusion_mix_output_is_so3_equivariant_after_layer_state_concat_fix() -> 
     for l in range(model.lmax + 1):
         expected = torch.matmul(blocks[l], d_mats[l])
         torch.testing.assert_close(blocks_rot[l], expected, atol=1.0e-8, rtol=1.0e-8)
+
+
+def test_gmix_output_lmax_default_matches_lmax_byte_identical() -> None:
+    """gmix_output_lmax=None resolves to lmax => byte-identical to gmix_output_lmax=lmax."""
+    torch.manual_seed(7)
+    m_default = _small_fix_model(route="fusion", lmax=1, gmix_output_lmax=None)
+    torch.manual_seed(7)
+    m_explicit = _small_fix_model(route="fusion", lmax=1, gmix_output_lmax=1)
+    assert m_default.ictd_fix_gmix_output_lmax == 1
+    assert m_default.multiple_contraction_mix.output_lmax == 1
+    graph = _toy_graph()
+    pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell = graph
+    with torch.no_grad():
+        e_d = m_default(pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+        e_e = m_explicit(pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+    torch.testing.assert_close(e_d, e_e, atol=0.0, rtol=0.0)
+
+
+def _check_gmix_higher_output_lmax(lmax: int, gmix_output_lmax: int) -> None:
+    """gmix contraction emitting output_lmax > input lmax must be (a) non-trivial at the
+    new l, (b) SO(3)-equivariant per block, (c) energy-invariant + force-covariant end-to-end."""
+    assert gmix_output_lmax > lmax
+    torch.manual_seed(11)
+    model = _small_fix_model(route="fusion", lmax=lmax, gmix_output_lmax=gmix_output_lmax)
+    model.eval()
+    assert model.multiple_contraction_mix.output_lmax == gmix_output_lmax
+
+    captured: list[torch.Tensor] = []
+
+    def capture_g_mix(_module, _inputs, output):
+        captured.append(output.detach())
+
+    graph = _toy_graph()
+    pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell = graph
+    rotation = _random_rotation()
+    d_mats = _right_action_matrices(rotation, gmix_output_lmax)
+
+    handle = model.multiple_contraction_mix.register_forward_hook(capture_g_mix)
+    try:
+        pos_req = pos.detach().clone().requires_grad_(True)
+        energy = model(pos_req, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+        forces = -torch.autograd.grad(energy.sum(), pos_req)[0]
+        g_mix = captured.pop()
+
+        pos_rot = (pos @ rotation.T).detach().clone().requires_grad_(True)
+        energy_rot = model(pos_rot, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+        forces_rot = -torch.autograd.grad(energy_rot.sum(), pos_rot)[0]
+        g_mix_rot = captured.pop()
+    finally:
+        handle.remove()
+
+    for t in (energy, forces, g_mix, energy_rot, forces_rot, g_mix_rot):
+        assert torch.isfinite(t).all()
+
+    channels = model.save_multiple_mix_channels
+    blocks = _split_irreps(g_mix, channels, gmix_output_lmax)
+    blocks_rot = _split_irreps(g_mix_rot, channels, gmix_output_lmax)
+
+    # the new higher-l block actually carries signal (it is doing something)
+    assert blocks[gmix_output_lmax].abs().max().item() > 1.0e-9
+
+    # equivariance of EVERY gmix output block, including the new higher l
+    for l in range(gmix_output_lmax + 1):
+        expected = torch.matmul(blocks[l], d_mats[l])
+        torch.testing.assert_close(blocks_rot[l], expected, atol=1.0e-8, rtol=1.0e-8)
+
+    # end-to-end: energy invariance + force covariance F(pos@R.T) == F(pos) @ R.T
+    torch.testing.assert_close(energy_rot, energy, atol=1.0e-8, rtol=1.0e-8)
+    torch.testing.assert_close(forces_rot, forces @ rotation.T, atol=1.0e-7, rtol=1.0e-7)
+
+
+def test_gmix_output_lmax_l1_to_l2_equivariant_nonzero() -> None:
+    _check_gmix_higher_output_lmax(lmax=1, gmix_output_lmax=2)
+
+
+def test_gmix_output_lmax_l2_to_l3_equivariant_nonzero() -> None:
+    _check_gmix_higher_output_lmax(lmax=2, gmix_output_lmax=3)
 
 
 def test_pure_cartesian_ictd_fix_baseline_route_forward_backward_smoke() -> None:
