@@ -943,6 +943,21 @@ class Trainer:
                 "ictd_fix_gmix_block_rmsnorm",
                 "ictd_fix_gmix_block_rmsnorm_gamma_init",
                 "ictd_fix_fusion_readout_mixed_channels",
+                # Core ictd-fix arch knobs + avg_num_neighbors. These were NOT being saved, so a
+                # reloaded checkpoint fell back to from_checkpoint's defaults -- harmless for the ones
+                # whose defaults happen to match, but avg_num_neighbors is auto-computed from the
+                # training data (a message-normalization constant the weights are trained under) and
+                # is a plain float, not a state_dict buffer -> a wrong value loads SILENTLY. Save them.
+                "ictd_fix_route",
+                "ictd_fix_product_backend",
+                "ictd_fix_fusion_heads",
+                "ictd_fix_fusion_head_weight_mode",
+                "ictd_fix_interaction_attn_heads",
+                "ictd_fix_interaction_scale",
+                "ictd_fix_fusion_scale_init",
+                "ictd_fix_gmix_gate_init",
+                "ictd_fix_gmix_output_lmax",
+                "avg_num_neighbors",
                 "zbl_enabled",
                 "zbl_inner_cutoff",
                 "zbl_outer_cutoff",

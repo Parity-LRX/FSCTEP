@@ -38,6 +38,23 @@ from molecular_force_field.test.bench_ictd_fix_trainstep import build_model, mak
 from molecular_force_field.training.makefx_compile import trace_and_compile_force
 
 
+class _E0Wrap(torch.nn.Module):
+    """Add E0(Z) to the bare model's per-atom energies so the exported .pt2 returns ABSOLUTE energies
+    (a true drop-in for an E0-embedded TorchScript core). E0 is a per-atom constant -> forces are
+    unchanged (its gradient w.r.t. positions is zero)."""
+
+    def __init__(self, model, e0_lut):
+        super().__init__()
+        self.model = model
+        self.register_buffer("e0_lut", e0_lut)
+
+    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+        out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
+        e_atom = out[0] if isinstance(out, tuple) else out
+        e0 = self.e0_lut[A].to(e_atom.dtype).reshape(e_atom.shape)
+        return e_atom + e0
+
+
 def force_compute_fn_factory(model, *, training: bool):
     """compute_fn returning (E_atom, force=-dE/dpos) -- force traced into the graph."""
     def compute_fn(pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
@@ -122,6 +139,14 @@ def main() -> int:
     p.add_argument("--elements", default="H,C,N,O",
                    help="comma-separated element symbols for the checkpoint (from_checkpoint requires element_types; "
                         "the validation graph's species fall back to these if the model can't report its own)")
+    p.add_argument("--avg-num-neighbors", dest="avg_num_neighbors", type=float, default=None,
+                   help="message-normalization constant the weights were trained under (model divides messages "
+                        "by it). For ictd-fix it is auto-computed from the training data and is NOT saved in the "
+                        "checkpoint, so pass the TRAINING value (logged as 'Computed average number of neighbors') "
+                        "or the deployed energies/forces are wrong (from_checkpoint else falls back to 14.38).")
+    p.add_argument("--embed-e0", dest="embed_e0", action="store_true",
+                   help="add E0(Z) atomic reference energies into the exported per-atom energy, so the .pt2 returns "
+                        "ABSOLUTE energy (a drop-in for an E0-embedded TorchScript core). Forces are unaffected.")
     p.add_argument("--out", default="/tmp/fscetp_aoti.pt2")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=5)
@@ -154,11 +179,22 @@ def main() -> int:
         element_types = [s.strip() for s in args.elements.split(",") if s.strip()]
         obj = LAMMPS_MLIAP_MFF.from_checkpoint(
             checkpoint_path=args.checkpoint, element_types=element_types, device=args.device,
+            avg_num_neighbors=args.avg_num_neighbors,
         )
         model = obj.wrapper.model
+        model.skip_input_validation = True  # set on the BARE model (the A.max().item() guard lives here,
+                                            # not on the E0 wrapper) so make_fx tracing stays data-independent
         dtype = next(model.parameters()).dtype  # honor the trained dtype (likely float64)
         species_z = [int(z) for z in (getattr(model, "atomic_numbers", None) or SPECIES) if int(z) > 0] or list(SPECIES)
-        print(f"[aoti] loaded checkpoint {args.checkpoint}  trained_dtype={dtype}  species={species_z}")
+        print(f"[aoti] loaded checkpoint {args.checkpoint}  trained_dtype={dtype}  species={species_z}  "
+              f"avg_num_neighbors={getattr(model, 'avg_num_neighbors', None)}")
+        if args.embed_e0:
+            from molecular_force_field.cli.export_libtorch_core import _e0_lut_from_keys_values
+            aek = obj.wrapper.atomic_energy_keys.detach().cpu()
+            aev = obj.wrapper.atomic_energy_values.detach().cpu()
+            lut = _e0_lut_from_keys_values(aek, aev, dtype=dtype, device=device)
+            model = _E0Wrap(model, lut).to(device=device)
+            print(f"[aoti] embedded E0(Z) for Z={aek.tolist()} -> absolute-energy .pt2")
     else:
         model = build_model(
             channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
