@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 using namespace LAMMPS_NS;
 
@@ -611,13 +612,36 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   // Count edges (upper bound) and build edges + lattice shifts.
   // Reuse persistent buffers to avoid heap allocation every step.
-  // Iterate LOCAL + GHOST centers (REQ_GHOST gives ghost atoms neighbor lists too); ilist has
-  // inum local then gnum ghost entries. Ghosts-as-centers is what gives them correct features.
+  // --- Pick CENTERS: local atoms + ghosts within (mp_depth_-1) hops of a local atom. Only centers
+  // get incoming edges (a center must AGGREGATE to produce a correct deeper-layer feature); ghosts
+  // beyond that are SRC-only NODES -- their layer-0 embedding is all a center needs from them. This
+  // keeps each local atom's full K-hop environment exact while avoiding the edge blow-up (and OOM)
+  // of making EVERY 2x-cutoff halo ghost a center. (REQ_GHOST: ilist is inum local then gnum ghost.)
+  std::vector<char> is_center(static_cast<size_t>(ntotal), 0);
+  std::vector<int> frontier;
+  frontier.reserve(static_cast<size_t>(inum));
+  for (int ii = 0; ii < inum; ii++) { is_center[ilist[ii]] = 1; frontier.push_back(ilist[ii]); }
+  for (int hop = 1; hop < mp_depth_; hop++) {
+    std::vector<int> next;
+    for (int ci : frontier) {
+      const int jn = numneigh[ci];
+      const int *jl = firstneigh[ci];
+      for (int jj = 0; jj < jn; jj++) {
+        const int j = jl[jj] & NEIGHMASK;
+        const double dx = x[j][0] - x[ci][0], dy = x[j][1] - x[ci][1], dz = x[j][2] - x[ci][2];
+        if (dx * dx + dy * dy + dz * dz > cutsq_global_) continue;  // ghosts carry the image -> direct dist
+        if (!is_center[j]) { is_center[j] = 1; next.push_back(j); }
+      }
+    }
+    frontier.swap(next);
+  }
+
+  // Count edges (upper bound), ONLY for centers (non-center ghosts stay src-only nodes).
   const int ncenters = inum + list->gnum;
   int64_t Emax = 0;
   for (int ii = 0; ii < ncenters; ii++) {
-    int i = ilist[ii];
-    Emax += numneigh[i];
+    const int i = ilist[ii];
+    if (is_center[i]) Emax += numneigh[i];
   }
   buf_edge_src_cpu_.clear();
   buf_edge_dst_cpu_.clear();
@@ -628,6 +652,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   for (int ii = 0; ii < ncenters; ii++) {
     int i = ilist[ii];
+    if (!is_center[i]) continue;   // only centers get incoming edges; non-center ghosts are src-only
     int jnum = numneigh[i];
     int *jlist = firstneigh[i];
     for (int jj = 0; jj < jnum; jj++) {
