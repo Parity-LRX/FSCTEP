@@ -927,6 +927,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         num_interaction: Optional[int] = None,
         ictd_tp_path_policy: Optional[str] = None,
         ictd_tp_max_rank_other: Optional[int] = None,
+        avg_num_neighbors: Optional[float] = None,
         torchscript: bool = False,
         force_naive: bool = False,
     ) -> "LAMMPS_MLIAP_MFF":
@@ -1111,6 +1112,36 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             else:
                 inferred_fusion_heads = 1
                 inferred_head_mode = "softmax"
+            # Equivariant neighbor-attention (commit 1319eba) is opt-in and post-dates the original
+            # from_checkpoint wiring; without reconstructing it, strict load fails on the attn_* keys.
+            # Prefer the saved hyperparameter, else infer the head count from attn_z_bias_raw's length
+            # (per-layer shape [H]). Defaults to 0 -> no attention modules (unchanged for old ckpts).
+            inferred_attn_heads = int(
+                ckpt.get("ictd_fix_interaction_attn_heads")
+                or arch_meta.get("ictd_fix_interaction_attn_heads")
+                or (selected_state_dict["interactions.0.attn_z_bias_raw"].numel()
+                    if "interactions.0.attn_z_bias_raw" in selected_state_dict else 0)
+            )
+            # avg_num_neighbors normalizes the messages (model divides by it, pure_cartesian_ictd_fix
+            # ~line 1666) so the weights are trained UNDER it -- but it is a plain Python float, NOT a
+            # state_dict buffer, so a wrong value loads SILENTLY (strict load can't catch it). For
+            # ictd-fix it is auto-computed from the training data, so the legacy 14.38 fallback is
+            # almost always wrong. Require it (explicit arg > ckpt > arch_meta), else warn loudly.
+            resolved_avg_nn = avg_num_neighbors
+            if resolved_avg_nn is None:
+                resolved_avg_nn = ckpt.get("avg_num_neighbors") or arch_meta.get("avg_num_neighbors")
+            if resolved_avg_nn is None:
+                import warnings
+                warnings.warn(
+                    "[LAMMPS_MLIAP_MFF] avg_num_neighbors is NOT in the checkpoint and was not passed "
+                    "explicitly; falling back to 14.38. The model divides messages by this constant, so "
+                    "if training used a different (auto-computed) value the deployed energies/forces are "
+                    "WRONG. Pass avg_num_neighbors=<the training value> (logged as 'Computed average "
+                    "number of neighbors').",
+                    RuntimeWarning,
+                )
+                resolved_avg_nn = 14.38
+            resolved_avg_nn = float(resolved_avg_nn)
             atomic_numbers = aek.detach().cpu().to(dtype=torch.long).tolist() if aek is not None else None
             model = PureCartesianICTDFix(
                 max_embed_radius=config.max_radius,
@@ -1205,12 +1236,10 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                         arch_meta.get("ictd_fix_fusion_readout_mixed_channels", False),
                     )
                 ),
+                ictd_fix_interaction_attn_heads=inferred_attn_heads,
                 save_contraction_order=save_contraction_order,
                 save_multiple_mix_channels=save_multiple_mix_channels,
-                avg_num_neighbors=float(
-                    ckpt.get("avg_num_neighbors")
-                    or arch_meta.get("avg_num_neighbors", 14.38)
-                ),
+                avg_num_neighbors=resolved_avg_nn,
                 device=torch.device(device),
                 long_range_mode=long_range_mode,
                 long_range_hidden_dim=long_range_hidden_dim,

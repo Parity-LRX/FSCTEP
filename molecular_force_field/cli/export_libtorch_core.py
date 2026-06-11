@@ -487,6 +487,7 @@ def _export_single_core(
     trace_num_nodes: int | None = None,
     trace_num_edges: int | None = None,
     jit_mode: str = "trace",
+    avg_num_neighbors: Optional[float] = None,
 ) -> dict:
     from molecular_force_field.interfaces.lammps_mliap import (
         LAMMPS_MLIAP_MFF,
@@ -573,6 +574,7 @@ def _export_single_core(
         device=build_device,
         tensor_product_mode=mode,
         num_interaction=num_interaction,
+        avg_num_neighbors=avg_num_neighbors,
         torchscript=False,
         force_naive=force_naive,
     )
@@ -788,6 +790,7 @@ def export_core(
     bundle_out: str | None = None,
     trace_buckets: str | None = None,
     jit_mode: str | None = None,
+    avg_num_neighbors: Optional[float] = None,
 ) -> None:
     ckpt_peek = torch.load(checkpoint, map_location="cpu", weights_only=False)
     mode = tensor_product_mode if tensor_product_mode is not None else ckpt_peek.get("tensor_product_mode", None)
@@ -823,6 +826,7 @@ def export_core(
             trace_num_nodes=trace_num_nodes,
             trace_num_edges=trace_num_edges,
             jit_mode=effective_jit_mode,
+            avg_num_neighbors=avg_num_neighbors,
         )
         return
 
@@ -854,6 +858,7 @@ def export_core(
             trace_num_nodes=nodes,
             trace_num_edges=edges,
             jit_mode=effective_jit_mode,
+            avg_num_neighbors=avg_num_neighbors,
         )
         bucket_entries.append(
             {
@@ -934,6 +939,11 @@ def main() -> None:
                    help="Export mode. Default: hybrid for spherical-save-cue with --native-ops and for pure-cartesian-ictd / pure-cartesian-ictd-o3 / pure-cartesian-ictd-save / pure-cartesian-ictd-save-o3 / pure-cartesian-ictd-fix; else trace. "
                         "Also applies to pure-cartesian-ictd-save-multiple. "
                         "hybrid scripts an export-only wrapper around the traced numeric core.")
+    p.add_argument("--avg-num-neighbors", dest="avg_num_neighbors", type=float, default=None,
+                   help="message-normalization constant the weights were trained under. For ictd-fix it is "
+                        "auto-computed from the training data and NOT saved in the checkpoint, so pass the TRAINING "
+                        "value (logged as 'Computed average number of neighbors') or the deployed energies/forces "
+                        "are wrong (from_checkpoint else falls back to 14.38).")
     p.add_argument("--out", type=str, default="core.pt", help="Output TorchScript file path")
     args = p.parse_args()
 
@@ -959,6 +969,7 @@ def main() -> None:
         bundle_out=args.bundle_out,
         trace_buckets=args.trace_buckets,
         jit_mode=(str(args.jit_mode) if args.jit_mode is not None else None),
+        avg_num_neighbors=(float(args.avg_num_neighbors) if args.avg_num_neighbors is not None else None),
     )
 
 

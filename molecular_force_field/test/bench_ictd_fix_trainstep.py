@@ -59,6 +59,7 @@ def build_model(
     dtype: torch.dtype,
     device: torch.device,
     correlation: int = 2,
+    attn_heads: int = 0,
     **extra,
 ) -> PureCartesianICTDFix:
     cfg = ModelConfig(dtype=dtype)
@@ -87,6 +88,7 @@ def build_model(
         ictd_fix_product_backend=product_backend,
         ictd_fix_fusion_scale_init=1.0,
         ictd_fix_fusion_heads=1,
+        ictd_fix_interaction_attn_heads=attn_heads,
         save_contraction_order=correlation,
         avg_num_neighbors=float(24),
         internal_compute_dtype=dtype,
@@ -176,7 +178,7 @@ def run_check(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-        correlation=args.contraction_order,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
     )
     model.eval()
     graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
@@ -287,7 +289,7 @@ def run_bench(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-        correlation=args.contraction_order,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
     )
     model.train()
     graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
@@ -406,7 +408,7 @@ def run_cudagraph(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-        correlation=args.contraction_order,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
     )
     model.eval()
     model.skip_input_validation = True  # remove host syncs so forward is capturable
@@ -539,7 +541,7 @@ def run_cudagraph_train(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-        correlation=args.contraction_order,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
     )
     model.train()
     model.skip_input_validation = True
@@ -658,7 +660,7 @@ def run_compile(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-        correlation=args.contraction_order,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
     )
     model.eval()
     model.skip_input_validation = True
@@ -792,6 +794,156 @@ def run_compile(args) -> int:
     return 0 if ok else 1
 
 
+def run_makefx(args) -> int:
+    """make_fx-compile route: flatten the forward + inner force-autograd into one
+    FX graph (so dE/dx is ordinary ops, not a hidden autograd call), then
+    torch.compile it -- letting Inductor do a single ordinary backward over the
+    flat graph for the optimizer step, sidestepping the second-order limit that
+    blocks a direct torch.compile of the train step.
+
+    Gates numerics (loss / forces / param-grads) + equivariance vs eager, then
+    times it. On CPU (or --makefx-no-compile) it skips Inductor and validates
+    only the flatten+strip+rebuild stages -- this proves param-grad connectivity
+    and detach-strip correctness without a GPU."""
+    from molecular_force_field.training.makefx_compile import trace_and_compile_force
+
+    device = torch.device(args.device)
+    dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    do_compile = (device.type == "cuda") and (not args.makefx_no_compile)
+    if do_compile:
+        import torch._dynamo as dynamo
+        dynamo.config.cache_size_limit = 256
+        torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+        torch.backends.cudnn.allow_tf32 = bool(args.tf32)
+    torch.manual_seed(0)
+    model = build_model(
+        channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
+        route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
+    )
+    model.eval()
+    model.skip_input_validation = True
+    graph = make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device)
+    base_pos = graph[0].detach().clone()
+    rest = tuple(graph[1:])
+    example_inputs = (base_pos,) + rest
+    f_tgt = torch.zeros(args.atoms, 3, device=device, dtype=dtype)
+    e_tgt = torch.zeros((), device=device, dtype=dtype)
+    fw = 10.0
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    print(f"[makefx] device={device} dtype={dtype} atoms={args.atoms} edges={args.atoms*args.degree} "
+          f"channels={args.channels} lmax={args.lmax} L={args.num_interaction} route={args.route} "
+          f"attn_heads={args.attn_heads} compile={do_compile}")
+    if device.type == "cuda":
+        print(f"[makefx] gpu={torch.cuda.get_device_name(0)} torch={torch.__version__} cuda={torch.version.cuda}")
+
+    def loss_from(energy, forces):
+        return (energy - e_tgt) ** 2 + fw * ((forces - f_tgt) ** 2).mean()
+
+    def eager_compute(pos_base):
+        pos = pos_base.detach().clone().requires_grad_(True)
+        e_atom = forward_energy_atom(model, pos, (pos,) + rest)
+        energy = e_atom.sum()
+        grad = torch.autograd.grad(energy, pos, create_graph=True)[0]
+        return energy, -grad
+
+    # ---- eager reference (numbers + param grads) ----
+    for p in params:
+        p.grad = None
+    e_ref, f_ref = eager_compute(base_pos)
+    loss_ref = loss_from(e_ref, f_ref)
+    loss_ref.backward()
+    grads_ref = _flat_grads(params).clone()
+    f_ref = f_ref.detach().clone()
+    loss_ref_v = loss_ref.detach().clone()
+
+    # ---- build the make_fx (compiled or flattened) callable ----
+    try:
+        compute = trace_and_compile_force(
+            model, example_inputs, training=True, do_compile=do_compile,
+        )
+    except Exception as ex:
+        import traceback
+        print(f"[makefx] TRACE/COMPILE FAILED: {type(ex).__name__}: {ex}")
+        traceback.print_exc()
+        return 1
+
+    def makefx_step(pos_base):
+        for p in params:
+            p.grad = None
+        energy, forces = compute(pos_base, *rest)
+        loss = loss_from(energy, forces)
+        loss.backward()
+        return loss.detach().clone(), forces.detach().clone()
+
+    # warm up (compilation lands on the first call when do_compile)
+    try:
+        loss_c, forces_c = makefx_step(base_pos)
+    except Exception as ex:
+        import traceback
+        print(f"[makefx] COMPILED STEP FAILED: {type(ex).__name__}: {ex}")
+        traceback.print_exc()
+        return 1
+    grads_c = _flat_grads(params).clone()
+
+    # ---- numerics vs eager ----
+    dloss = (loss_c - loss_ref_v).abs().item()
+    rloss = dloss / (loss_ref_v.abs().item() + 1e-30)
+    dforce = (forces_c - f_ref).abs().max().item()
+    fscale = f_ref.abs().max().item()
+    dgrad = (grads_c - grads_ref).abs().max().item()
+    gscale = grads_ref.abs().max().item()
+    rgrad = dgrad / (gscale + 1e-30)
+    gnz = grads_c.abs().max().item()
+    print(f"[makefx] loss eager={loss_ref_v.item():.8e} makefx={loss_c.item():.8e} rel={rloss:.3e}")
+    print(f"[makefx] forces max|d|={dforce:.3e} scale={fscale:.3e} rel={dforce/(fscale+1e-30):.3e}")
+    print(f"[makefx] param-grads max|d|={dgrad:.3e} scale={gscale:.3e} rel={rgrad:.3e} "
+          f"(makefx grad absmax={gnz:.3e}, n={grads_ref.numel()})")
+    if gnz <= 0.0:
+        print("[makefx] WARNING: make_fx param grads are all ZERO -> detach strip likely severed "
+              "the force-loss -> theta path. NUMERICAL-MATCH would be a false pass.")
+    tol = 1e-9 if dtype == torch.float64 else 3e-3
+    ok = (rloss <= tol) and (rgrad <= tol) and (gnz > 0.0)
+    print(f"[makefx] NUMERICAL-MATCH {'PASS' if ok else 'FAIL'} (rel tol={tol:.1e})")
+
+    # ---- equivariance: rotate inputs, energy invariant + forces covariant ----
+    if dtype == torch.float64:
+        R = random_rotation(dtype=dtype).to(device)
+        pos_rot = base_pos @ R.T
+        e_c0, f_c0 = compute(base_pos, *rest)
+        e_cR, f_cR = compute(pos_rot, *rest)
+        e_err = (e_cR - e_c0).abs().item()
+        f_cov_err = (f_cR - f_c0 @ R.T).abs().max().item()
+        f_sc = f_c0.abs().max().item()
+        etol = 1e-8 * max(1.0, abs(e_c0.item()))
+        ftol = 1e-8 * max(1.0, f_sc)
+        eq_ok = (e_err <= etol) and (f_cov_err <= ftol)
+        print(f"[makefx] equivariance |E(Rx)-E(x)|={e_err:.3e} |F(Rx)-F(x)R^T|_inf={f_cov_err:.3e} "
+              f"{'PASS' if eq_ok else 'FAIL'}")
+        ok = ok and eq_ok
+
+    # ---- timing (only when actually compiled) ----
+    if do_compile:
+        def eager_step():
+            for p in params:
+                p.grad = None
+            e_, f_ = eager_compute(base_pos)
+            loss_from(e_, f_).backward()
+        torch.cuda.reset_peak_memory_stats()
+        t_eager = _time_section(eager_step, device=device, iters=args.iters, warmup=args.warmup, label="eager")
+        mem_eager = torch.cuda.max_memory_allocated() / 1e9
+        torch.cuda.reset_peak_memory_stats()
+        t_mfx = _time_section(lambda: makefx_step(base_pos), device=device, iters=args.iters, warmup=args.warmup, label="makefx")
+        mem_mfx = torch.cuda.max_memory_allocated() / 1e9
+        print(f"[makefx] eager full step : {t_eager:8.3f} ms")
+        print(f"[makefx] makefx step     : {t_mfx:8.3f} ms")
+        print(f"[makefx] SPEEDUP         : {t_eager / max(t_mfx,1e-9):6.2f}x  (steady-state median, compile excluded)")
+        print(f"[makefx] peak CUDA mem   : eager={mem_eager:.2f} GB  makefx={mem_mfx:.2f} GB  "
+              f"ratio={mem_mfx / max(mem_eager, 1e-9):.2f}x")
+    return 0 if ok else 1
+
+
 def run_func(args) -> int:
     """Compute the training-step gradients via torch.func (functional VJP) instead
     of the autograd engine. forces = -func.grad(E, pos); param grads = func.grad of
@@ -815,7 +967,7 @@ def run_func(args) -> int:
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
         route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-        correlation=args.contraction_order,
+        correlation=args.contraction_order, attn_heads=args.attn_heads,
     )
     model.eval()
     model.skip_input_validation = True
@@ -963,6 +1115,8 @@ def main() -> int:
     p.add_argument("--compiled-autograd", action="store_true", help="compile the backward via compiled-autograd")
     p.add_argument("--compile-mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--tf32", action="store_true", help="allow TF32 matmul (changes numerics)")
+    p.add_argument("--makefx", action="store_true", help="make_fx-flatten the forward+force-autograd then torch.compile it (second-order via flat backward); compare+time")
+    p.add_argument("--makefx-no-compile", dest="makefx_no_compile", action="store_true", help="with --makefx: skip Inductor, validate only the flatten+strip+rebuild stages vs eager (CPU-friendly)")
     p.add_argument("--func", action="store_true", help="compute train-step grads via torch.func (functional VJP); compare+time")
     p.add_argument("--paths", action="store_true", help="print ICTD-U symmetric-contraction path counts per degree (no model build / no CUDA)")
     p.add_argument("--compile-func", action="store_true", help="torch.compile the torch.func double-grad")
@@ -979,6 +1133,9 @@ def main() -> int:
                    help="symmetric-contraction correlation/body-order (degree). 3=production default; "
                         "2=cheaper (back in fused_tp's bilinear zone, far fewer paths)")
     p.add_argument("--route", default="baseline", choices=["baseline", "fusion"])
+    p.add_argument("--attn-heads", dest="attn_heads", type=int, default=0,
+                   help="interaction neighbor-attention heads (0=off; trainer flag "
+                        "--ictd-fix-interaction-attn-heads)")
     p.add_argument("--product-backend", default="ictd-pure-u")
     p.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     p.add_argument("--iters", type=int, default=20)
@@ -990,7 +1147,7 @@ def main() -> int:
     p.add_argument("--compare-ref", default=None)
     args = p.parse_args()
 
-    if not (args.check or args.bench or args.cudagraph or args.cudagraph_train or args.do_compile or args.func or args.paths):
+    if not (args.check or args.bench or args.cudagraph or args.cudagraph_train or args.do_compile or args.func or args.paths or args.makefx):
         args.check = True
 
     rc = 0
@@ -1008,6 +1165,8 @@ def main() -> int:
         rc |= run_compile(args)
     if args.func:
         rc |= run_func(args)
+    if args.makefx:
+        rc |= run_makefx(args)
     return rc
 
 

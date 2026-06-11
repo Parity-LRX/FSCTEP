@@ -1,6 +1,7 @@
 #include "pair_mff_torch.h"
 
 #include "atom.h"
+#include "comm.h"
 #include "domain.h"
 #include "error.h"
 #include "force.h"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 using namespace LAMMPS_NS;
 
@@ -289,8 +291,16 @@ void PairMFFTorch::coeff(int narg, char **arg) {
 void PairMFFTorch::init_style() {
   if (core_pt_path_.empty()) error->all(FLERR, "pair_coeff for mff/torch must specify core.pt path");
 
-  // Request a full neighbor list.
-  neighbor->add_request(this, NeighConst::REQ_FULL);
+  // A num_interaction-layer message-passing model needs each LOCAL atom's full K-hop environment.
+  // We get it WITHOUT per-layer communication by (1) requesting a GHOST neighbor list so ghost atoms
+  // are also graph centers (with their own edges -> correct features), and (2) extending the ghost
+  // halo to mp_depth_*cutoff so every local atom's K-hop neighbours are present as ghosts. The model
+  // runs on the full local+ghost halo graph and we keep only the LOCAL atom energies/forces. This is
+  // correct under MPI domain decomposition -- unlike folding ghosts to a local owner (atom->map),
+  // which only works on a single subdomain because a boundary ghost's owner lives on another rank.
+  neighbor->add_request(this, NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
+  const double halo = static_cast<double>(mp_depth_) * cut_global_;
+  if (comm->cutghostuser < halo) comm->cutghostuser = halo;
 
   try {
     if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
@@ -602,10 +612,36 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   // Count edges (upper bound) and build edges + lattice shifts.
   // Reuse persistent buffers to avoid heap allocation every step.
+  // --- Pick CENTERS: local atoms + ghosts within (mp_depth_-1) hops of a local atom. Only centers
+  // get incoming edges (a center must AGGREGATE to produce a correct deeper-layer feature); ghosts
+  // beyond that are SRC-only NODES -- their layer-0 embedding is all a center needs from them. This
+  // keeps each local atom's full K-hop environment exact while avoiding the edge blow-up (and OOM)
+  // of making EVERY 2x-cutoff halo ghost a center. (REQ_GHOST: ilist is inum local then gnum ghost.)
+  std::vector<char> is_center(static_cast<size_t>(ntotal), 0);
+  std::vector<int> frontier;
+  frontier.reserve(static_cast<size_t>(inum));
+  for (int ii = 0; ii < inum; ii++) { is_center[ilist[ii]] = 1; frontier.push_back(ilist[ii]); }
+  for (int hop = 1; hop < mp_depth_; hop++) {
+    std::vector<int> next;
+    for (int ci : frontier) {
+      const int jn = numneigh[ci];
+      const int *jl = firstneigh[ci];
+      for (int jj = 0; jj < jn; jj++) {
+        const int j = jl[jj] & NEIGHMASK;
+        const double dx = x[j][0] - x[ci][0], dy = x[j][1] - x[ci][1], dz = x[j][2] - x[ci][2];
+        if (dx * dx + dy * dy + dz * dz > cutsq_global_) continue;  // ghosts carry the image -> direct dist
+        if (!is_center[j]) { is_center[j] = 1; next.push_back(j); }
+      }
+    }
+    frontier.swap(next);
+  }
+
+  // Count edges (upper bound), ONLY for centers (non-center ghosts stay src-only nodes).
+  const int ncenters = inum + list->gnum;
   int64_t Emax = 0;
-  for (int ii = 0; ii < inum; ii++) {
-    int i = ilist[ii];
-    Emax += numneigh[i];
+  for (int ii = 0; ii < ncenters; ii++) {
+    const int i = ilist[ii];
+    if (is_center[i]) Emax += numneigh[i];
   }
   buf_edge_src_cpu_.clear();
   buf_edge_dst_cpu_.clear();
@@ -614,8 +650,9 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   buf_edge_dst_cpu_.reserve(static_cast<size_t>(Emax));
   buf_edge_shifts_cpu_.reserve(static_cast<size_t>(Emax) * 3);
 
-  for (int ii = 0; ii < inum; ii++) {
+  for (int ii = 0; ii < ncenters; ii++) {
     int i = ilist[ii];
+    if (!is_center[i]) continue;   // only centers get incoming edges; non-center ghosts are src-only
     int jnum = numneigh[i];
     int *jlist = firstneigh[i];
     for (int jj = 0; jj < jnum; jj++) {
@@ -638,11 +675,18 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       const double rsq = delx * delx + dely * dely + delz * delz;
       if (rsq > cutsq_global_) continue;
 
-      buf_edge_src_cpu_.push_back(static_cast<int64_t>(i));
-      buf_edge_dst_cpu_.push_back(static_cast<int64_t>(j));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(sx));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(sy));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(sz));
+      // Edge: neighbor j -> center i (the model puts edge features on edge_src and scatters into
+      // edge_dst, so the CENTER must be the dst). j keeps its (possibly ghost) index -- ghosts are
+      // real graph nodes here, with their own edges, so their features are correct. edge_vec =
+      // x[i]-x[j]+shift@cell; the ghost already carries the periodic image (min-image sx==0 in the
+      // halo), so shift = -(sx,sy,sz) is the robust value (0 for ghost edges). This is the convention
+      // the model was trained with (center aggregates neighbours) and is correct under MPI domain
+      // decomposition because j's features come from j-as-a-center, not from a cross-rank owner.
+      buf_edge_src_cpu_.push_back(static_cast<int64_t>(j));
+      buf_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sx));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sy));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sz));
     }
   }
 

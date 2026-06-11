@@ -316,6 +316,18 @@ class H5Dataset(Dataset):
         extra_label_paths: Dict[str, str] | None = None,
         # Optional: per-node label file (HDF5 with sample_0, sample_1, ... each with charge_per_atom etc.)
         extra_per_node_label_path: str | None = None,
+        # Pad each frame's edge list to a fixed E_max with out-of-cutoff dummy edges, so every
+        # batch has a FIXED shape (enables CUDA-graph / fixed-shape compiled-autograd). The dummies
+        # are zeroed by the model's edge_mask (edge_length<=max_radius) -> numerically a no-op.
+        pad_edges_to_max: bool = False,
+        # Pad each frame's ATOM count to a fixed N_max with dummy atoms (zero force, energy zeroed
+        # by atom_mask). The dummies carry no edges (the precomputed edge list never references
+        # them), so they get only a species embedding -> coord-independent energy -> zero force,
+        # and real atoms are unaffected. Combined with pad_edges_to_max this fixes the WHOLE graph
+        # shape, so make_fx-compile traces ONE graph for any batch / batch-size / system size
+        # (the per-N cache collapses to a single slot). atom_mask is emitted per node for the
+        # trainer to zero dummy energy + exclude dummies from the loss denominators.
+        pad_nodes_to_max: bool = False,
     ):
         """
         Initialize H5 dataset.
@@ -338,8 +350,19 @@ class H5Dataset(Dataset):
                 f"Please run 'mff-preprocess' first to generate the required data files."
             )
         
+        self.pad_edges_to_max = bool(pad_edges_to_max)
+        self.pad_nodes_to_max = bool(pad_nodes_to_max)
         with h5py.File(self.file_path, 'r') as f:
             self.num_samples = len(f.keys())
+            # E_max for fixed-shape edge padding: prefer the preprocess-summarized attr, else
+            # (datasets made before this feature) scan the per-frame edge lengths once at load.
+            self.max_edges = int(f.attrs.get('max_edges', 0))
+            if self.pad_edges_to_max and self.max_edges <= 0:
+                self.max_edges = max((int(f[k]['edge_src'].shape[0]) for k in f.keys()), default=0)
+            # N_max for fixed-shape node padding (same high-water-mark pattern as max_edges).
+            self.max_atoms = int(f.attrs.get('max_atoms', 0))
+            if self.pad_nodes_to_max and self.max_atoms <= 0:
+                self.max_atoms = max((int(f[k]['pos'].shape[0]) for k in f.keys()), default=0)
 
         self._extra_labels: Dict[str, torch.Tensor] = {}
         if extra_label_paths:
@@ -414,6 +437,19 @@ class H5Dataset(Dataset):
             'cell': torch.from_numpy(g['cell'][:]).double(),
             'stress': stress,
         }
+        if self.pad_edges_to_max:
+            E = int(out['edge_src'].shape[0])
+            target = max(self.max_edges, E)  # never truncate; an over-E_max frame just grows the shape
+            if target > E:
+                npad = target - E
+                z = torch.zeros(npad, dtype=torch.long)
+                out['edge_src'] = torch.cat([out['edge_src'], z])
+                out['edge_dst'] = torch.cat([out['edge_dst'], z])
+                # dummy edges src=dst=0 with a huge fractional shift: |edge|=shift*cell >> max_radius
+                # -> zeroed by the model's edge_mask (edge_length<=max_radius); numerically a no-op.
+                pad_shift = torch.zeros(npad, 3, dtype=torch.float64)
+                pad_shift[:, 0] = 1.0e3
+                out['edge_shifts'] = torch.cat([out['edge_shifts'], pad_shift], dim=0)
         # Prefer in-H5 datasets when present, else fall back to extra_label_paths.
         for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in g:
@@ -436,6 +472,28 @@ class H5Dataset(Dataset):
                 out[k] = torch.from_numpy(g[k][:]).double()
             elif hasattr(self, "_extra_per_node") and k in self._extra_per_node:
                 out[k] = self._extra_per_node[k][idx]
+        if self.pad_nodes_to_max:
+            N = int(out['pos'].shape[0])
+            targetN = max(self.max_atoms, N)  # never truncate; an over-N_max frame just grows the shape
+            atom_mask = torch.ones(N, dtype=torch.float64)
+            if targetN > N:
+                npad = targetN - N
+                # Dummy atoms: the precomputed edge list (loaded above) never references indices
+                # >= N, so they carry no edges -> only a species embedding -> coord-independent
+                # energy (zeroed by atom_mask) -> zero force; real atoms are untouched. pos value
+                # is irrelevant (no edges use it); species copies a real one (any valid id works).
+                out['pos'] = torch.cat([out['pos'], out['pos'].new_zeros(npad, 3)], dim=0)
+                pad_A = out['A'][:1].expand(npad).clone() if N > 0 else out['A'].new_zeros(npad)
+                out['A'] = torch.cat([out['A'], pad_A], dim=0)
+                out['force'] = torch.cat([out['force'], out['force'].new_zeros(npad, 3)], dim=0)
+                atom_mask = torch.cat([atom_mask, torch.zeros(npad, dtype=torch.float64)], dim=0)
+                for k in (
+                    "charge_per_atom", "dipole_per_atom", "magnetic_moment_per_atom",
+                    "polarizability_per_atom", "quadrupole_per_atom", "born_effective_charge_per_atom",
+                ):
+                    if k in out and out[k] is not None:
+                        out[k] = torch.cat([out[k], out[k].new_zeros((npad,) + tuple(out[k].shape[1:]))], dim=0)
+            out['atom_mask'] = atom_mask
         return out
 
 

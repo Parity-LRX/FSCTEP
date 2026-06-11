@@ -18,7 +18,7 @@ from molecular_force_field.models.ictd_irreps import (
     direction_harmonics_all,
     ictd_u_matrix_so3,
 )
-from molecular_force_field.models.radial_basis import mace_radial_embedding
+from molecular_force_field.models.radial_basis import mace_radial_embedding, mace_polynomial_cutoff
 from molecular_force_field.models.pure_cartesian_ictd_layers import (
     EquivariantScalarReadoutSO3,
     SO3BlockRMSNorm,
@@ -1445,6 +1445,7 @@ class ICTDResidualInteractionBlock(nn.Module):
         message_scale_init: list[float] | tuple[float, ...] | None = None,
         sc_scale_init: list[float] | tuple[float, ...] | None = None,
         use_rms_norm: bool = False,
+        interaction_attn_heads: int = 0,
     ):
         super().__init__()
         self.channels = int(channels)
@@ -1529,6 +1530,84 @@ class ICTDResidualInteractionBlock(nn.Module):
             if sc_scale_init is not None
             else nn.Identity()
         )
+        # --- Optional equivariant neighbor-attention scatter (DPA-4/SeZM-style) ---
+        # heads=0 -> plain envelope scatter-sum (byte-identical to before). heads>0 ->
+        # an invariant attention weight per (edge, head): logit = (q[dst].k[src])/sqrt(d)
+        # + radial_bias, computed from the l=0 node scalars (q=dst, k=src); the weights
+        # are env^2-gated zeta-softmax over each dst's incoming edges (smooth at rcut, so
+        # forces stay continuous). The scalar alpha is shared across the 2l+1 m-components
+        # of every l (=> equivariance preserved) and across the head's channels.
+        self.interaction_attn_heads = int(interaction_attn_heads)
+        if self.interaction_attn_heads > 0:
+            if self.channels % self.interaction_attn_heads != 0:
+                raise ValueError(
+                    f"channels ({self.channels}) must be divisible by interaction_attn_heads ({self.interaction_attn_heads})"
+                )
+            self.attn_head_dim = self.channels // self.interaction_attn_heads
+            self.attn_qk_norm = nn.LayerNorm(self.channels)
+            self.attn_q_proj = nn.Linear(self.channels, self.channels, bias=False)
+            self.attn_k_proj = nn.Linear(self.channels, self.channels, bias=False)
+            self.attn_radial_bias = nn.Linear(self.number_of_basis, self.interaction_attn_heads, bias=False)
+            self.attn_z_bias_raw = nn.Parameter(torch.zeros(self.interaction_attn_heads))
+            # DPA-4-style gentle start: a learnable per-(head, head_channel) weight on the
+            # q*k product (replaces the fixed 1/sqrt(d) scale), init tiny so the content
+            # logit ~= 0 at init; together with zero-init radial_bias the whole logit starts
+            # at 0 => alpha = pure env^2-weighted average (no content "neighbor picking" yet),
+            # and the content/distance attention ramps in gradually as these weights grow.
+            self.attn_logit_w = nn.Parameter(
+                torch.empty(self.interaction_attn_heads, self.attn_head_dim)
+            )
+            nn.init.normal_(self.attn_logit_w, mean=0.0, std=0.01)
+            nn.init.zeros_(self.attn_radial_bias.weight)
+        else:
+            self.attn_head_dim = 0
+            self.attn_qk_norm = None
+            self.attn_q_proj = None
+            self.attn_k_proj = None
+            self.attn_radial_bias = None
+            self.attn_z_bias_raw = None
+            self.attn_logit_w = None
+
+    def _attention_alpha(
+        self,
+        node_feats_l0: torch.Tensor,
+        edge_feats: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_env: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """Invariant env^2-gated zeta-softmax attention weight, shape (E, H).
+
+        node_feats_l0: (N, channels) l=0 scalar block. edge_env: (E,) cutoff envelope.
+        Destination-wise (over each dst's incoming edges):
+            alpha_ij = env_ij^2 exp(logit_ij) / (zeta_h + sum_k env_ik^2 exp(logit_ik))
+        with logit = (q[dst].k[src])/sqrt(d) + radial_bias and zeta = softplus(z_bias_raw).
+        env^2 -> 0 at rcut + the unnormalized (zeta) denominator keep forces smooth."""
+        H = self.interaction_attn_heads
+        d = self.attn_head_dim
+        qk = self.attn_qk_norm(node_feats_l0)
+        q = self.attn_q_proj(qk).reshape(-1, H, d)
+        k = self.attn_k_proj(qk).reshape(-1, H, d)
+        # learnable per-(head, channel) weight on q*k (replaces fixed 1/sqrt(d)); init ~0
+        # so the content logit starts at 0 and ramps in (DPA-4-style gentle start).
+        logit = (q[edge_dst] * k[edge_src] * self.attn_logit_w).sum(-1)  # (E, H)
+        logit = logit + self.attn_radial_bias(edge_feats)  # (E, H); radial_bias zero-init
+        env2 = edge_env.reshape(-1, 1).to(dtype=logit.dtype).clamp_min(0.0).square()  # (E, 1)
+        # group max over dst's edges, floored at 0 (the zeta term sits at logit 0) for
+        # overflow-free exp shifts: exp(logit-gmax)<=exp(0)=1 and exp(-gmax)<=1.
+        # per-dst max over incoming logits (softmax stability shift). Use torch-native
+        # scatter_reduce(amax) which returns ONLY values -- torch_scatter's scatter_max returns a
+        # non-differentiable argmax that breaks compiled-autograd (non_differentiable assert) AND
+        # CUDA-graph capture. Numerically identical (same max). clamp_min(0): the zeta term sits at 0.
+        gmax = logit.new_zeros(num_nodes, H).scatter_reduce_(
+            0, edge_dst.unsqueeze(-1).expand(-1, H), logit, reduce="amax", include_self=False
+        ).clamp_min(0.0)  # (N, H)
+        ex = env2 * torch.exp(logit - gmax[edge_dst])  # (E, H)
+        denom = scatter(ex, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")  # (N, H)
+        zeta = F.softplus(self.attn_z_bias_raw).reshape(1, H).to(dtype=logit.dtype)
+        denom = denom + zeta * torch.exp(-gmax)  # (N, H)
+        return ex / (denom[edge_dst] + 1e-20)  # (E, H)
 
     def forward(
         self,
@@ -1539,6 +1618,7 @@ class ICTDResidualInteractionBlock(nn.Module):
         edge_feats: torch.Tensor,
         edge_index: torch.Tensor,
         edge_mask: torch.Tensor | None = None,
+        edge_env: torch.Tensor | None = None,
         sync_after_scatter: callable | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         edge_src = edge_index[0]
@@ -1554,18 +1634,36 @@ class ICTDResidualInteractionBlock(nn.Module):
         if edge_mask is not None:
             mask = edge_mask.to(dtype=node_feats.dtype)
             edge_blocks = {l: block * mask.unsqueeze(-1) for l, block in edge_blocks.items()}
-        message_blocks = {
-            l: scatter(edge_blocks[l], edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
-            for l in range(self.target_lmax + 1)
-        }
-        if self.avg_num_neighbors is None:
-            if edge_mask is not None:
-                avg_num_neighbors = float(edge_mask.detach().sum().item()) / float(max(num_nodes, 1))
-            else:
-                avg_num_neighbors = float(edge_src.numel()) / float(max(num_nodes, 1))
+        if self.interaction_attn_heads > 0:
+            if edge_env is None:
+                raise ValueError("interaction_attn_heads > 0 requires edge_env to be passed to forward()")
+            H = self.interaction_attn_heads
+            alpha = self._attention_alpha(
+                x1[0].squeeze(-1), edge_feats, edge_src, edge_dst, edge_env, num_nodes
+            )  # (E, H) invariant env^2-gated zeta-softmax weights
+            a = alpha.reshape(-1, H, 1, 1)
+            message_blocks = {}
+            for l in range(self.target_lmax + 1):
+                eb = edge_blocks[l]  # (E, C_l, 2l+1); C_l = channels * num_paths_l, H | channels => H | C_l
+                e_n, c_l, m = eb.shape
+                eb = (eb.reshape(e_n, H, c_l // H, m) * a).reshape(e_n, c_l, m)
+                message_blocks[l] = scatter(eb, edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
+            # zeta-softmax already normalizes (sum of alpha <= 1); do NOT divide by
+            # avg_num_neighbors (that would double-normalize the attention path).
+            message = self.message_linear(message_blocks)
         else:
-            avg_num_neighbors = self.avg_num_neighbors
-        message = self.message_linear(message_blocks) / max(avg_num_neighbors, 1e-8)
+            message_blocks = {
+                l: scatter(edge_blocks[l], edge_dst, dim=0, dim_size=num_nodes, reduce="sum")
+                for l in range(self.target_lmax + 1)
+            }
+            if self.avg_num_neighbors is None:
+                if edge_mask is not None:
+                    avg_num_neighbors = float(edge_mask.detach().sum().item()) / float(max(num_nodes, 1))
+                else:
+                    avg_num_neighbors = float(edge_src.numel()) / float(max(num_nodes, 1))
+            else:
+                avg_num_neighbors = self.avg_num_neighbors
+            message = self.message_linear(message_blocks) / max(avg_num_neighbors, 1e-8)
         if sync_after_scatter is not None:
             message = sync_after_scatter(message)
         if not self.use_self_connection:
@@ -1692,6 +1790,7 @@ class PureCartesianICTDFix(nn.Module):
         ictd_fix_fusion_readout_mixed_channels: bool = True,
         ictd_fix_fusion_pre_product_norm: bool = True,
         ictd_fix_interaction_rms_norm: bool = False,
+        ictd_fix_interaction_attn_heads: int = 0,
         ictd_fix_gmix_energy_readout: bool = True,
         ictd_fix_gmix_readout_scale_init: float | None = None,
         ictd_fix_gmix_readout_output_init_std: float = 0.003,
@@ -1772,6 +1871,7 @@ class PureCartesianICTDFix(nn.Module):
         self.ictd_fix_fusion_readout_mixed_channels = bool(ictd_fix_fusion_readout_mixed_channels)
         self.ictd_fix_fusion_pre_product_norm = bool(ictd_fix_fusion_pre_product_norm)
         self.ictd_fix_interaction_rms_norm = bool(ictd_fix_interaction_rms_norm)
+        self.ictd_fix_interaction_attn_heads = int(ictd_fix_interaction_attn_heads)
         self.ictd_fix_gmix_energy_readout = bool(ictd_fix_gmix_energy_readout)
         self.ictd_fix_gmix_readout_output_init_std = float(ictd_fix_gmix_readout_output_init_std)
         self.ictd_fix_layer_readout_output_init_std = float(ictd_fix_layer_readout_output_init_std)
@@ -1872,6 +1972,7 @@ class PureCartesianICTDFix(nn.Module):
                     message_scale_init=message_scale_init,
                     sc_scale_init=sc_scale_init,
                     use_rms_norm=self.ictd_fix_interaction_rms_norm,
+                    interaction_attn_heads=self.ictd_fix_interaction_attn_heads,
                 )
             )
             if effective_product_backend == "native-mace":
@@ -2236,6 +2337,18 @@ class PureCartesianICTDFix(nn.Module):
             function_type=self.function_type,
             polynomial_cutoff_p=self.polynomial_cutoff_p,
         ).to(dtype=dtype)
+        # Per-edge cutoff envelope for the optional interaction neighbor-attention
+        # (env^2-gating keeps attention -> 0 smoothly at r_max so forces stay continuous).
+        # Same MACE polynomial cutoff that is baked into edge_feats. Only built when needed.
+        edge_env = (
+            mace_polynomial_cutoff(
+                edge_length,
+                self.max_radius,
+                self.polynomial_cutoff_p if self.polynomial_cutoff_p is not None else 6,
+            ).to(dtype=dtype)
+            if self.ictd_fix_interaction_attn_heads > 0
+            else None
+        )
 
         A_long = A.long()
         # `skip_input_validation` removes the two host syncs below (`.item()` /
@@ -2270,6 +2383,7 @@ class PureCartesianICTDFix(nn.Module):
                 edge_feats=edge_feats,
                 edge_index=edge_index,
                 edge_mask=edge_mask,
+                edge_env=edge_env,
                 sync_after_scatter=sync_after_scatter,
             )
             if self.ictd_fix_route == "fusion" and layer_idx == self.num_interaction - 1:

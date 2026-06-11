@@ -68,6 +68,7 @@ def _small_fix_model(
     readout_head_scale_trainable: bool = False,
     lmax: int = 1,
     gmix_output_lmax: int | None = None,
+    interaction_attn_heads: int = 0,
 ) -> PureCartesianICTDFix:
     return PureCartesianICTDFix(
         max_embed_radius=4.0,
@@ -93,6 +94,7 @@ def _small_fix_model(
         ictd_fix_fusion_heads=1,
         ictd_fix_readout_head_scale_trainable=readout_head_scale_trainable,
         ictd_fix_gmix_output_lmax=gmix_output_lmax,
+        ictd_fix_interaction_attn_heads=interaction_attn_heads,
         save_contraction_order=2,
         avg_num_neighbors=4.0,
     ).to(dtype=torch.float64)
@@ -270,3 +272,77 @@ def test_pure_cartesian_ictd_fix_readout_head_scales_receive_gradients() -> None
     assert model.readout_head_scales.grad is not None
     assert torch.isfinite(model.readout_head_scales.grad).all()
     assert model.readout_head_scales.grad.abs().max().item() > 0.0
+
+
+def test_interaction_attn_default_off_byte_identical() -> None:
+    """interaction_attn_heads=0 (default) -> no attention modules, output == default path."""
+    torch.manual_seed(3)
+    m0 = _small_fix_model(route="fusion", lmax=1, interaction_attn_heads=0)
+    assert all(blk.interaction_attn_heads == 0 for blk in m0.interactions)
+    assert all(blk.attn_q_proj is None for blk in m0.interactions)
+    torch.manual_seed(3)
+    m_default = _small_fix_model(route="fusion", lmax=1)  # heads not passed -> default 0
+    graph = _toy_graph()
+    pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell = graph
+    with torch.no_grad():
+        e0 = m0(pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+        ed = m_default(pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+    torch.testing.assert_close(e0, ed, atol=0.0, rtol=0.0)
+
+
+def test_interaction_attn_equivariant() -> None:
+    """interaction_attn_heads=1 -> energy invariant + forces covariant. Attention weights are
+    invariant l=0 scalars applied uniformly across the 2l+1 m-components => equivariance held."""
+    torch.manual_seed(5)
+    model = _small_fix_model(route="fusion", lmax=1, interaction_attn_heads=1)
+    assert all(blk.interaction_attn_heads == 1 for blk in model.interactions)
+    model.eval()
+    graph = _toy_graph()
+    pos, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell = graph
+
+    pos_req = pos.detach().clone().requires_grad_(True)
+    energy = model(pos_req, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+    forces = -torch.autograd.grad(energy.sum(), pos_req)[0]
+
+    rotation = _random_rotation()
+    pos_rot = (pos @ rotation.T).detach().clone().requires_grad_(True)
+    energy_rot = model(pos_rot, atomic_numbers, batch, edge_src, edge_dst, edge_shifts, cell)
+    forces_rot = -torch.autograd.grad(energy_rot.sum(), pos_rot)[0]
+
+    assert torch.isfinite(energy).all() and torch.isfinite(forces).all()
+    torch.testing.assert_close(energy_rot, energy, atol=1.0e-8, rtol=1.0e-8)
+    torch.testing.assert_close(forces_rot, forces @ rotation.T, atol=1.0e-7, rtol=1.0e-7)
+
+
+def test_interaction_attn_force_continuous_across_cutoff() -> None:
+    """A neighbor sliding across rcut must not jump the energy/force: env^2 gating drives that
+    neighbor's attention weight smoothly to 0, and the zeta-bias denominator stops the other
+    neighbors' weights from renormalizing discontinuously (unlike a plain sum-to-1 softmax)."""
+    torch.manual_seed(9)
+    model = _small_fix_model(route="baseline", lmax=1, interaction_attn_heads=1)
+    with torch.no_grad():  # randomize attention so its contribution is non-trivial
+        for blk in model.interactions:
+            if blk.attn_q_proj is not None:
+                blk.attn_q_proj.weight.normal_(0.0, 1.0)
+                blk.attn_k_proj.weight.normal_(0.0, 1.0)
+                blk.attn_radial_bias.weight.normal_(0.0, 1.0)
+                blk.attn_z_bias_raw.normal_(0.0, 0.5)
+    model.eval()
+    rcut = float(model.max_radius)
+    atomic_numbers = torch.tensor([1, 6, 8], dtype=torch.long)
+    batch = torch.zeros(3, dtype=torch.long)
+    src, dst = _all_directed_edges(3)
+    edge_shifts = torch.zeros(src.shape[0], 3, dtype=torch.float64)
+    cell = torch.eye(3, dtype=torch.float64).unsqueeze(0) * 30.0
+
+    def energy_at(d: float) -> float:
+        pos = torch.tensor([[0.0, 0.0, 0.0], [1.2, 0.0, 0.0], [d, 0.25, 0.0]], dtype=torch.float64)
+        with torch.no_grad():
+            return model(pos, atomic_numbers, batch, src, dst, edge_shifts, cell).sum().item()
+
+    ds = [rcut - 0.05 + 0.005 * i for i in range(21)]  # 3.95 .. 4.05, crosses rcut
+    es = [energy_at(d) for d in ds]
+    assert torch.isfinite(torch.tensor(es)).all()
+    diffs = [abs(es[i + 1] - es[i]) for i in range(len(es) - 1)]
+    med = sorted(diffs)[len(diffs) // 2]
+    assert max(diffs) < 25.0 * med + 1e-9, f"energy jump across cutoff: max={max(diffs):.3e} med={med:.3e}"

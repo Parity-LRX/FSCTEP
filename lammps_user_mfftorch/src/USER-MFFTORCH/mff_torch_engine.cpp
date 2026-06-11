@@ -423,6 +423,82 @@ static void load_custom_op_libs() {
 void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
   load_custom_op_libs();
   ensure_python_custom_op_registrations();
+
+  // AOTInductor .pt2: an Inductor-compiled inference package with the force traced INTO
+  // the graph. Load via AOTIModelPackageLoader and take the simpler AOTI compute path
+  // (no C++ edge_vec compute, no C++ autograd -- the .pt2 already returns (E, force)).
+  // .pt2 is device-specific (compiled for the target GPU/CPU), so no device arg is needed.
+  if (core_pt_path.size() >= 4 &&
+      core_pt_path.compare(core_pt_path.size() - 4, 4, ".pt2") == 0) {
+#if MFF_HAS_AOTI
+    aoti_loader_ = std::make_unique<torch::inductor::AOTIModelPackageLoader>(
+        core_pt_path, "model", /*run_single_threaded=*/false);
+    aoti_mode_ = true;
+    loaded_ = true;
+    cached_ntotal_ = 0;
+    cached_nedges_ = 0;
+    // training-signature .pt2 carries no external/fidelity/phys heads
+    core_takes_external_tensor_arg_ = false;
+    core_requires_external_tensor_ = false;
+    core_takes_fidelity_arg_ = false;
+    core_requires_runtime_fidelity_ = false;
+    core_exports_reciprocal_source_ = false;
+
+    // Sidecar "<core>.pt2.meta": "nmax <N>" (the baked atom count -> pad ntotal up to it),
+    // "pad_z <Z>" (dummy padding species), "fallback <path>" (an N-flexible TorchScript core to use
+    // when ntotal > nmax, e.g. a ghost-count spike). Absent meta -> aoti_nmax_=0 (no padding).
+    aoti_nmax_ = 0;
+    aoti_pad_z_ = 1;
+    have_ts_fallback_ = false;
+    aoti_fallback_warned_ = false;
+    {
+      std::ifstream mf(core_pt_path + ".meta");
+      std::string key, fb;
+      while (mf >> key) {
+        if (key == "nmax") mf >> aoti_nmax_;
+        else if (key == "pad_z") mf >> aoti_pad_z_;
+        else if (key == "fallback") mf >> fb;
+        else { std::string rest; std::getline(mf, rest); }
+      }
+      if (!fb.empty()) {
+        std::filesystem::path fbp(fb);
+        if (fbp.is_relative())
+          fbp = std::filesystem::path(core_pt_path).parent_path() / fbp;
+        try {
+          core_ = torch::jit::load(fbp.string(), device_);
+          core_.eval();
+          // The fallback's forward signature differs from the .pt2's -- read it to set the arg flags
+          // run_forward_backward uses (external_tensor at arg>=9, fidelity at >=10), like the primary
+          // TorchScript load path. Without this run_forward_backward omits external_tensor and the
+          // core rejects the call ("missing value for argument 'external_tensor'").
+          try {
+            auto schema = core_.get_method("forward").function().getSchema();
+            size_t nargs = schema.arguments().size();
+            if (nargs > 0 && schema.arguments()[0].name() == "self") nargs -= 1;
+            core_takes_external_tensor_arg_ = (nargs >= 9);
+            core_takes_fidelity_arg_ = (nargs >= 10);
+          } catch (...) {
+            core_takes_external_tensor_arg_ = false;
+            core_takes_fidelity_arg_ = false;
+          }
+          have_ts_fallback_ = true;
+          std::fprintf(stderr, "[mff/torch] AOTI .pt2 N_max=%lld pad_z=%lld + TorchScript fallback %s (ext_arg=%d)\n",
+                       (long long)aoti_nmax_, (long long)aoti_pad_z_, fbp.string().c_str(),
+                       (int)core_takes_external_tensor_arg_);
+        } catch (const std::exception& e) {
+          std::fprintf(stderr, "[mff/torch] WARNING: AOTI fallback core %s failed to load: %s\n",
+                       fbp.string().c_str(), e.what());
+        }
+      }
+    }
+    return;
+#else
+    throw std::runtime_error(
+        "core path ends in .pt2 (AOTInductor package) but this libtorch build lacks "
+        "AOTIModelPackageLoader (needs torch >= 2.6).");
+#endif
+  }
+
   core_ = torch::jit::load(core_pt_path, device_);
   core_.eval();
 
@@ -700,6 +776,11 @@ void MFFTorchEngine::prepare_for_shape(int64_t nlocal, int64_t ntotal, int64_t n
 void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   if (bundle_mode_ && current_bucket_index_ < 0) return;
   if (!loaded_) return;
+  // An AOTI .pt2 is precompiled and BAKES its atom count N. The TorchScript-style JIT
+  // warmup doesn't apply, and running the graph here at the guessed default N (!= baked N)
+  // feeds it a wrong-shaped input -> device-side index assert ("index out of bounds").
+  // The first real compute() call runs it at the correct N, so skip warmup in AOTI mode.
+  if (aoti_mode_) return;
   if (trace_num_nodes_ > 0) N = trace_num_nodes_;
   if (trace_num_edges_ > 0) E = trace_num_edges_;
 
@@ -800,6 +881,27 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   if (!loaded_) throw std::runtime_error("MFFTorchEngine not loaded");
   if (nlocal <= 0 || ntotal <= 0) return {};
 
+  // DEBUG: dump the exact graph fed to the model (MFF_DUMP_GRAPH=1) so it can be replayed
+  // through the eager model in Python to localize an energy discrepancy. One-shot per run.
+  if (std::getenv("MFF_DUMP_GRAPH") && !warming_up_) {
+    static bool dumped = false;
+    if (!dumped) {
+      dumped = true;
+      const std::string p = "/tmp/mff_graph_";
+      torch::save(pos_in.detach().to(torch::kCPU, torch::kFloat64), p + "pos.pt");
+      torch::save(A_in.detach().to(torch::kCPU, torch::kInt64), p + "A.pt");
+      torch::save(edge_src_in.detach().to(torch::kCPU, torch::kInt64), p + "es.pt");
+      torch::save(edge_dst_in.detach().to(torch::kCPU, torch::kInt64), p + "ed.pt");
+      torch::save(edge_shifts_in.detach().to(torch::kCPU, torch::kFloat64), p + "esh.pt");
+      torch::save(cell_in.detach().to(torch::kCPU, torch::kFloat64), p + "cell.pt");
+      std::ofstream mf(p + "meta.txt");
+      mf << nlocal << " " << ntotal << " " << edge_src_in.size(0) << "\n";
+      mf.close();
+      std::fprintf(stderr, "[MFF_DUMP_GRAPH] nlocal=%lld ntotal=%lld E=%lld -> /tmp/mff_graph_*.pt\n",
+                   (long long)nlocal, (long long)ntotal, (long long)edge_src_in.size(0));
+    }
+  }
+
   const int64_t nedges = edge_src_in.size(0);
 
   auto pos0 = (pos_in.device() == device_ && pos_in.dtype() == torch::kFloat32)
@@ -885,6 +987,40 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   }
   cached_nedges_ = nedges;
 
+  // AOTI .pt2: force is already in the graph -> single inference call, no autograd.
+  if (aoti_mode_) {
+    // ntotal > baked N_max (e.g. a ghost-count spike): the N-baked .pt2 can't run it. Fall back to
+    // the N-flexible TorchScript core if one was loaded, else error clearly. (Common steps stay on
+    // the fast .pt2 path; the fallback is a rarely-hit safety net.)
+    if (aoti_nmax_ > 0 && ntotal > aoti_nmax_) {
+      if (have_ts_fallback_) {
+        if (!aoti_fallback_warned_) {
+          aoti_fallback_warned_ = true;
+          std::fprintf(stderr, "[mff/torch] ntotal %lld > AOTI N_max %lld -> TorchScript fallback "
+                       "(slower). Re-export the .pt2 with a larger --atoms if frequent.\n",
+                       (long long)ntotal, (long long)aoti_nmax_);
+        }
+        return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
+                                    external_tensor, fidelity_ids,
+                                    nlocal, ntotal, need_energy, need_atom_virial);
+      }
+      throw std::runtime_error(
+          "mff/torch: ntotal=" + std::to_string(ntotal) + " exceeds the AOTI .pt2 baked N_max=" +
+          std::to_string(aoti_nmax_) + " and no TorchScript fallback configured; re-export with a "
+          "larger --atoms or add 'fallback <core.pt>' to <core>.pt2.meta.");
+    }
+    MFFOutputs out = run_aoti(pos0, A, edge_src, edge_dst, edge_shifts, cell);
+    // run_aoti fills atom_energy + forces but NOT the scalar out.energy that the pair_style
+    // adds to eng_vdwl (the reported PE). Reduce the LOCAL atom energies here (compute() has
+    // nlocal), mirroring run_forward_backward's E_local = atom_e[0:nlocal].sum(). Without this
+    // PE reads 0 even though forces are correct.
+    if (need_energy && out.atom_energy.defined()) {
+      out.energy = out.atom_energy.reshape({-1}).narrow(0, 0, nlocal)
+                       .to(torch::kFloat64).sum().item<double>();
+    }
+    return out;
+  }
+
 #if MFF_HAS_CUDA_GRAPH
   if (use_cuda_graph_ && device_.is_cuda()) {
     return compute_with_cuda_graph(nlocal, ntotal, pos0, A, edge_src, edge_dst,
@@ -896,6 +1032,43 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
                               external_tensor, fidelity_ids,
                               nlocal, ntotal, need_energy, need_atom_virial);
+}
+
+MFFOutputs MFFTorchEngine::run_aoti(
+    const torch::Tensor& pos0, const torch::Tensor& A,
+    const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+    const torch::Tensor& edge_shifts, const torch::Tensor& cell) {
+#if MFF_HAS_AOTI
+  // Training-signature inputs: (pos, A, batch, edge_src, edge_dst, edge_shifts, cell).
+  // The .pt2 computes edge_vec internally and returns (atom_energy[N,1], force[N,3] = -dE/dpos)
+  // with the force traced into the graph. The .pt2 BAKES N, so when ntotal < aoti_nmax_ we PAD the
+  // node tensors up to aoti_nmax_ with dummy atoms (valid species, no edges -> isolated -> they
+  // contribute nothing to the real atoms and are sliced off afterwards). Edges/shifts are E-dynamic
+  // and reference only real atoms, so they are passed unchanged. buf_batch_ is the zeros batch index.
+  const int64_t ntot = pos0.size(0);
+  at::Tensor pos_in = pos0, A_in = A, batch_in = buf_batch_;
+  if (aoti_nmax_ > 0 && ntot < aoti_nmax_) {
+    const int64_t k = aoti_nmax_ - ntot;
+    pos_in = torch::cat({pos0, torch::zeros({k, 3}, pos0.options())}, 0);
+    A_in = torch::cat({A, torch::full({k}, aoti_pad_z_, A.options())}, 0);
+    batch_in = torch::cat({buf_batch_, torch::zeros({k}, buf_batch_.options())}, 0);
+  }
+  const std::vector<at::Tensor> inputs = {
+      pos_in, A_in, batch_in, edge_src, edge_dst, edge_shifts, cell};
+  auto outs = aoti_loader_->run(inputs);
+  if (outs.size() < 2) {
+    throw std::runtime_error(
+        "AOTI .pt2 must return (atom_energy, force); got fewer than 2 outputs");
+  }
+  MFFOutputs out;
+  // Slice off the dummy padding atoms -> outputs for the real ntot atoms only.
+  out.atom_energy = outs[0].narrow(0, 0, ntot).contiguous();
+  out.forces = outs[1].narrow(0, 0, ntot).contiguous();
+  return out;
+#else
+  (void)pos0; (void)A; (void)edge_src; (void)edge_dst; (void)edge_shifts; (void)cell;
+  throw std::runtime_error("run_aoti called but this build lacks AOTIModelPackageLoader");
+#endif
 }
 
 #if MFF_HAS_CUDA_GRAPH
