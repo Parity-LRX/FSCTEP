@@ -833,6 +833,27 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   if (!loaded_) throw std::runtime_error("MFFTorchEngine not loaded");
   if (nlocal <= 0 || ntotal <= 0) return {};
 
+  // DEBUG: dump the exact graph fed to the model (MFF_DUMP_GRAPH=1) so it can be replayed
+  // through the eager model in Python to localize an energy discrepancy. One-shot per run.
+  if (std::getenv("MFF_DUMP_GRAPH") && !warming_up_) {
+    static bool dumped = false;
+    if (!dumped) {
+      dumped = true;
+      const std::string p = "/tmp/mff_graph_";
+      torch::save(pos_in.detach().to(torch::kCPU, torch::kFloat64), p + "pos.pt");
+      torch::save(A_in.detach().to(torch::kCPU, torch::kInt64), p + "A.pt");
+      torch::save(edge_src_in.detach().to(torch::kCPU, torch::kInt64), p + "es.pt");
+      torch::save(edge_dst_in.detach().to(torch::kCPU, torch::kInt64), p + "ed.pt");
+      torch::save(edge_shifts_in.detach().to(torch::kCPU, torch::kFloat64), p + "esh.pt");
+      torch::save(cell_in.detach().to(torch::kCPU, torch::kFloat64), p + "cell.pt");
+      std::ofstream mf(p + "meta.txt");
+      mf << nlocal << " " << ntotal << " " << edge_src_in.size(0) << "\n";
+      mf.close();
+      std::fprintf(stderr, "[MFF_DUMP_GRAPH] nlocal=%lld ntotal=%lld E=%lld -> /tmp/mff_graph_*.pt\n",
+                   (long long)nlocal, (long long)ntotal, (long long)edge_src_in.size(0));
+    }
+  }
+
   const int64_t nedges = edge_src_in.size(0);
 
   auto pos0 = (pos_in.device() == device_ && pos_in.dtype() == torch::kFloat32)

@@ -292,6 +292,14 @@ void PairMFFTorch::init_style() {
   // Request a full neighbor list.
   neighbor->add_request(this, NeighConst::REQ_FULL);
 
+  // We fold periodic-ghost neighbors back to their local owner (atom->map) + an integer cell shift
+  // so the model sees the TRAINING graph topology (local nodes + PBC shifts) rather than ghost
+  // NODES. That requires an atom map.
+  if (atom->map_style == Atom::MAP_NONE)
+    error->all(FLERR,
+               "pair_style mff/torch needs an atom map to fold periodic ghosts to local atoms; "
+               "add 'atom_modify map yes' before the box is created");
+
   try {
     if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
     if (!reciprocal_solver_) reciprocal_solver_ = std::make_unique<mfftorch::MFFReciprocalSolver>();
@@ -638,11 +646,26 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       const double rsq = delx * delx + dely * dely + delz * delz;
       if (rsq > cutsq_global_) continue;
 
-      buf_edge_src_cpu_.push_back(static_cast<int64_t>(i));
-      buf_edge_dst_cpu_.push_back(static_cast<int64_t>(j));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(sx));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(sy));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(sz));
+      // Fold the (possibly periodic-ghost) neighbor j back to its LOCAL owner jl + integer cell
+      // offset g (x[j] = x[jl] + g@cell), and emit the edge as neighbor->center with shift -g.
+      // The model then computes edge_vec = x[i] - x[jl] - g@cell = x[i] - x[j] (the correct
+      // displacement) and aggregates the neighbor's features INTO local center i -- matching the
+      // training graph (local nodes + PBC shifts). Emitting ghost NODES instead (center i -> ghost j,
+      // shift 0) makes a multi-layer message-passing model undercount cross-boundary messages and
+      // mis-target aggregation, giving energies wrong by ~0.1 eV/atom on periodic systems. (Folding
+      // to local indices also lands forces directly on the local owner -- no reverse comm needed.)
+      const int jl = atom->map(atom->tag[j]);
+      const double dxl = x[j][0] - x[jl][0];
+      const double dyl = x[j][1] - x[jl][1];
+      const double dzl = x[j][2] - x[jl][2];
+      const int gx = nearest_int(dxl * geom.inv[0][0] + dyl * geom.inv[1][0] + dzl * geom.inv[2][0]);
+      const int gy = nearest_int(dxl * geom.inv[0][1] + dyl * geom.inv[1][1] + dzl * geom.inv[2][1]);
+      const int gz = nearest_int(dxl * geom.inv[0][2] + dyl * geom.inv[1][2] + dzl * geom.inv[2][2]);
+      buf_edge_src_cpu_.push_back(static_cast<int64_t>(jl));
+      buf_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-gx));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-gy));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-gz));
     }
   }
 
