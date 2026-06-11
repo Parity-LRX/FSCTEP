@@ -423,6 +423,34 @@ static void load_custom_op_libs() {
 void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
   load_custom_op_libs();
   ensure_python_custom_op_registrations();
+
+  // AOTInductor .pt2: an Inductor-compiled inference package with the force traced INTO
+  // the graph. Load via AOTIModelPackageLoader and take the simpler AOTI compute path
+  // (no C++ edge_vec compute, no C++ autograd -- the .pt2 already returns (E, force)).
+  // .pt2 is device-specific (compiled for the target GPU/CPU), so no device arg is needed.
+  if (core_pt_path.size() >= 4 &&
+      core_pt_path.compare(core_pt_path.size() - 4, 4, ".pt2") == 0) {
+#if MFF_HAS_AOTI
+    aoti_loader_ = std::make_unique<torch::inductor::AOTIModelPackageLoader>(
+        core_pt_path, "model", /*run_single_threaded=*/false);
+    aoti_mode_ = true;
+    loaded_ = true;
+    cached_ntotal_ = 0;
+    cached_nedges_ = 0;
+    // training-signature .pt2 carries no external/fidelity/phys heads
+    core_takes_external_tensor_arg_ = false;
+    core_requires_external_tensor_ = false;
+    core_takes_fidelity_arg_ = false;
+    core_requires_runtime_fidelity_ = false;
+    core_exports_reciprocal_source_ = false;
+    return;
+#else
+    throw std::runtime_error(
+        "core path ends in .pt2 (AOTInductor package) but this libtorch build lacks "
+        "AOTIModelPackageLoader (needs torch >= 2.6).");
+#endif
+  }
+
   core_ = torch::jit::load(core_pt_path, device_);
   core_.eval();
 
@@ -700,6 +728,11 @@ void MFFTorchEngine::prepare_for_shape(int64_t nlocal, int64_t ntotal, int64_t n
 void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   if (bundle_mode_ && current_bucket_index_ < 0) return;
   if (!loaded_) return;
+  // An AOTI .pt2 is precompiled and BAKES its atom count N. The TorchScript-style JIT
+  // warmup doesn't apply, and running the graph here at the guessed default N (!= baked N)
+  // feeds it a wrong-shaped input -> device-side index assert ("index out of bounds").
+  // The first real compute() call runs it at the correct N, so skip warmup in AOTI mode.
+  if (aoti_mode_) return;
   if (trace_num_nodes_ > 0) N = trace_num_nodes_;
   if (trace_num_edges_ > 0) E = trace_num_edges_;
 
@@ -885,6 +918,20 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   }
   cached_nedges_ = nedges;
 
+  // AOTI .pt2: force is already in the graph -> single inference call, no autograd.
+  if (aoti_mode_) {
+    MFFOutputs out = run_aoti(pos0, A, edge_src, edge_dst, edge_shifts, cell);
+    // run_aoti fills atom_energy + forces but NOT the scalar out.energy that the pair_style
+    // adds to eng_vdwl (the reported PE). Reduce the LOCAL atom energies here (compute() has
+    // nlocal), mirroring run_forward_backward's E_local = atom_e[0:nlocal].sum(). Without this
+    // PE reads 0 even though forces are correct.
+    if (need_energy && out.atom_energy.defined()) {
+      out.energy = out.atom_energy.reshape({-1}).narrow(0, 0, nlocal)
+                       .to(torch::kFloat64).sum().item<double>();
+    }
+    return out;
+  }
+
 #if MFF_HAS_CUDA_GRAPH
   if (use_cuda_graph_ && device_.is_cuda()) {
     return compute_with_cuda_graph(nlocal, ntotal, pos0, A, edge_src, edge_dst,
@@ -896,6 +943,32 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
                               external_tensor, fidelity_ids,
                               nlocal, ntotal, need_energy, need_atom_virial);
+}
+
+MFFOutputs MFFTorchEngine::run_aoti(
+    const torch::Tensor& pos0, const torch::Tensor& A,
+    const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+    const torch::Tensor& edge_shifts, const torch::Tensor& cell) {
+#if MFF_HAS_AOTI
+  // Training-signature inputs: (pos, A, batch, edge_src, edge_dst, edge_shifts, cell).
+  // The .pt2 computes edge_vec internally and returns (atom_energy[ntotal,1],
+  // force[ntotal,3] = -dE/dpos) with the force traced into the graph -- no C++ edge_vec
+  // compute and no C++ autograd. buf_batch_ is the all-zeros single-graph batch index.
+  const std::vector<at::Tensor> inputs = {
+      pos0, A, buf_batch_, edge_src, edge_dst, edge_shifts, cell};
+  auto outs = aoti_loader_->run(inputs);
+  if (outs.size() < 2) {
+    throw std::runtime_error(
+        "AOTI .pt2 must return (atom_energy, force); got fewer than 2 outputs");
+  }
+  MFFOutputs out;
+  out.atom_energy = outs[0];
+  out.forces = outs[1];
+  return out;
+#else
+  (void)pos0; (void)A; (void)edge_src; (void)edge_dst; (void)edge_shifts; (void)cell;
+  throw std::runtime_error("run_aoti called but this build lacks AOTIModelPackageLoader");
+#endif
 }
 
 #if MFF_HAS_CUDA_GRAPH

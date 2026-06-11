@@ -15,6 +15,18 @@
 #define MFF_HAS_CUDA_GRAPH 0
 #endif
 
+// AOTInductor .pt2 loader (an inference-only Inductor-compiled model). Present in
+// torch >= 2.6. Lets pair_style mff/torch load an AOTI .pt2 (with the force traced
+// INTO the graph) instead of a TorchScript .pt. The .pt2 path is simpler than the
+// TorchScript path: it skips the C++-side edge_vec compute and the C++ autograd,
+// calling .run() -> (atom_energy, force) directly.
+#if __has_include(<torch/csrc/inductor/aoti_package/model_package_loader.h>)
+#include <torch/csrc/inductor/aoti_package/model_package_loader.h>
+#define MFF_HAS_AOTI 1
+#else
+#define MFF_HAS_AOTI 0
+#endif
+
 namespace mfftorch {
 
 struct MFFOutputs {
@@ -99,9 +111,18 @@ class MFFTorchEngine {
   };
 
   void load_single_core_file(const std::string& core_pt_path);
+  // AOTI inference path: .pt2 returns (atom_energy, force) with force already in-graph,
+  // so no C++ edge_vec compute and no C++ autograd are needed (unlike run_forward_backward).
+  MFFOutputs run_aoti(const torch::Tensor& pos0, const torch::Tensor& A,
+                      const torch::Tensor& edge_src, const torch::Tensor& edge_dst,
+                      const torch::Tensor& edge_shifts, const torch::Tensor& cell);
   void ensure_core_for_shape(int64_t nlocal, int64_t ntotal, int64_t nedges, bool warmup_on_switch);
 
   torch::jit::script::Module core_;
+#if MFF_HAS_AOTI
+  std::unique_ptr<torch::inductor::AOTIModelPackageLoader> aoti_loader_;
+#endif
+  bool aoti_mode_ = false;   // true when core was loaded from an AOTI .pt2 (force in-graph)
   bool loaded_ = false;
   bool bundle_mode_ = false;
   std::string bundle_manifest_path_;

@@ -1111,6 +1111,16 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             else:
                 inferred_fusion_heads = 1
                 inferred_head_mode = "softmax"
+            # Equivariant neighbor-attention (commit 1319eba) is opt-in and post-dates the original
+            # from_checkpoint wiring; without reconstructing it, strict load fails on the attn_* keys.
+            # Prefer the saved hyperparameter, else infer the head count from attn_z_bias_raw's length
+            # (per-layer shape [H]). Defaults to 0 -> no attention modules (unchanged for old ckpts).
+            inferred_attn_heads = int(
+                ckpt.get("ictd_fix_interaction_attn_heads")
+                or arch_meta.get("ictd_fix_interaction_attn_heads")
+                or (selected_state_dict["interactions.0.attn_z_bias_raw"].numel()
+                    if "interactions.0.attn_z_bias_raw" in selected_state_dict else 0)
+            )
             atomic_numbers = aek.detach().cpu().to(dtype=torch.long).tolist() if aek is not None else None
             model = PureCartesianICTDFix(
                 max_embed_radius=config.max_radius,
@@ -1205,6 +1215,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                         arch_meta.get("ictd_fix_fusion_readout_mixed_channels", False),
                     )
                 ),
+                ictd_fix_interaction_attn_heads=inferred_attn_heads,
                 save_contraction_order=save_contraction_order,
                 save_multiple_mix_channels=save_multiple_mix_channels,
                 avg_num_neighbors=float(
