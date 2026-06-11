@@ -136,6 +136,7 @@ setup(
             "mff-convert-dataset=molecular_force_field.cli.convert_dataset:main",
             "mff-lammps=molecular_force_field.cli.lammps_interface:main",
             "mff-export-core=molecular_force_field.cli.export_libtorch_core:main",
+            "mff-export-aoti=molecular_force_field.cli.export_aoti_core:main",
             "mff-evaluate-pes-coverage=molecular_force_field.cli.evaluate_pes_coverage:main",
             "mff-active-learn=molecular_force_field.cli.active_learning:main",
             "mff-init-data=molecular_force_field.cli.init_data:main",

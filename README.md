@@ -335,6 +335,21 @@ pair_coeff * * /path/to/core.pt H O
 
 If `core.pt` came from a checkpoint with ZBL enabled, no extra LAMMPS keyword is needed: the ZBL short-range repulsion is already embedded in the exported TorchScript model.
 
+**AOTInductor (`.pt2`) fast path (recommended)**: besides the TorchScript `core.pt`, you can export an AOTInductor `core.pt2` that ahead-of-time compiles the whole graph with the force traced in (no C++ autograd at runtime) — ~1.5–3x faster on large systems (higher on small). It is **N-dynamic by default**: one `.pt2` serves any atom count, with no padding / `N_max` / fallback. The same `pair_style mff/torch` is used; the `.pt2` suffix is auto-detected.
+
+```bash
+mff-export-aoti --checkpoint model.pth --elements H,O,F,K \
+    --atoms 400 --device cuda --embed-e0 --out core.pt2
+```
+
+```lammps
+atom_modify map yes
+pair_style mff/torch 6.0 cuda            # cutoff MUST equal the model max_radius
+pair_coeff * * /path/to/core.pt2 H O F K # .pt2 -> AOTI auto-detected
+```
+
+> Use `.pt` for runtime external fields / multi-fidelity; use `.pt2` for the fastest energy+force. See [LAMMPS_INTERFACE.md](LAMMPS_INTERFACE.md) for the full notes (`avg_num_neighbors` auto-read vs explicit, `--static-n`, and the `.pt` vs `.pt2` comparison).
+
 For checkpoints exported with external-field architecture, USER-MFFTORCH supports runtime rank-1 external tensors and follows the exported irrep semantics:
 
 ```lammps

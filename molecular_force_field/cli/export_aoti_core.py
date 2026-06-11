@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""AOTInductor export + load + verify for FSCETP LAMMPS-inference acceleration (A-phase).
+"""Official AOTInductor (.pt2) export CLI for FSCETP LAMMPS inference -- ``mff-export-aoti``.
 
-Flattens forward + 1st-order force-autograd via make_fx (reusing
-``makefx_compile.trace_and_compile_force(do_compile=False)``), hands the flat
-GraphModule to ``torch.export.export``, AOTInductor-compiles it to a ``.pt2``
-package, loads it back, and checks the loaded model's ``(energy, force)`` match
-eager + measures inference speedup.
+Exports a trained checkpoint to an AOTInductor ``.pt2`` package that the
+``pair_style mff/torch`` engine loads directly: the force is traced INTO the
+graph, so there is no C++ autograd at runtime (the .pt2 returns ``(energy,
+force)`` from a single ``.run()``). N-dynamic by DEFAULT -- ONE ``.pt2`` serves
+any atom count -- via ``torch.export`` with the atom axis as a ``Dim``
+(``--static-n`` opts out to the legacy baked-N + padding path).
 
-This is the Python-only validation step of the LAMMPS-AOTI plan (no C++/LAMMPS
-yet): it answers "can the FSCETP model be AOTI-compiled, and how much does
-inference speed up?" before investing in the C++ pair_style. Force is traced
-INTO the graph (model.forward + autograd.grad over positions -> force output),
-which is the settled approach from NequIP/Allegro + DeepMD (torch.export does
-not emit a standalone backward; AOTI is inference-only).
+Pipeline: make_fx flattens forward + 1st-order force-autograd (reusing
+``makefx_compile.trace_and_compile_force(do_compile=False)``) -> ``torch.export.export``
+(N and E dynamic) -> ``aoti_compile_and_package`` -> load back and verify numerics +
+rotation-equivariance + VARY-N, then time vs eager. Writes ``<out>`` plus a
+``<out>.meta`` sidecar (``dynamic 1 / nmax 0``) that the LAMMPS engine reads.
 
-Usage (on the 4090):
-  python -m molecular_force_field.test.bench_aoti_export \
-      --route fusion --atoms 256 --attn-heads 1 --dtype float32 --device cuda
+Usage:
+  # export a trained checkpoint (N-dynamic, absolute-energy .pt2):
+  mff-export-aoti --checkpoint model.pth --elements H,O,F,K \
+      --atoms 400 --device cuda --embed-e0 --out core.pt2
+  # (equivalently: python -m molecular_force_field.cli.export_aoti_core ...)
+  # then in LAMMPS:  pair_coeff * * core.pt2 H O F K   (.pt2 -> AOTI auto-detected)
 """
 from __future__ import annotations
 
@@ -34,8 +37,32 @@ _repo_root = os.path.dirname(_script_dir)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from molecular_force_field.test.bench_ictd_fix_trainstep import build_model, make_fixed_graph, SPECIES
 from molecular_force_field.training.makefx_compile import trace_and_compile_force
+
+# Default species (H, C, N, O) for the synthetic no-checkpoint path only; a real --checkpoint export
+# overrides this with the checkpoint's own atomic_numbers.
+SPECIES = (1, 6, 7, 8)
+
+
+def make_fixed_graph(*, num_nodes, avg_degree, dtype, device, seed: int = 42):
+    """Deterministic single-molecule example graph (no self-loops) for tracing + numerics/equivariance
+    checks. Big non-periodic box (edge_shifts=0); the real LAMMPS graph is supplied at runtime, this is
+    only the torch.export trace/validation sample."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    pos = torch.randn(num_nodes, 3, generator=g, dtype=torch.float64) * 2.5
+    species = torch.tensor(SPECIES, dtype=torch.long)
+    A = species[torch.randint(0, len(SPECIES), (num_nodes,), generator=g)]
+    num_edges = num_nodes * avg_degree
+    edge_src = torch.randint(0, num_nodes, (num_edges,), generator=g)
+    edge_dst = torch.randint(0, num_nodes, (num_edges,), generator=g)
+    loop = edge_src == edge_dst
+    edge_dst[loop] = (edge_dst[loop] + 1) % num_nodes  # break self-loops deterministically
+    edge_shifts = torch.zeros(num_edges, 3, dtype=torch.float64)
+    cell = torch.eye(3, dtype=torch.float64).unsqueeze(0) * 100.0  # big box, no PBC wrap
+    batch = torch.zeros(num_nodes, dtype=torch.long)
+    return (pos.to(device=device, dtype=dtype), A.to(device=device), batch.to(device=device),
+            edge_src.to(device=device), edge_dst.to(device=device),
+            edge_shifts.to(device=device, dtype=dtype), cell.to(device=device, dtype=dtype))
 
 
 class _E0Wrap(torch.nn.Module):
@@ -220,6 +247,9 @@ def main() -> int:
             model = _E0Wrap(model, lut).to(device=device)
             print(f"[aoti] embedded E0(Z) for Z={aek.tolist()} -> absolute-energy .pt2")
     else:
+        # synthetic no-checkpoint path (testing/benchmarking only) -- lazy-import the test harness so the
+        # real --checkpoint export path has ZERO dependency on molecular_force_field.test
+        from molecular_force_field.test.bench_ictd_fix_trainstep import build_model
         model = build_model(
             channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
             route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,

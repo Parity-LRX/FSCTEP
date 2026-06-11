@@ -160,6 +160,43 @@ bash molecular_force_field/test/run_gpu_lammps_with_corept.sh \
   --lmp /path/to/lmp --dummy-cue --elements H O --cutoff 5.0 --steps 200
 ```
 
+### AOTInductor（`.pt2`）加速路径（推荐）
+
+上面的 `core.pt` 是 **TorchScript** 模型（能量在图里、力在 C++ 侧用 LibTorch autograd 算）。FSCETP 另提供一条 **AOTInductor**（`.pt2`）路径：用 PyTorch Inductor **提前编译**整张图、**把力也编进图里**，运行时引擎只调一次 `.run()` 拿 `(energy, force)`，**不走 C++ autograd**，大体系上比 TorchScript 快约 1.5–3×（小体系更高）。`pair_style mff/torch` 看到 `.pt2` 后缀会**自动**切到这条路径，LAMMPS 输入与 `.pt` 完全一致。
+
+**1. 导出 `.pt2`**（`mff-export-aoti`，N-dynamic 默认 —— 一个 `.pt2` 吃任意原子数）：
+```bash
+mff-export-aoti --checkpoint model.pth --elements H,O,F,K \
+    --atoms 400 --device cuda --embed-e0 --out core.pt2
+# 等价：python -m molecular_force_field.cli.export_aoti_core ...
+```
+- `--atoms` 只是 **trace 样例尺寸**（小 = 烤得轻）；N 是动态的，部署时跑任意 `ntotal`，**无需 padding / 无 N_max / 无 fallback**。
+- `--embed-e0`：把 E0(Z) 编进图，输出**绝对能量**（对得上 DFT）。不加只有网络能量（差一个常数，力不受影响）。
+- `avg_num_neighbors` 会**自动从 ckpt 读**（新版 trainer 已写进 ckpt）；**老 ckpt 必须显式传** `--avg-num-neighbors <训练日志里 "Computed average number of neighbors" 的值>`，否则回退 14.38 → 能量错。
+- `--static-n`：退回**烤死-N + padding** 的旧路径（固定 N 的 `.pt2` 比动态约快 5%，但要补哑原子 + 需配 TorchScript fallback 应对 ghost 突增），一般用不上。
+- 产出 `core.pt2` + 旁车 `core.pt2.meta`（`dynamic 1 / nmax 0`，引擎读它判断是否 padding）。脚本自带验收：数值匹配 + 旋转等变 + VARY-N（`--vary-atoms <N2>` 测第二个原子数）。
+- `.pt2` **设备相关**：在哪类 GPU 导就在哪类 GPU 跑。
+
+**2. LAMMPS 里用**（和 `.pt` 唯一区别就是把 `core.pt` 换成 `core.pt2`）：
+```lammps
+atom_style atomic
+atom_modify map yes                        # 必需（消息传递用 atom->map）
+pair_style mff/torch 6.0 cuda              # ★cutoff 必须 = 训练 max_radius
+pair_coeff * * /path/to/core.pt2 H O F K   # .pt2 → 引擎自动走 AOTI
+```
+
+**`.pt` vs `.pt2` 怎么选**：
+
+| | `core.pt`（TorchScript） | `core.pt2`（AOTInductor） |
+|---|---|---|
+| 力 | C++ 侧 autograd（2 趟） | 编进图，1 次 `.run()` |
+| 速度 | 基线 | 大体系 ~1.5–3×，小体系更高 |
+| 变 N | 原生支持 | N-dynamic 默认，一个 `.pt2` 任意 N |
+| 外场 / 多保真 | 支持（`field` / `field9` / `field6`） | 暂不支持（纯能量 + 力） |
+| 运行时依赖 | LibTorch ≥ 训练版 | LibTorch ≥ 2.6（带 AOTI 运行时） |
+
+> 需要**运行时外场**（`field ...`）或多保真的用 `.pt`；只要**能量 + 力**、想要**最快**的用 `.pt2`。两者用同一个编译好的 `pair_style mff/torch`，靠**文件后缀**自动区分。
+
 ---
 
 ## 方式二：ML-IAP unified 接口
