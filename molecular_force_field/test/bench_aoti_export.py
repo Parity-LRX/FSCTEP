@@ -160,9 +160,30 @@ def main() -> int:
                    help="with --dynamic: also call the .pt2 at this avg degree (!= --degree) -> a "
                         "different EDGE count at the SAME atom count, proving one .pt2 handles varying "
                         "neighbor count (the thing that actually varies in LAMMPS NVE/NVT, where N is fixed)")
+    p.add_argument("--n-dynamic", dest="n_dynamic", action="store_true", default=True,
+                   help="(DEFAULT) make the atom count N a torch.export Dim -> ONE .pt2 for ANY N (no "
+                        "padding, no N_max, no fallback). Works by disabling e3nn's jit-scripting of "
+                        "o3.Linear (e3nn.set_optimization_defaults(jit_script_fx=False)), which specialized "
+                        "N via torch.size(x)[0] typed as a TorchScript int. Numerically identical (script "
+                        "vs fx GraphModule = same compute, same weights). Implies --dynamic.")
+    p.add_argument("--static-n", dest="n_dynamic", action="store_false",
+                   help="opt OUT of N-dynamic: bake N (legacy pad-to-N_max + dual-core fallback path). "
+                        "Use only for a fixed-N .pt2 (~5%% faster kernels at one size, but needs padding "
+                        "+ a TorchScript fallback for ntotal spikes in LAMMPS).")
+    p.add_argument("--vary-atoms", dest="vary_atoms", type=int, default=0,
+                   help="with --n-dynamic: also call the .pt2 at this atom count (!= --atoms) -> proves "
+                        "one .pt2 handles a different N. Uses --degree for its neighbor count.")
     p.add_argument("--no-equiv", dest="no_equiv", action="store_true",
                    help="skip the rotation-equivariance gate on the loaded .pt2")
     args = p.parse_args()
+    if args.n_dynamic:
+        args.dynamic = True  # N-dynamic implies E-dynamic
+        # MUST be set BEFORE any e3nn module is constructed (the model build below). jit_script_fx=True
+        # compiles o3.Linear to a RecursiveScriptModule whose `torch.size(x)[0]` is a TorchScript int ->
+        # int(SymInt) guard bakes N. As an fx GraphModule the size stays a symbolic SymInt -> N dynamic.
+        import e3nn
+        e3nn.set_optimization_defaults(jit_script_fx=False)
+        print("[aoti] --n-dynamic: e3nn jit_script_fx=False (o3.Linear stays fx GraphModule -> N symbolic)")
 
     device = torch.device(args.device)
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
@@ -253,15 +274,19 @@ def main() -> int:
     dyn = None
     if args.dynamic:
         from torch.export import Dim
-        # FSCETP's make_fx flatten BAKES the atom count N (the many view(*x.shape[:-1], C, 2l+1)
-        # in the ICTD layers, same root cause as the training-side per-N cache) -- torch.export
-        # confirms n_atoms/n_mol are constants. But the EDGE count E stays symbolic (edge ops are
-        # scatter/index_select). This is exactly right for LAMMPS: in NVE/NVT the atom count is
-        # FIXED (conserved), and what varies frame-to-frame is the neighbor (edge) count as atoms
-        # move. So make ONLY E dynamic; N and num_mol stay static (one .pt2 per system size).
         # inputs order: (pos[N,3], A[N], batch[N], edge_src[E], edge_dst[E], edge_shifts[E,3], cell[M,3,3])
         Edim = Dim("n_edges", min=2)
-        dyn = (None, None, None, {0: Edim}, {0: Edim}, {0: Edim}, None)
+        if args.n_dynamic:
+            # N-DYNAMIC: with e3nn jit_script_fx=False (set above) the make_fx flatten no longer bakes the
+            # atom count -- N is a symbol -- so make N a Dim too. ONE .pt2 for ANY atom count AND any edge
+            # count (no padding, no N_max, no fallback). num_mol (cell dim 0) stays 1 (LAMMPS is 1 graph).
+            Ndim = Dim("n_atoms", min=2)
+            dyn = ({0: Ndim}, {0: Ndim}, {0: Ndim}, {0: Edim}, {0: Edim}, {0: Edim}, None)
+        else:
+            # E-only dynamic (legacy padding path): make_fx BAKES N (the view(*x.shape[:-1], C, 2l+1) in the
+            # ICTD layers via e3nn's scripted o3.Linear), so N stays static (one .pt2 per system size, padded
+            # in LAMMPS). The EDGE count E stays symbolic (scatter/index_select) -- right for fixed-N NVE/NVT.
+            dyn = (None, None, None, {0: Edim}, {0: Edim}, {0: Edim}, None)
     try:
         exported = torch.export.export(gm, tuple(example_inputs), dynamic_shapes=dyn)
         print(f"[aoti] torch.export.export OK (dynamic={args.dynamic})")
@@ -285,11 +310,18 @@ def main() -> int:
     meta_path = str(args.out) + ".meta"
     pad_z = int(species_z[0]) if species_z else 1
     with open(meta_path, "w") as mf:
-        mf.write(f"nmax {args.atoms}\n")
-        mf.write(f"pad_z {pad_z}\n")
-        if args.fallback:
-            mf.write(f"fallback {args.fallback}\n")
-    print(f"[aoti] wrote {meta_path}  (nmax={args.atoms} pad_z={pad_z} fallback={args.fallback})")
+        if args.n_dynamic:
+            # N-dynamic: the .pt2 accepts ANY atom count -> LAMMPS needs no padding/N_max/fallback.
+            # nmax 0 signals "no padding" to the engine (aoti_nmax_==0 -> legacy/dynamic path).
+            mf.write("dynamic 1\n")
+            mf.write("nmax 0\n")
+        else:
+            mf.write(f"nmax {args.atoms}\n")
+            mf.write(f"pad_z {pad_z}\n")
+            if args.fallback:
+                mf.write(f"fallback {args.fallback}\n")
+    print(f"[aoti] wrote {meta_path}  ("
+          + ("N-DYNAMIC (no padding)" if args.n_dynamic else f"nmax={args.atoms} pad_z={pad_z} fallback={args.fallback}") + ")")
 
     # ---- load back + verify numerics ----
     try:
@@ -344,6 +376,36 @@ def main() -> int:
             print(f"[aoti] VARY-E call FAILED: {type(ex).__name__}: {ex}")
             ok = False
         del e2e, f2e
+
+    # ---- dynamic-N proof: call the SAME .pt2 at a DIFFERENT ATOM COUNT N (the whole point) ----
+    if args.n_dynamic and args.vary_atoms > 0 and args.vary_atoms != args.atoms:
+        gN = _apply_species(make_fixed_graph(num_nodes=args.vary_atoms, avg_degree=args.degree, dtype=dtype, device=device))
+        inpN = (gN[0],) + tuple(gN[1:])
+        eNe, fNe = eager_fn(*inpN); eNe = eNe.detach(); fNe = fNe.detach()
+        try:
+            eNa, fNa = loaded(*inpN)
+            dNe = (eNa - eNe).abs().max().item(); dNf = (fNa - fNe).abs().max().item()
+            n_ok = (dNe / (eNe.abs().max().item() + 1e-30) <= tol) and (dNf / (fNe.abs().max().item() + 1e-30) <= tol)
+            print(f"[aoti] VARY-N: exported@{args.atoms} atoms called@{args.vary_atoms} atoms -> "
+                  f"dE={dNe:.3e} dF={dNf:.3e}  "
+                  f"{'PASS (ONE .pt2 handles any atom count)' if n_ok else 'FAIL'}")
+            ok = ok and n_ok
+            # equivariance at the new N too (HARD constraint must hold at every N)
+            if not args.no_equiv:
+                Rn = _random_rotation(dtype, device)
+                e0n, f0n = loaded(inpN[0], *tuple(inpN[1:]))
+                e1n, f1n = loaded(inpN[0] @ Rn.T, *tuple(inpN[1:]))
+                ei = (e1n.sum() - e0n.sum()).abs().item() / (e0n.abs().sum().item() + 1e-30)
+                fc = (f1n - f0n @ Rn.T).abs().max().item() / (f0n.abs().max().item() + 1e-30)
+                eqtol = 1e-9 if dtype == torch.float64 else 1e-3
+                print(f"[aoti] VARY-N EQUIVARIANCE @{args.vary_atoms} atoms: E-inv rel {ei:.2e}  F-cov rel {fc:.2e}  "
+                      f"{'PASS' if (ei <= eqtol and fc <= eqtol) else 'FAIL'}")
+                ok = ok and (ei <= eqtol and fc <= eqtol)
+        except Exception as ex:
+            import traceback; traceback.print_exc()
+            print(f"[aoti] VARY-N call FAILED: {type(ex).__name__}: {ex}")
+            ok = False
+        del eNe, fNe
 
     # Free the trace/export/compile intermediates before timing. Otherwise on large
     # float64 systems the script holds eager refs + flat gm + ExportedProgram +

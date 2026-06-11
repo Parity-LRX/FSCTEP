@@ -318,6 +318,13 @@ class CompiledForceCache:
         self._model = model
         self._max_slots = int(max_slots)
         self._cache: dict[tuple, Callable] = {}
+        # NOTE: a single-slot ("N-dynamic") cache does NOT help the TRAINING path. e3nn jit_script_fx=False
+        # makes the make_fx flatten N-symbolic (which IS what unblocks the AOTI torch.export deploy), but
+        # torch.compile's dynamo RE-specializes N when it retraces the flat GraphModule (mark_dynamic ->
+        # ConstraintViolationError "size inferred constant", dynamic=True -> silent ~73s recompile per new
+        # N). So the per-N recompile lives in dynamo, not here; keep the explicit per-shape slots so the
+        # compile count is at least bounded and visible. (Deploy N-dynamic uses torch.export, not
+        # torch.compile, which DOES honor explicit Dims.)
 
     def get(
         self,
