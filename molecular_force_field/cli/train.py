@@ -1256,6 +1256,20 @@ def main():
                              'shape change mid-run or a capture failure) transparently falls back to the eager '
                              'train_epoch. Best for launch-bound (small-atom) regimes; limited benefit when '
                              'compute-bound at large atom counts. Mutually exclusive with --train-compiled-autograd.')
+    parser.add_argument('--train-makefx-compile', action='store_true',
+                        help='make_fx-compile training: flatten forward + inner force-autograd into one FX '
+                             'graph and torch.compile(inductor, dynamic=True) it, so the optimizer-step backward '
+                             'is a single ordinary backward over the flat graph -- the way to compile a 2nd-order '
+                             'force-loss step (AOTAutograd cannot double-backward; this also dissolves the fusion '
+                             'None-accumulate that blocks --train-compiled-autograd). make_fx bakes the concrete '
+                             'atom/edge counts into the flat graph, so it compiles one graph PER distinct input '
+                             'size (cached; a handful of slab sizes like {695,701,703} compile that many times '
+                             'then hit cache forever; too many distinct sizes overflow a budget and fall back to '
+                             'eager). PAIR WITH --pad-edges-to-max to hold edge count fixed so only atom count '
+                             'varies. Restricted to the plain energy+force regime (no stress/phys/fidelity/'
+                             'external); anything else, or a trace/compile failure, transparently falls back to '
+                             'eager. Best for COMPUTE-bound large systems (slab) where cuda-graph plateaus. '
+                             'Mutually exclusive with --train-cuda-graph and --train-compiled-autograd.')
     parser.add_argument('--pad-edges-to-max', action='store_true',
                         help='Pad every frame\'s edge list to a fixed E_max (the dataset\'s longest neighbor '
                              'list, summarized at preprocess into the h5 `max_edges` attr, else scanned once at '
@@ -1264,6 +1278,18 @@ def main():
                              '(validated bit-identical). This is what makes a variable-NEIGHBOR-count dataset '
                              '(fixed atoms, moving neighbors) usable with --train-cuda-graph / fixed-shape '
                              'compiled-autograd. Auto-enabled when --train-cuda-graph is set.')
+    parser.add_argument('--pad-nodes-to-max', action='store_true',
+                        help='Pad every frame to a fixed atom count N_max (dataset high-water-mark, summarized '
+                             'at preprocess into the h5 `max_atoms` attr, else scanned once at load) with dummy '
+                             'atoms. The dummies carry no edges (precomputed edge list never references them) -> '
+                             'only a species embedding -> coord-independent energy -> zero force; an emitted '
+                             'atom_mask zeros their energy and excludes them from loss denominators, so the padded '
+                             'batch is numerically IDENTICAL to the unpadded one (validated). Auto-enables '
+                             '--pad-edges-to-max so the WHOLE graph shape is fixed -> make_fx-compile traces ONE '
+                             'graph for any batch / batch-size / system size (the per-N cache collapses to a single '
+                             'slot). This is what makes --train-makefx-compile usable with BATCH-SIZE>1 and wide '
+                             'atom-count datasets (without it, bs>1 makes the total atom count vary every batch and '
+                             'overflow the per-shape compile budget).')
 
     # 推理模式：保存到 checkpoint，供 evaluate/inference_ddp 使用；TorchScript/LAMMPS 导出始终只输出能量和力
     parser.add_argument('--inference-output-physical-tensors', action='store_true',
@@ -1864,7 +1890,8 @@ def main():
             'train', data_dir=args.data_dir, file_path=args.train_data,
             extra_label_paths=extra_label_paths,
             extra_per_node_label_path=args.extra_per_node_file,
-            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph),
+            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph or args.pad_nodes_to_max),
+            pad_nodes_to_max=args.pad_nodes_to_max,
         )
         val_dataset = H5Dataset(
             'val', data_dir=args.data_dir, file_path=args.valid_data,
@@ -1877,7 +1904,8 @@ def main():
             args.train_prefix, data_dir=args.data_dir,
             extra_label_paths=extra_label_paths,
             extra_per_node_label_path=args.extra_per_node_file,
-            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph),
+            pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph or args.pad_nodes_to_max),
+            pad_nodes_to_max=args.pad_nodes_to_max,
         )
         val_dataset = H5Dataset(
             args.val_prefix, data_dir=args.data_dir,
@@ -3025,6 +3053,7 @@ def main():
         train_compiled_autograd=args.train_compiled_autograd,
         compiled_autograd_dynamic=(not args.train_ca_static),
         train_cuda_graph=args.train_cuda_graph,
+        train_makefx_compile=args.train_makefx_compile,
         inference_output_physical_tensors=args.inference_output_physical_tensors,
         physical_tensor_weights=physical_tensor_weights,
         fidelity_loss_weights=fidelity_loss_weights,

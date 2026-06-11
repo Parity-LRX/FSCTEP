@@ -154,6 +154,13 @@ class Trainer:
         # single-GPU, smooth-l1, constant loss weights, no phys/fidelity/external;
         # otherwise it transparently falls back to the eager train_epoch. Opt-in.
         train_cuda_graph: bool = False,
+        # Training-step make_fx-compile: flattens forward + inner force-autograd into one
+        # FX graph and torch.compile(inductor, dynamic=True)'s it, so the optimizer-step
+        # backward is a single ordinary backward over the flat graph (no 2nd-order limit;
+        # dissolves the fusion None-accumulate that blocks compiled-autograd). Restricted
+        # to the plain energy+force regime (no stress/phys/fidelity/external); otherwise
+        # the per-batch compute transparently falls back to eager. Opt-in.
+        train_makefx_compile: bool = False,
         # 推理模式：保存到 checkpoint，evaluate/inference_ddp 可读取；TorchScript/LAMMPS 导出始终只输出能量和力
         inference_output_physical_tensors: bool = False,
         # 物理张量 loss 系数：{"charge": 1.0, "dipole": 2.0, ...}，未指定则 1.0；charge_per_atom 用 charge
@@ -272,6 +279,17 @@ class Trainer:
         self._cg_warned = False
         self._cg_recaptures = 0        # option-2 high-water-mark: re-captures done on shape growth
         self._cg_recapture_budget = 8  # cap re-captures; beyond this, shapes truly thrash -> eager
+        # make_fx-compile training-step path. Mutually exclusive with cuda-graph and
+        # compiled-autograd (all three rewrite the backward by different means); prefer
+        # the others if both are set, since make_fx is the heavier compile investment.
+        self.train_makefx_compile = bool(train_makefx_compile)
+        if self.train_makefx_compile and (self.train_cuda_graph or self.train_compiled_autograd):
+            other = "cuda-graph" if self.train_cuda_graph else "compiled-autograd"
+            logging.warning(f"train_makefx_compile is mutually exclusive with {other}; "
+                            f"disabling make_fx-compile.")
+            self.train_makefx_compile = False
+        self._makefx_disabled = False  # permanently fell back to eager (trace/compile failed)
+        object.__setattr__(self, "_makefx_cache", None)  # compiled-callable cache, outside the module tree
         self._val_compiled_current = None
         self._val_compiled_ema = None
         self._val_compile_failed_current = False
@@ -1344,6 +1362,41 @@ class Trainer:
         g = m[..., 2, 0]; h = m[..., 2, 1]; i = m[..., 2, 2]
         return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
 
+    def _makefx_forward_forces(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
+        """make_fx-compiled ``(E_per_atom, dE/dpos)`` for the plain energy+force regime.
+
+        Flattens forward + the inner ``autograd.grad`` force derivative into one FX
+        graph then ``torch.compile``s it, so the caller's ``loss.backward()`` does a
+        single ordinary backward over the flat graph -- no second-order limit, and
+        (unlike compiled-autograd) the fusion None-accumulate dissolves. Compiled
+        once per train/eval mode, cached outside the nn.Module tree; ``dynamic=True``
+        absorbs per-batch N/E changes. Returns ``E_per_atom`` (pre-offset, [N,1]) and
+        the raw gradient ``dE/dpos`` (matching the eager ``grads[0]``)."""
+        from molecular_force_field.training.makefx_compile import CompiledForceCache
+        base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
+        if getattr(self, "_makefx_cache", None) is None:
+            object.__setattr__(self, "_makefx_cache", CompiledForceCache(base_e3))
+
+        def _factory(model, *, training):
+            def compute_fn(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
+                p = pos.detach().requires_grad_(True)
+                e_atom = model(p, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+                if isinstance(e_atom, tuple):
+                    e_atom = e_atom[0]
+                # E_per_atom.sum() == E_mean.sum() (the per-type offset is pos-independent),
+                # so this gradient is the exact eager dE/dpos.
+                grad = torch.autograd.grad(e_atom.sum(), p, create_graph=training)[0]
+                return e_atom, grad
+            return compute_fn
+
+        example_inputs = (pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        compiled = self._makefx_cache.get(
+            example_inputs,
+            training=bool(base_e3.training),
+            compute_fn_factory=_factory,
+        )
+        return compiled(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+
     def _train_compute(self, pos, A, batch_idx, force_ref, target_energies,
                        edge_src, edge_dst, edge_shifts, cell, stress_ref, extras,
                        *, capture_safe: bool = False):
@@ -1357,9 +1410,23 @@ class Trainer:
         capture_safe=True it swaps in host-sync-free variants (_safe_smooth_l1, _det3x3)
         so it can be captured into a CUDA graph; in that mode the caller guarantees no
         fidelity weights / phys / external heads / weighted-mse so the results match."""
-        # Map atomic energies
+        # Optional node-padding mask (pad_nodes_to_max): a per-node 1/0 flag (real/dummy). Used to
+        # zero dummy-atom contributions everywhere so a batch padded to a fixed N_max is numerically
+        # IDENTICAL to the unpadded batch. atom_mask=None (no padding) takes the original path
+        # verbatim -> bit-identical for existing training.
+        atom_mask = None
+        if isinstance(extras, dict) and torch.is_tensor(extras.get("atom_mask", None)):
+            atom_mask = extras["atom_mask"].to(device=self.device, dtype=pos.dtype).view(-1)
+
+        def _mol_sum(x):
+            """Per-molecule scatter-sum with dummy atoms zeroed (mask broadcast over trailing dims)."""
+            if atom_mask is not None:
+                x = x * atom_mask.view([-1] + [1] * (x.dim() - 1))
+            return scatter(x, batch_idx, dim=0, reduce='sum')
+
+        # Map atomic energies (dummy atoms' per-type offset zeroed by the mask)
         mapped_A = map_tensor_values(A, self.keys, self.values).to(self.device)
-        E_offset_mol = scatter(mapped_A, batch_idx, dim=0, reduce='sum')
+        E_offset_mol = _mol_sum(mapped_A)
 
         # Apply per-molecule strain for stress computation
         compute_stress = (self.c > 0)
@@ -1415,37 +1482,70 @@ class Trainer:
         supports_phys = hasattr(base_e3, "physical_tensor_heads") and base_e3.physical_tensor_heads is not None
 
         phys_pred = None
-        if want_phys and supports_phys:
-            try:
-                E_per_atom, phys_pred = self.e3trans(
-                    pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
-                    return_physical_tensors=True,
-                    **forward_kwargs,
-                )
-            except TypeError:
-                E_per_atom, phys_pred = self.e3trans(
-                    pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
-                    return_physical_tensors=True,
-                )
-        else:
-            try:
-                E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
-            except TypeError:
-                E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
-        E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
-        E_mean = E_conv_mol + E_offset_mol
-
-        # Compute forces (and stress if enabled)
-        grad_targets = [pos]
-        if compute_stress:
-            grad_targets.append(strain)
-
-        grads = torch.autograd.grad(
-            E_mean.sum(),
-            grad_targets,
-            create_graph=True,
-            retain_graph=True
+        # make_fx-compile fast path: flatten forward + inner force-autograd into one
+        # FX graph and torch.compile it, so the outer loss.backward() does a single
+        # ordinary backward over the flat graph (sidestepping the 2nd-order limit).
+        # Restricted to the plain energy+force regime -- no stress / phys heads /
+        # fidelity / external field, and never on the capture_safe (cuda-graph) path.
+        # On any trace/compile error it disables itself and falls back to eager.
+        use_makefx = (
+            getattr(self, "train_makefx_compile", False)
+            and not getattr(self, "_makefx_disabled", False)
+            and not capture_safe
+            and not compute_stress
+            and not (want_phys and supports_phys)
+            and num_fidelity_levels == 0
+            and not external_specs
+            and "external_field" not in extras
         )
+        if use_makefx:
+            try:
+                E_per_atom, mfx_grad = self._makefx_forward_forces(
+                    pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+            except Exception as e:
+                object.__setattr__(self, "_makefx_disabled", True)
+                logging.warning(
+                    f"train_makefx_compile failed ({type(e).__name__}: {e}); "
+                    f"disabling it and falling back to eager for the rest of training.")
+                use_makefx = False
+
+        if use_makefx:
+            E_conv_mol = _mol_sum(E_per_atom).squeeze(-1)
+            E_mean = E_conv_mol + E_offset_mol
+            # mfx_grad is dE/dpos, matching the eager grads[0]; no stress target here.
+            grads = (mfx_grad,)
+        else:
+            if want_phys and supports_phys:
+                try:
+                    E_per_atom, phys_pred = self.e3trans(
+                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                        return_physical_tensors=True,
+                        **forward_kwargs,
+                    )
+                except TypeError:
+                    E_per_atom, phys_pred = self.e3trans(
+                        pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input,
+                        return_physical_tensors=True,
+                    )
+            else:
+                try:
+                    E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input, **forward_kwargs)
+                except TypeError:
+                    E_per_atom = self.e3trans(pos_input, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_input)
+            E_conv_mol = _mol_sum(E_per_atom).squeeze(-1)
+            E_mean = E_conv_mol + E_offset_mol
+
+            # Compute forces (and stress if enabled)
+            grad_targets = [pos]
+            if compute_stress:
+                grad_targets.append(strain)
+
+            grads = torch.autograd.grad(
+                E_mean.sum(),
+                grad_targets,
+                create_graph=True,
+                retain_graph=True
+            )
 
         force_grads = grads[0]
         fx_pred = self.train_dataset.restore_force(-force_grads[:, 0])
@@ -1471,18 +1571,27 @@ class Trainer:
             batch_idx,
             dtype=pos.dtype,
         )
+        # Exclude dummy atoms (pad_nodes_to_max) from the force loss + metrics: they have
+        # f_pred=f_ref=0 but would otherwise dilute the mean / rmse denominators. Selecting
+        # real atoms keeps the padded batch's force loss equal to the unpadded one.
+        if atom_mask is not None:
+            mb = atom_mask.bool()
+            f_pred_l, force_ref_l = f_pred[mb], force_ref_scaled[mb]
+            atom_fid_w_l = atom_fidelity_weights[mb] if atom_fidelity_weights is not None else None
+        else:
+            f_pred_l, force_ref_l, atom_fid_w_l = f_pred, force_ref_scaled, atom_fidelity_weights
         if capture_safe:
-            force_loss = self._safe_smooth_l1(f_pred, force_ref_scaled)
+            force_loss = self._safe_smooth_l1(f_pred_l, force_ref_l)
         else:
             force_loss, _, _ = self._regression_loss_stats(
-                f_pred,
-                force_ref_scaled,
-                weights=atom_fidelity_weights,
+                f_pred_l,
+                force_ref_l,
+                weights=atom_fid_w_l,
             )
 
         with torch.no_grad():
-            force_rmse = torch.sqrt(self.criterion_2(f_pred.view(-1), force_ref_scaled.view(-1)))
-            force_mae = F.l1_loss(f_pred.view(-1), force_ref_scaled.view(-1))
+            force_rmse = torch.sqrt(self.criterion_2(f_pred_l.view(-1), force_ref_l.view(-1)))
+            force_mae = F.l1_loss(f_pred_l.view(-1), force_ref_l.view(-1))
 
         # Stress loss
         if compute_stress:
@@ -1502,8 +1611,11 @@ class Trainer:
             stress_rmse = torch.tensor(0.0, device=self.device)
             stress_mae = torch.tensor(0.0, device=self.device)
 
-        # Energy loss
-        num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
+        # Energy loss (per-molecule atom count counts REAL atoms only when node-padded)
+        if atom_mask is not None:
+            num_atoms_per_mol = scatter(atom_mask, batch_idx, dim=0, reduce='sum')
+        else:
+            num_atoms_per_mol = scatter(torch.ones_like(batch_idx), batch_idx, dim=0, reduce='sum')
         E_avg_pred = E_mean / num_atoms_per_mol
         target_energy_avg = target_energies / num_atoms_per_mol
         if capture_safe:
@@ -3090,7 +3202,7 @@ class Trainer:
             E_per_atom = out[0] if isinstance(out, tuple) else out
             if isinstance(out, tuple) and len(out) >= 2:
                 phys_pred = out[1]
-            E_conv_mol = scatter(E_per_atom, batch_idx, dim=0, reduce='sum').squeeze(-1)
+            E_conv_mol = _mol_sum(E_per_atom).squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
 
             grad_targets = [pos]

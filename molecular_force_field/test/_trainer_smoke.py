@@ -131,21 +131,115 @@ def run_ca_check(label, route, dtype, device, atoms, ckpt_dir, *, stress=False):
     return ok
 
 
+def run_makefx_compare(label, route, dtype, device, atoms, ckpt_dir):
+    """Train one epoch eagerly and one via --train-makefx-compile on identical init
+    weights + data; assert weights match within tol and moved. make_fx flattens the
+    forward + force-autograd then torch.compile's it, so Inductor REORDERS float ops:
+    this is machine-precision close, NOT the bit-identical replay cuda-graph gives, so
+    the tolerance is looser. Also asserts the path actually engaged (didn't fall back)."""
+    torch.manual_seed(0)
+    te = build_trainer(route, dtype, device, atoms, ckpt_dir)
+    w0 = _weight_vec(te)
+    me = te.train_epoch(0)
+    we = _weight_vec(te)
+
+    torch.manual_seed(0)
+    tm = build_trainer(route, dtype, device, atoms, ckpt_dir, train_makefx_compile=True)
+    mm = tm.train_epoch(0)
+    wm = _weight_vec(tm)
+    used = bool(tm.train_makefx_compile) and not bool(getattr(tm, "_makefx_disabled", True))
+
+    dE = abs(me["energy_loss"] - mm["energy_loss"])
+    dF = abs(me["force_loss"] - mm["force_loss"])
+    dw = (we - wm).abs().max().item()
+    wscale = we.abs().max().item() + 1e-30
+    moved = (we - w0).abs().max().item() > 0
+    tol = 1e-6 if dtype == torch.float64 else 5e-3
+    ok = used and (dw / wscale) <= tol and moved
+    print(f"[mfx-smoke] {label:30s} used={used} dE={dE:.2e} dF={dF:.2e} d_w(rel)={dw/wscale:.2e} "
+          f"moved={moved} {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def _pad_batch(batch, n_max):
+    """Append dummy atoms to a collated batch to reach n_max nodes, emitting atom_mask in extras.
+    Dummies: pos=0 (no edges reference them), species copies a real one, force 0, batch_idx=0.
+    Mirrors H5Dataset.pad_nodes_to_max + collate so we can test the trainer's masking end-to-end."""
+    pos, A, batch_idx, force_ref, target_e, src, dst, shifts, cell, stress = batch
+    N = pos.shape[0]
+    npad = n_max - N
+    if npad <= 0:
+        extras = {"atom_mask": torch.ones(N, dtype=pos.dtype)}
+        return (pos, A, batch_idx, force_ref, target_e, src, dst, shifts, cell, stress, extras)
+    pos_p = torch.cat([pos, pos.new_zeros(npad, 3)])
+    A_p = torch.cat([A, A[:1].expand(npad).clone()])
+    f_p = torch.cat([force_ref, force_ref.new_zeros(npad, 3)])
+    bi_p = torch.cat([batch_idx, batch_idx.new_zeros(npad)])  # dummies belong to molecule 0 (energy masked out)
+    mask = torch.cat([torch.ones(N, dtype=pos.dtype), torch.zeros(npad, dtype=pos.dtype)])
+    return (pos_p, A_p, bi_p, f_p, target_e, src, dst, shifts, cell, stress, {"atom_mask": mask})
+
+
+def run_padnodes_compare(label, route, dtype, device, atoms, ckpt_dir, *, stress=False):
+    """Train one epoch on the plain batches and one on the SAME batches padded with dummy atoms
+    (+ atom_mask); assert weights + losses are bit-identical (dummies must not perturb anything).
+    This is the numerical gate for pad_nodes_to_max: a padded batch must equal the unpadded one."""
+    torch.manual_seed(0)
+    tu = build_trainer(route, dtype, device, atoms, ckpt_dir, stress=stress)
+    w0 = _weight_vec(tu)
+    mu = tu.train_epoch(0)
+    wu = _weight_vec(tu)
+
+    torch.manual_seed(0)
+    tp = build_trainer(route, dtype, device, atoms, ckpt_dir, stress=stress)
+    n_max = atoms + 7  # pad every frame to atoms+7 dummy-padded nodes
+    tp.train_loader = [_pad_batch(b, n_max) for b in tp.train_loader]
+    mp = tp.train_epoch(0)
+    wp = _weight_vec(tp)
+
+    dE = abs(mu["energy_loss"] - mp["energy_loss"])
+    dF = abs(mu["force_loss"] - mp["force_loss"])
+    dw = (wu - wp).abs().max().item()
+    wscale = wu.abs().max().item() + 1e-30
+    moved = (wu - w0).abs().max().item() > 0
+    tol = 1e-9 if dtype == torch.float64 else 1e-4
+    ok = (dE <= tol) and (dF <= tol) and (dw / wscale <= tol) and moved
+    print(f"[padnodes] {label:28s} dE={dE:.2e} dF={dF:.2e} d_w(rel)={dw/wscale:.2e} "
+          f"moved={moved} {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # MFF_SMOKE_SUITE: "all" (default, original suite) / "makefx" (only make_fx vs eager) /
+    # "all+makefx" (everything). make_fx is gated off the default run because it triggers
+    # an Inductor compile (slow on CPU) and is the newest, opt-in path.
+    suite = os.environ.get("MFF_SMOKE_SUITE", "all").strip().lower()
+    run_base = suite in ("all", "all+makefx")
+    run_mfx = suite in ("makefx", "all+makefx")
+    run_padnodes = suite in ("padnodes", "all+makefx")
     with tempfile.TemporaryDirectory() as ckpt_dir:
         ok = True
-        ok &= run_epoch("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
-        ok &= run_epoch("fusion energy+force+stress", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
-        ok &= run_epoch("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
-        # CUDA-graph path must match eager (numerically identical replay).
-        ok &= run_cg_compare("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
-        ok &= run_cg_compare("fusion energy+force+stress", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
-        ok &= run_cg_compare("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
-        # --train-compiled-autograd must actually engage (not silently fall back to eager).
-        ok &= run_ca_check("fusion +compiled-autograd", "fusion", torch.float64, device, 48, ckpt_dir)
-        ok &= run_ca_check("fusion+stress +CA", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
-        ok &= run_ca_check("baseline +CA", "baseline", torch.float64, device, 48, ckpt_dir)
+        if run_base:
+            ok &= run_epoch("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
+            ok &= run_epoch("fusion energy+force+stress", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
+            ok &= run_epoch("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
+            # CUDA-graph path must match eager (numerically identical replay).
+            ok &= run_cg_compare("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
+            ok &= run_cg_compare("fusion energy+force+stress", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
+            ok &= run_cg_compare("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
+            # --train-compiled-autograd must actually engage (not silently fall back to eager).
+            ok &= run_ca_check("fusion +compiled-autograd", "fusion", torch.float64, device, 48, ckpt_dir)
+            ok &= run_ca_check("fusion+stress +CA", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
+            ok &= run_ca_check("baseline +CA", "baseline", torch.float64, device, 48, ckpt_dir)
+        if run_padnodes:
+            # pad_nodes_to_max must be bit-identical to unpadded (dummy atoms perturb nothing).
+            ok &= run_padnodes_compare("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
+            ok &= run_padnodes_compare("fusion energy+force+stress", "fusion", torch.float64, device, 48, ckpt_dir, stress=True)
+            ok &= run_padnodes_compare("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
+        if run_mfx:
+            # make_fx-compile path must match eager (machine-precision, Inductor reorders floats).
+            ok &= run_makefx_compare("fusion energy+force", "fusion", torch.float64, device, 48, ckpt_dir)
+            ok &= run_makefx_compare("baseline energy+force", "baseline", torch.float64, device, 48, ckpt_dir)
     print(f"[smoke] {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

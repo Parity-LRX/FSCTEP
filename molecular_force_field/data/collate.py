@@ -110,6 +110,11 @@ def collate_fn_h5(batch_list):
         "polarizability_per_atom",
         "quadrupole_per_atom",
         "born_effective_charge_per_atom",
+        # node-padding mask (pad_nodes_to_max): concatenated per-node like a label so it
+        # rides through to the trainer, which uses it to zero dummy-atom energy + exclude
+        # dummies from loss denominators. Per-frame offsets work unchanged because pos is
+        # already padded to N_max in __getitem__ (collate's node_offset uses pos.shape[0]).
+        "atom_mask",
     )
     
     node_offset = 0

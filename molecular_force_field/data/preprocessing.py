@@ -935,6 +935,7 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
         try:
             print("Writing results to HDF5...")
             max_edges = 0  # summarize the longest neighbor list across frames (for fixed-shape edge padding / CUDA-graph)
+            max_atoms = 0  # longest atom count across frames (for fixed-shape node padding / make_fx-compile)
             for res in tqdm(
                 result_iterator,
                 total=total_frames,
@@ -944,6 +945,7 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
             ):
                 idx = res['idx']
                 max_edges = max(max_edges, int(res['edge_src'].shape[0]))
+                max_atoms = max(max_atoms, int(blocks[idx].shape[0]))
                 block = blocks[idx]
                 # Validation
                 pos_original = block[:, 0:3].astype(np.float64)
@@ -973,7 +975,9 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
                 else:
                     g.create_dataset('stress', data=np.zeros((3, 3), dtype=np.float64))
             f.attrs['max_edges'] = int(max_edges)
+            f.attrs['max_atoms'] = int(max_atoms)
             print(f"Stored max_edges={max_edges} attr (longest neighbor list; for fixed-shape edge padding / CUDA-graph).")
+            print(f"Stored max_atoms={max_atoms} attr (longest atom count; for fixed-shape node padding / make_fx-compile).")
         finally:
             if num_workers > 1:
                 executor.shutdown()
