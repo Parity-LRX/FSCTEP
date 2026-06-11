@@ -388,11 +388,19 @@ class Trainer:
         # If checkpoint_path is a filename (not a full path), save it in checkpoint directory
         if os.path.dirname(checkpoint_path) == '':
             base_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
-            self.checkpoint_save_path = os.path.join(self.checkpoint_dir, f'{base_name}{self.tensor_product_suffix}.pth')
+            # idempotent: don't double-append the mode suffix if --checkpoint already carries it
+            # (e.g. --checkpoint model_pure_cartesian_ictd_fix.pth must NOT become
+            # model_pure_cartesian_ictd_fix_pure_cartesian_ictd_fix.pth)
+            _bn = base_name if base_name.endswith(self.tensor_product_suffix) else base_name + self.tensor_product_suffix
+            self.checkpoint_save_path = os.path.join(self.checkpoint_dir, f'{_bn}.pth')
         else:
             # If it's a full path, extract filename and save to checkpoint directory
             base_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
-            self.checkpoint_save_path = os.path.join(self.checkpoint_dir, f'{base_name}{self.tensor_product_suffix}.pth')
+            # idempotent: don't double-append the mode suffix if --checkpoint already carries it
+            # (e.g. --checkpoint model_pure_cartesian_ictd_fix.pth must NOT become
+            # model_pure_cartesian_ictd_fix_pure_cartesian_ictd_fix.pth)
+            _bn = base_name if base_name.endswith(self.tensor_product_suffix) else base_name + self.tensor_product_suffix
+            self.checkpoint_save_path = os.path.join(self.checkpoint_dir, f'{_bn}.pth')
         self.use_checkpoint_loss_weights = use_checkpoint_loss_weights  # Whether to use checkpoint a/b
         self.train_eval_sample_ratio = train_eval_sample_ratio  # Ratio of training set to evaluate (0.0-1.0)
         self.log_val_batch_energy_to_console = log_val_batch_energy_to_console  # Whether to log validation batch energy to console (default: False, only to file)
