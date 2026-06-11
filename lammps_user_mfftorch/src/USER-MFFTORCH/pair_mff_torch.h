@@ -52,6 +52,9 @@ class PairMFFTorch : public Pair {
 
   double cut_global_ = 0.0;
   double cutsq_global_ = 0.0;
+  // Message-passing depth (num_interaction). The ghost halo is extended to mp_depth_*cutoff so each
+  // local atom's full K-hop environment is present -> correct under MPI domain decomposition.
+  int mp_depth_ = 2;
 
   std::string device_str_ = "cuda";
   std::string core_pt_path_;

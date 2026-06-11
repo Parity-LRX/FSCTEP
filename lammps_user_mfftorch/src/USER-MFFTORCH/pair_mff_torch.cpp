@@ -1,6 +1,7 @@
 #include "pair_mff_torch.h"
 
 #include "atom.h"
+#include "comm.h"
 #include "domain.h"
 #include "error.h"
 #include "force.h"
@@ -289,16 +290,16 @@ void PairMFFTorch::coeff(int narg, char **arg) {
 void PairMFFTorch::init_style() {
   if (core_pt_path_.empty()) error->all(FLERR, "pair_coeff for mff/torch must specify core.pt path");
 
-  // Request a full neighbor list.
-  neighbor->add_request(this, NeighConst::REQ_FULL);
-
-  // We fold periodic-ghost neighbors back to their local owner (atom->map) + an integer cell shift
-  // so the model sees the TRAINING graph topology (local nodes + PBC shifts) rather than ghost
-  // NODES. That requires an atom map.
-  if (atom->map_style == Atom::MAP_NONE)
-    error->all(FLERR,
-               "pair_style mff/torch needs an atom map to fold periodic ghosts to local atoms; "
-               "add 'atom_modify map yes' before the box is created");
+  // A num_interaction-layer message-passing model needs each LOCAL atom's full K-hop environment.
+  // We get it WITHOUT per-layer communication by (1) requesting a GHOST neighbor list so ghost atoms
+  // are also graph centers (with their own edges -> correct features), and (2) extending the ghost
+  // halo to mp_depth_*cutoff so every local atom's K-hop neighbours are present as ghosts. The model
+  // runs on the full local+ghost halo graph and we keep only the LOCAL atom energies/forces. This is
+  // correct under MPI domain decomposition -- unlike folding ghosts to a local owner (atom->map),
+  // which only works on a single subdomain because a boundary ghost's owner lives on another rank.
+  neighbor->add_request(this, NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
+  const double halo = static_cast<double>(mp_depth_) * cut_global_;
+  if (comm->cutghostuser < halo) comm->cutghostuser = halo;
 
   try {
     if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
@@ -610,8 +611,11 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   // Count edges (upper bound) and build edges + lattice shifts.
   // Reuse persistent buffers to avoid heap allocation every step.
+  // Iterate LOCAL + GHOST centers (REQ_GHOST gives ghost atoms neighbor lists too); ilist has
+  // inum local then gnum ghost entries. Ghosts-as-centers is what gives them correct features.
+  const int ncenters = inum + list->gnum;
   int64_t Emax = 0;
-  for (int ii = 0; ii < inum; ii++) {
+  for (int ii = 0; ii < ncenters; ii++) {
     int i = ilist[ii];
     Emax += numneigh[i];
   }
@@ -622,7 +626,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   buf_edge_dst_cpu_.reserve(static_cast<size_t>(Emax));
   buf_edge_shifts_cpu_.reserve(static_cast<size_t>(Emax) * 3);
 
-  for (int ii = 0; ii < inum; ii++) {
+  for (int ii = 0; ii < ncenters; ii++) {
     int i = ilist[ii];
     int jnum = numneigh[i];
     int *jlist = firstneigh[i];
@@ -646,26 +650,18 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       const double rsq = delx * delx + dely * dely + delz * delz;
       if (rsq > cutsq_global_) continue;
 
-      // Fold the (possibly periodic-ghost) neighbor j back to its LOCAL owner jl + integer cell
-      // offset g (x[j] = x[jl] + g@cell), and emit the edge as neighbor->center with shift -g.
-      // The model then computes edge_vec = x[i] - x[jl] - g@cell = x[i] - x[j] (the correct
-      // displacement) and aggregates the neighbor's features INTO local center i -- matching the
-      // training graph (local nodes + PBC shifts). Emitting ghost NODES instead (center i -> ghost j,
-      // shift 0) makes a multi-layer message-passing model undercount cross-boundary messages and
-      // mis-target aggregation, giving energies wrong by ~0.1 eV/atom on periodic systems. (Folding
-      // to local indices also lands forces directly on the local owner -- no reverse comm needed.)
-      const int jl = atom->map(atom->tag[j]);
-      const double dxl = x[j][0] - x[jl][0];
-      const double dyl = x[j][1] - x[jl][1];
-      const double dzl = x[j][2] - x[jl][2];
-      const int gx = nearest_int(dxl * geom.inv[0][0] + dyl * geom.inv[1][0] + dzl * geom.inv[2][0]);
-      const int gy = nearest_int(dxl * geom.inv[0][1] + dyl * geom.inv[1][1] + dzl * geom.inv[2][1]);
-      const int gz = nearest_int(dxl * geom.inv[0][2] + dyl * geom.inv[1][2] + dzl * geom.inv[2][2]);
-      buf_edge_src_cpu_.push_back(static_cast<int64_t>(jl));
+      // Edge: neighbor j -> center i (the model puts edge features on edge_src and scatters into
+      // edge_dst, so the CENTER must be the dst). j keeps its (possibly ghost) index -- ghosts are
+      // real graph nodes here, with their own edges, so their features are correct. edge_vec =
+      // x[i]-x[j]+shift@cell; the ghost already carries the periodic image (min-image sx==0 in the
+      // halo), so shift = -(sx,sy,sz) is the robust value (0 for ghost edges). This is the convention
+      // the model was trained with (center aggregates neighbours) and is correct under MPI domain
+      // decomposition because j's features come from j-as-a-center, not from a cross-rank owner.
+      buf_edge_src_cpu_.push_back(static_cast<int64_t>(j));
       buf_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(-gx));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(-gy));
-      buf_edge_shifts_cpu_.push_back(static_cast<float>(-gz));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sx));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sy));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sz));
     }
   }
 
