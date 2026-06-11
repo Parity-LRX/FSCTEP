@@ -123,6 +123,14 @@ class MFFTorchEngine {
   std::unique_ptr<torch::inductor::AOTIModelPackageLoader> aoti_loader_;
 #endif
   bool aoti_mode_ = false;   // true when core was loaded from an AOTI .pt2 (force in-graph)
+  // AOTI .pt2 bakes the atom count N. Pad ntotal up to aoti_nmax_ each step (dummy atoms = valid
+  // species, no edges -> inert) and slice the first ntotal outputs back; when ntotal exceeds
+  // aoti_nmax_ (e.g. a ghost-count spike), fall back to the N-flexible TorchScript core_. Read from a
+  // sidecar "<core>.pt2.meta" (nmax / pad_z / fallback). aoti_nmax_==0 -> no padding (legacy .pt2).
+  int64_t aoti_nmax_ = 0;
+  int64_t aoti_pad_z_ = 1;          // atomic number for dummy padding atoms (must be a valid embedding Z)
+  bool have_ts_fallback_ = false;   // core_ holds an N-flexible TorchScript core for ntotal > nmax_
+  bool aoti_fallback_warned_ = false;
   bool loaded_ = false;
   bool bundle_mode_ = false;
   std::string bundle_manifest_path_;

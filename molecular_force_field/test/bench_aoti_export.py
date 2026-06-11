@@ -148,6 +148,9 @@ def main() -> int:
                    help="add E0(Z) atomic reference energies into the exported per-atom energy, so the .pt2 returns "
                         "ABSOLUTE energy (a drop-in for an E0-embedded TorchScript core). Forces are unaffected.")
     p.add_argument("--out", default="/tmp/fscetp_aoti.pt2")
+    p.add_argument("--fallback", default=None,
+                   help="path to an N-flexible TorchScript core (.pt) the LAMMPS engine should fall back to "
+                        "when ntotal exceeds this .pt2's baked N (a ghost-count spike). Written into <out>.meta.")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--dynamic", action="store_true",
@@ -276,6 +279,17 @@ def main() -> int:
         print(f"[aoti] aoti_compile_and_package FAILED: {type(ex).__name__}: {ex}")
         return 1
     print(f"[aoti] compiled .pt2 -> {pt2}  ({time.perf_counter()-t0:.1f}s)")
+
+    # Sidecar metadata the LAMMPS engine reads: baked atom count N (-> pad ntotal up to it), a valid
+    # padding species, and an optional N-flexible TorchScript fallback for ntotal > N spikes.
+    meta_path = str(args.out) + ".meta"
+    pad_z = int(species_z[0]) if species_z else 1
+    with open(meta_path, "w") as mf:
+        mf.write(f"nmax {args.atoms}\n")
+        mf.write(f"pad_z {pad_z}\n")
+        if args.fallback:
+            mf.write(f"fallback {args.fallback}\n")
+    print(f"[aoti] wrote {meta_path}  (nmax={args.atoms} pad_z={pad_z} fallback={args.fallback})")
 
     # ---- load back + verify numerics ----
     try:
