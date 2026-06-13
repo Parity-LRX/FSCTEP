@@ -1385,22 +1385,44 @@ class Trainer:
         g = m[..., 2, 0]; h = m[..., 2, 1]; i = m[..., 2, 2]
         return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
 
-    def _makefx_forward_forces(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
-        """make_fx-compiled ``(E_per_atom, dE/dpos)`` for the plain energy+force regime.
+    def _makefx_forward_forces(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, strain=None):
+        """make_fx-compiled ``(E_per_atom, dE/dpos)`` -- and, with ``strain`` given, also
+        ``dE/dstrain`` for the stress/virial loss.
 
-        Flattens forward + the inner ``autograd.grad`` force derivative into one FX
-        graph then ``torch.compile``s it, so the caller's ``loss.backward()`` does a
-        single ordinary backward over the flat graph -- no second-order limit, and
-        (unlike compiled-autograd) the fusion None-accumulate dissolves. Compiled
-        once per train/eval mode, cached outside the nn.Module tree; ``dynamic=True``
-        absorbs per-batch N/E changes. Returns ``E_per_atom`` (pre-offset, [N,1]) and
-        the raw gradient ``dE/dpos`` (matching the eager ``grads[0]``)."""
+        Flattens forward + the inner ``autograd.grad`` derivative(s) into one FX graph
+        then ``torch.compile``s it, so the caller's ``loss.backward()`` does a single
+        ordinary backward over the flat graph -- no second-order limit, and (unlike
+        compiled-autograd) the fusion None-accumulate dissolves. With ``strain`` the
+        flattened graph also carries the strain derivative: positions and cell are
+        deformed by ``I + sym(strain)`` and differentiated at ``strain=0`` (the eager
+        stress deformation, verbatim), so the returned ``dE/dstrain`` matches the eager
+        ``grads[1]``. Compiled once per (mode, input-shape) signature, cached outside the
+        nn.Module tree; ``dynamic=True`` absorbs per-batch N/E changes. Returns
+        ``E_per_atom`` (pre-offset, [N,1]) and ``dE/dpos`` (+ ``dE/dstrain`` with strain)."""
         from molecular_force_field.training.makefx_compile import CompiledForceCache
         base_e3 = self.e3trans.module if (self.distributed and hasattr(self.e3trans, "module")) else self.e3trans
         if getattr(self, "_makefx_cache", None) is None:
             object.__setattr__(self, "_makefx_cache", CompiledForceCache(base_e3))
 
+        stress = strain is not None
+
         def _factory(model, *, training):
+            if stress:
+                def compute_fn(pos, strain, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
+                    p = pos.detach().requires_grad_(True)
+                    s = strain.detach().requires_grad_(True)
+                    # Same deformation as the eager stress path (symmetric strain; I + sym).
+                    sym = 0.5 * (s + s.transpose(-1, -2))
+                    defo = torch.eye(3, dtype=p.dtype, device=p.device) + sym
+                    pos_in = torch.einsum('ni,nij->nj', p, defo[batch_idx])
+                    cell_in = torch.bmm(cell, defo)
+                    e_atom = model(pos_in, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_in)
+                    if isinstance(e_atom, tuple):
+                        e_atom = e_atom[0]
+                    g = torch.autograd.grad(e_atom.sum(), [p, s], create_graph=training)
+                    return e_atom, g[0], g[1]
+                return compute_fn
+
             def compute_fn(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
                 p = pos.detach().requires_grad_(True)
                 e_atom = model(p, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
@@ -1412,13 +1434,16 @@ class Trainer:
                 return e_atom, grad
             return compute_fn
 
-        example_inputs = (pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        if stress:
+            example_inputs = (pos, strain, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        else:
+            example_inputs = (pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
         compiled = self._makefx_cache.get(
             example_inputs,
             training=bool(base_e3.training),
             compute_fn_factory=_factory,
         )
-        return compiled(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        return compiled(*example_inputs)
 
     def _train_compute(self, pos, A, batch_idx, force_ref, target_energies,
                        edge_src, edge_dst, edge_shifts, cell, stress_ref, extras,
@@ -1508,14 +1533,16 @@ class Trainer:
         # make_fx-compile fast path: flatten forward + inner force-autograd into one
         # FX graph and torch.compile it, so the outer loss.backward() does a single
         # ordinary backward over the flat graph (sidestepping the 2nd-order limit).
-        # Restricted to the plain energy+force regime -- no stress / phys heads /
-        # fidelity / external field, and never on the capture_safe (cuda-graph) path.
-        # On any trace/compile error it disables itself and falls back to eager.
+        # Restricted to the energy+force(+stress) regime -- no phys heads / fidelity /
+        # external field, and never on the capture_safe (cuda-graph) path. With stress
+        # on, the strain derivative is flattened into the same FX graph (dE/dstrain), so
+        # make_fx now covers force-loss training WITH stress (the eager fallback below
+        # still handles every excluded regime). On any trace/compile error it disables
+        # itself and falls back to eager.
         use_makefx = (
             getattr(self, "train_makefx_compile", False)
             and not getattr(self, "_makefx_disabled", False)
             and not capture_safe
-            and not compute_stress
             and not (want_phys and supports_phys)
             and num_fidelity_levels == 0
             and not external_specs
@@ -1523,8 +1550,14 @@ class Trainer:
         )
         if use_makefx:
             try:
-                E_per_atom, mfx_grad = self._makefx_forward_forces(
-                    pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+                if compute_stress:
+                    # strain is the zeros leaf the eager path built above; the compiled fn
+                    # rebinds it and deforms pos/cell internally, returning dE/dstrain too.
+                    E_per_atom, mfx_grad, mfx_grad_strain = self._makefx_forward_forces(
+                        pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, strain=strain)
+                else:
+                    E_per_atom, mfx_grad = self._makefx_forward_forces(
+                        pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
             except Exception as e:
                 object.__setattr__(self, "_makefx_disabled", True)
                 logging.warning(
@@ -1535,8 +1568,9 @@ class Trainer:
         if use_makefx:
             E_conv_mol = _mol_sum(E_per_atom).squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
-            # mfx_grad is dE/dpos, matching the eager grads[0]; no stress target here.
-            grads = (mfx_grad,)
+            # mfx_grad is dE/dpos (eager grads[0]); with stress, mfx_grad_strain is
+            # dE/dstrain (eager grads[1]) so the stress code below is unchanged.
+            grads = (mfx_grad, mfx_grad_strain) if compute_stress else (mfx_grad,)
         else:
             if want_phys and supports_phys:
                 try:
