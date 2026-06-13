@@ -936,6 +936,10 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
             print("Writing results to HDF5...")
             max_edges = 0  # summarize the longest neighbor list across frames (for fixed-shape edge padding / CUDA-graph)
             max_atoms = 0  # longest atom count across frames (for fixed-shape node padding / make_fx-compile)
+            # Per-sample sizes (indexed by sample id) baked so make_fx bucketing reads them at load
+            # instead of re-scanning every sample's pos/edge_src shape (O(N) h5 opens -> one read).
+            node_counts = np.zeros(total_frames, dtype=np.int64)
+            edge_counts = np.zeros(total_frames, dtype=np.int64)
             for res in tqdm(
                 result_iterator,
                 total=total_frames,
@@ -946,6 +950,8 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
                 idx = res['idx']
                 max_edges = max(max_edges, int(res['edge_src'].shape[0]))
                 max_atoms = max(max_atoms, int(blocks[idx].shape[0]))
+                edge_counts[idx] = int(res['edge_src'].shape[0])
+                node_counts[idx] = int(blocks[idx].shape[0])
                 block = blocks[idx]
                 # Validation
                 pos_original = block[:, 0:3].astype(np.float64)
@@ -978,6 +984,12 @@ def save_to_h5_parallel(prefix, max_radius, num_workers, data_dir='.'):
             f.attrs['max_atoms'] = int(max_atoms)
             print(f"Stored max_edges={max_edges} attr (longest neighbor list; for fixed-shape edge padding / CUDA-graph).")
             print(f"Stored max_atoms={max_atoms} attr (longest atom count; for fixed-shape node padding / make_fx-compile).")
+            # Per-sample sizes -> a SIDECAR .counts.npz (NOT a top-level h5 dataset, which would
+            # pollute f.keys() and break every "count/iterate samples" reader). make_fx bucketing
+            # reads it at load instead of re-scanning every sample's pos/edge_src shape (O(N) -> O(1));
+            # a missing/stale sidecar transparently falls back to scanning.
+            np.savez(output_file + ".counts.npz", node_counts=node_counts, edge_counts=edge_counts)
+            print(f"Stored per-sample sizes -> {output_file}.counts.npz ({total_frames}) for make_fx bucketing.")
         finally:
             if num_workers > 1:
                 executor.shutdown()

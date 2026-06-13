@@ -1693,8 +1693,9 @@ class Trainer:
 
     def train_epoch(self, epoch):
         """Train for one epoch."""
-        # Set epoch for distributed sampler
-        if self.distributed and self.train_sampler is not None:
+        # Per-epoch reshuffle: DistributedSampler (DDP) AND the make_fx BucketBatchSampler (any
+        # mode) both expose set_epoch; call it whenever present so bucketed runs reshuffle too.
+        if self.train_sampler is not None and hasattr(self.train_sampler, "set_epoch"):
             self.train_sampler.set_epoch(epoch)
         
         self.model.train()

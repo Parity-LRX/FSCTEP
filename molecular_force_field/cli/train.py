@@ -1290,6 +1290,13 @@ def main():
                              'slot). This is what makes --train-makefx-compile usable with BATCH-SIZE>1 and wide '
                              'atom-count datasets (without it, bs>1 makes the total atom count vary every batch and '
                              'overflow the per-shape compile budget).')
+    parser.add_argument('--makefx-buckets', type=str, default=None,
+                        help='Bucket training samples by atom count for --train-makefx-compile: an int K -> K '
+                             'equal-frequency (quantile) buckets, or a comma-list of atom-count upper bounds '
+                             '(e.g. "64,128,256"). Each batch then carries ONE fixed graph shape (one make_fx '
+                             'compile per bucket) while padding to the BUCKET max instead of the global max -> '
+                             'far less padding waste than --pad-nodes-to-max. Implies fixed-shape padding and '
+                             'uses a DDP-aware BucketBatchSampler.')
 
     # 推理模式：保存到 checkpoint，供 evaluate/inference_ddp 使用；TorchScript/LAMMPS 导出始终只输出能量和力
     parser.add_argument('--inference-output-physical-tensors', action='store_true',
@@ -1884,6 +1891,12 @@ def main():
         extra_label_paths["fidelity_id"] = args.fidelity_id_file
     extra_label_paths = extra_label_paths if extra_label_paths else None
 
+    # parse --makefx-buckets: "6" -> int K (quantile buckets); "64,128,256" -> explicit bounds
+    makefx_buckets = None
+    if getattr(args, "makefx_buckets", None):
+        _mb = str(args.makefx_buckets).strip()
+        makefx_buckets = [int(x) for x in _mb.split(",") if x.strip()] if "," in _mb else int(_mb)
+
     # --- Build datasets (from custom paths or data_dir + prefix) ---
     if use_custom_data_paths:
         train_dataset = H5Dataset(
@@ -1892,6 +1905,7 @@ def main():
             extra_per_node_label_path=args.extra_per_node_file,
             pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph or args.pad_nodes_to_max),
             pad_nodes_to_max=args.pad_nodes_to_max,
+            makefx_buckets=makefx_buckets,
         )
         val_dataset = H5Dataset(
             'val', data_dir=args.data_dir, file_path=args.valid_data,
@@ -1906,6 +1920,7 @@ def main():
             extra_per_node_label_path=args.extra_per_node_file,
             pad_edges_to_max=(args.pad_edges_to_max or args.train_cuda_graph or args.pad_nodes_to_max),
             pad_nodes_to_max=args.pad_nodes_to_max,
+            makefx_buckets=makefx_buckets,
         )
         val_dataset = H5Dataset(
             args.val_prefix, data_dir=args.data_dir,
@@ -1972,18 +1987,54 @@ def main():
         # auto: only force spawn when validation compile is enabled on CUDA to avoid fork deadlocks
         mp_ctx = "spawn" if (args.compile_val != "none" and torch.cuda.is_available() and train_num_workers > 0) else None
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
-        sampler=train_sampler,
-        collate_fn=collate_fn_h5,
-        num_workers=train_num_workers,
-        pin_memory=True if torch.cuda.is_available() else False,
-        multiprocessing_context=mp_ctx,
-        worker_init_fn=_seed_worker if train_num_workers > 0 else None,
-        generator=torch.Generator().manual_seed(args.seed),
-    )
+    # make_fx bucketing: one fixed graph shape per size-bucket -> a BucketBatchSampler (replaces
+    # batch_size+sampler; it batches same-bucket samples and shards across ranks for DDP itself).
+    bucket_batch_sampler = None
+    if makefx_buckets is not None:
+        from molecular_force_field.data.bucket_sampler import BucketBatchSampler
+        bucket_batch_sampler = BucketBatchSampler(
+            train_dataset.sample_bucket,
+            batch_size=args.batch_size,
+            shuffle=bool(args.train_shuffle),
+            # drop_last=True: every batch is exactly batch_size -> total shape = batch_size * bucket
+            # max -> EXACTLY one fixed graph shape per bucket (one make_fx compile each). The dropped
+            # per-bucket remainder is reshuffled each epoch, so all samples are seen across epochs.
+            drop_last=True,
+            num_replicas=world_size if args.distributed else 1,
+            rank=rank if args.distributed else 0,
+            seed=args.seed,
+        )
+        if rank == 0:
+            logging.info(
+                "make_fx bucketing ON: %d buckets (atom-count bounds=%s); per-bucket N_max=%s E_max=%s",
+                len(train_dataset._bucket_bounds) + 1, train_dataset._bucket_bounds,
+                train_dataset._bucket_n_max, train_dataset._bucket_e_max,
+            )
+
+    if bucket_batch_sampler is not None:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=bucket_batch_sampler,
+            collate_fn=collate_fn_h5,
+            num_workers=train_num_workers,
+            pin_memory=True if torch.cuda.is_available() else False,
+            multiprocessing_context=mp_ctx,
+            worker_init_fn=_seed_worker if train_num_workers > 0 else None,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            sampler=train_sampler,
+            collate_fn=collate_fn_h5,
+            num_workers=train_num_workers,
+            pin_memory=True if torch.cuda.is_available() else False,
+            multiprocessing_context=mp_ctx,
+            worker_init_fn=_seed_worker if train_num_workers > 0 else None,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
     
     val_loader = DataLoader(
         val_dataset,
@@ -3039,7 +3090,7 @@ def main():
         distributed=args.distributed,
         rank=rank,
         world_size=world_size,
-        train_sampler=train_sampler,
+        train_sampler=(bucket_batch_sampler if bucket_batch_sampler is not None else train_sampler),
         val_sampler=val_sampler,
         save_val_csv=args.save_val_csv,
         train_eval_sample_ratio=args.train_eval_sample_ratio,

@@ -328,6 +328,12 @@ class H5Dataset(Dataset):
         # (the per-N cache collapses to a single slot). atom_mask is emitted per node for the
         # trainer to zero dummy energy + exclude dummies from the loss denominators.
         pad_nodes_to_max: bool = False,
+        # make_fx bucketing: int K -> K equal-frequency (quantile) buckets by atom count; a
+        # list -> explicit atom-count upper-bounds. Each sample is padded to its BUCKET's
+        # (N_max, E_max) instead of the global max -> one fixed graph shape per bucket (one
+        # make_fx compile each) with far less padding waste than padding everything to the
+        # global max. Implies pad_nodes_to_max + pad_edges_to_max. None -> disabled.
+        makefx_buckets: int | list | None = None,
     ):
         """
         Initialize H5 dataset.
@@ -363,6 +369,52 @@ class H5Dataset(Dataset):
             self.max_atoms = int(f.attrs.get('max_atoms', 0))
             if self.pad_nodes_to_max and self.max_atoms <= 0:
                 self.max_atoms = max((int(f[k]['pos'].shape[0]) for k in f.keys()), default=0)
+
+            # --- make_fx bucketing: quantile buckets by atom count; pad each sample to its
+            # bucket's (N_max, E_max). _sample_bucket=None means "no bucketing" (global pad). ---
+            self._sample_bucket = None
+            self._bucket_n_max = []
+            self._bucket_e_max = []
+            self._bucket_bounds = []
+            if makefx_buckets is not None:
+                self.pad_nodes_to_max = True
+                self.pad_edges_to_max = True
+                # Prefer the preprocess-baked per-sample sizes (SIDECAR <h5>.counts.npz, indexed by
+                # sample id) -> one read, no re-scan. Validate the length, else fall back to scanning
+                # each sample (datasets made before this feature, or a stale sidecar). Both index by
+                # NUMERIC sample id to match __getitem__ -> f['sample_{idx}'] (h5 key order is
+                # alphabetical: sample_0,1,10,2,... so a keys()-ordered list would mis-map
+                # bucket -> sample and truncate frames).
+                _sidecar = self.file_path + ".counts.npz"
+                atom_counts = None
+                if os.path.exists(_sidecar):
+                    _d = np.load(_sidecar)
+                    if len(_d['node_counts']) == self.num_samples:
+                        atom_counts = [int(x) for x in _d['node_counts']]
+                        edge_counts = [int(x) for x in _d['edge_counts']]
+                if atom_counts is None:
+                    atom_counts = [int(f[f'sample_{i}']['pos'].shape[0]) for i in range(self.num_samples)]
+                    edge_counts = [int(f[f'sample_{i}']['edge_src'].shape[0]) for i in range(self.num_samples)]
+                if isinstance(makefx_buckets, (list, tuple)):
+                    bounds = sorted({int(b) for b in makefx_buckets})
+                else:
+                    # auto: K-1 interior atom-count quantiles -> K equal-frequency buckets
+                    K = max(int(makefx_buckets), 1)
+                    a_sorted = sorted(atom_counts)
+                    nsamp = len(a_sorted)
+                    bounds = sorted({a_sorted[min(nsamp - 1, (j * nsamp) // K)]
+                                     for j in range(1, K)}) if nsamp else []
+                import bisect as _bisect
+                self._bucket_bounds = bounds
+                self._sample_bucket = [_bisect.bisect_right(bounds, a) for a in atom_counts]
+                nb = len(bounds) + 1
+                self._bucket_n_max = [0] * nb
+                self._bucket_e_max = [0] * nb
+                for a, e, b in zip(atom_counts, edge_counts, self._sample_bucket):
+                    if a > self._bucket_n_max[b]:
+                        self._bucket_n_max[b] = a
+                    if e > self._bucket_e_max[b]:
+                        self._bucket_e_max[b] = e
 
         self._extra_labels: Dict[str, torch.Tensor] = {}
         if extra_label_paths:
@@ -414,6 +466,23 @@ class H5Dataset(Dataset):
         """Restore force units (if normalized)."""
         return normalized_force
 
+    @property
+    def sample_bucket(self):
+        """Per-sample make_fx bucket id (list[int]), or None when bucketing is disabled."""
+        return self._sample_bucket
+
+    def _n_max_for(self, idx):
+        """Node-pad target for sample idx: its bucket's N_max, else the global max_atoms."""
+        if self._sample_bucket is not None:
+            return self._bucket_n_max[self._sample_bucket[idx]]
+        return self.max_atoms
+
+    def _e_max_for(self, idx):
+        """Edge-pad target for sample idx: its bucket's E_max, else the global max_edges."""
+        if self._sample_bucket is not None:
+            return self._bucket_e_max[self._sample_bucket[idx]]
+        return self.max_edges
+
     def __len__(self):
         return self.num_samples
 
@@ -439,7 +508,7 @@ class H5Dataset(Dataset):
         }
         if self.pad_edges_to_max:
             E = int(out['edge_src'].shape[0])
-            target = max(self.max_edges, E)  # never truncate; an over-E_max frame just grows the shape
+            target = max(self._e_max_for(idx), E)  # bucket E_max (or global); never truncate
             if target > E:
                 npad = target - E
                 z = torch.zeros(npad, dtype=torch.long)
@@ -474,7 +543,7 @@ class H5Dataset(Dataset):
                 out[k] = self._extra_per_node[k][idx]
         if self.pad_nodes_to_max:
             N = int(out['pos'].shape[0])
-            targetN = max(self.max_atoms, N)  # never truncate; an over-N_max frame just grows the shape
+            targetN = max(self._n_max_for(idx), N)  # bucket N_max (or global); never truncate
             atom_mask = torch.ones(N, dtype=torch.float64)
             if targetN > N:
                 npad = targetN - N
