@@ -2,10 +2,16 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/License-Academic_Non--Commercial-orange)](LICENSE)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19063206-blue)](https://doi.org/10.5281/zenodo.19063206)
 
 **FusedSCEquiTensorPot** is an E(3)-equivariant neural potential for atomistic modeling with multiple tensor-product backends, explicit external-field conditioning, physical-tensor supervision, multi-fidelity training, and direct LAMMPS deployment.
+
+> **Licensing / 许可**: Non-commercial academic research and teaching are free
+> under the [FSCETP Academic Non-Commercial License](LICENSE). Commercial use,
+> including corporate internal R&D, requires a separate written, paid license.
+> 非商业学术研究与教学免费；企业内部研发及其他商业用途须事先取得单独的书面付费许可。
+> [Details / 详细说明](COMMERCIAL_LICENSE.md).
 
 ## Overview
 
@@ -701,7 +707,18 @@ For detailed performance comparison and recommendations, see [USAGE.md](USAGE.md
 
 ## 📄 License
 
-MIT License
+This release is offered under the **FSCETP Academic Non-Commercial License 1.0**;
+see [LICENSE](LICENSE) for the controlling terms and
+[COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for examples and licensing inquiries.
+It is source-available software, not OSI-approved open-source software.
+
+- Eligible non-commercial academic research and teaching: royalty-free.
+- Corporate research, commercial services, product development, and other
+  commercial uses: a separate written commercial license and agreed fees are required.
+- Prior MIT releases retain the rights already granted under MIT. This change
+  does not retroactively remove those rights.
+- Separately identified third-party components retain their own licenses;
+  see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## 🙏 Acknowledgments
 

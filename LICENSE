@@ -1,21 +1,118 @@
-MIT License
+FSCETP Academic Non-Commercial License 1.0
+SPDX-License-Identifier: LicenseRef-FSCETP-Academic-NonCommercial-1.0
 
-Copyright (c) 2026 Ruixiang Lin
+Copyright (c) 2026 Ruixiang Lin. All rights reserved except as expressly granted below.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Scope and acceptance
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+This license applies to the copyright holder's software, documentation, and
+other materials expressly distributed under this license (the "Software").
+It applies only to rights that the copyright holder is entitled to license.
+Exercising rights granted by this license constitutes acceptance of its terms.
+This is a source-available academic license, not an OSI-approved open-source
+license. The identifier above is a project-specific LicenseRef.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. Eligible users and permitted purposes
+
+An "Eligible User" is a student, educator, or researcher acting solely in that
+capacity at a nonprofit educational institution, nonprofit research institution,
+or public research institution, for that institution's non-commercial academic
+research or teaching. Employees, agents, and contractors acting for a for-profit
+entity are not Eligible Users for that activity, even if they also hold an
+academic affiliation or intend to publish their results.
+
+"Permitted Purposes" means non-commercial academic research, teaching, study,
+and reproducibility of scholarly results by Eligible Users. Ordinary tuition
+and public or charitable research funding do not alone make an otherwise
+eligible activity commercial. A nonprofit affiliation alone does not make a
+commercial activity permissible.
+
+3. Limited, royalty-free grant
+
+Subject to all terms below, the copyright holder grants Eligible Users a
+worldwide, non-exclusive, royalty-free, non-sublicensable license to access,
+copy, install, compile, execute, inspect, and modify the Software solely for
+Permitted Purposes. No commercial-use right is granted. All other rights are
+reserved. Commercial use requires a separate written commercial license from
+the relevant copyright holder and payment of the fees agreed in that license
+before use begins. Other excluded uses require separate written permission.
+These terms do not promise that a separate license will be offered.
+
+4. Commercial and other excluded uses
+
+Under this academic license, you may not use, modify, distribute, or make the Software available, directly
+or indirectly, for commercial advantage, monetary compensation, or the benefit
+of a for-profit business. Prohibited activities include:
+
+(a) corporate internal research, evaluation, product development, or production;
+(b) paid consulting, contract research, or services for a commercial client;
+(c) industry-sponsored research carried out for a sponsor's business benefit,
+    including projects granting a commercial sponsor privileged exploitation
+    rights or exclusive access to results;
+(d) commercial hosted services, APIs, software-as-a-service, or paid access;
+(e) incorporation into commercial software, products, workflows, or services;
+(f) using the Software to train, fine-tune, distill, or generate models,
+    checkpoints, datasets, or other assets for commercial exploitation; and
+(g) evasion of these restrictions through affiliates, academic collaborators,
+    intermediaries, wrappers, or modifications.
+
+Free-of-charge access, publication of results, or describing work as "research"
+does not by itself make an excluded use permissible.
+
+5. Redistribution, modifications, and notices
+
+You may share copies or modifications only for Permitted Purposes, with these
+terms, all copyright notices, and all applicable third-party notices intact.
+Recipients must obtain their license directly under these terms; you may not
+grant broader rights, remove the non-commercial restriction, or relicense the
+copyright holder's Software. Clearly identify your modifications and do not
+misrepresent them as an official release. Public source forks may be hosted
+with these terms prominently included; execution and other licensed uses
+remain limited to Eligible Users and Permitted Purposes. Rights independently
+granted by a hosting platform's applicable terms are not withdrawn here.
+
+6. Scholarly publication and outputs
+
+Eligible Users may publish scholarly papers, factual findings, and benchmark
+results from Permitted Purposes, including in journals that charge publication
+or subscription fees. Acknowledge FSCETP and the version used. This license
+does not claim ownership of your independently created findings or data.
+The grant does not authorize operating the Software to produce assets for
+commercial exploitation, or distributing Software or derivative code inside
+an output under less restrictive terms. Independently applicable rights in
+data, models, and third-party materials must be respected.
+
+7. Prior releases and third-party rights
+
+This license does not revoke rights already granted for copies previously
+released under MIT or another license. It does not retroactively restrict
+those copies, and does not remove rights independently available under such
+licenses. Separately identified third-party components retain their own
+licenses; this license does not replace or narrow those licenses. See the
+repository's third-party notices. No trademark endorsement or rights beyond
+the copyright holder's authority are granted.
+
+8. Termination
+
+The permissions granted by this license terminate automatically upon breach.
+Upon termination, stop exercising those permissions and delete copies held
+solely under this license, except copies required by law. Reinstatement
+requires written permission from the copyright holder. This provision does
+not terminate independent rights under a prior or third-party license.
+
+9. Disclaimer and limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+THE COPYRIGHT HOLDER AND CONTRIBUTORS SHALL NOT BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE, WHETHER
+IN CONTRACT, TORT, OR OTHERWISE. Nothing excludes liability that applicable
+law does not permit to be excluded.
+
+10. Interpretation
+
+If a provision is unenforceable, the remaining provisions continue to apply
+to the extent permitted by law. No failure to enforce a term is a waiver.
+Exceptions require the relevant copyright holder's written agreement.
+The English text is controlling; translations and summaries are explanatory.

@@ -3,7 +3,7 @@
 # (Batatia et al., MACE: Higher Order Equivariant Message Passing Neural Networks
 # for Fast and Accurate Force Fields, Eq. 10 and 11)
 # Authors: Ilyes Batatia
-# This program is distributed under the MIT License (see MIT.md)
+# This program is distributed under the MIT License (see LICENSES/MACE-MIT.txt at repository root)
 #
 # Local minimal copy for spherical-fix native MACE contraction.
 ###########################################################################################

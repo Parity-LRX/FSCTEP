@@ -1,7 +1,7 @@
 ###########################################################################################
 # Higher Order Real Clebsch Gordan (based on e3nn by Mario Geiger)
 # Authors: Ilyes Batatia
-# This program is distributed under the MIT License (see MIT.md)
+# This program is distributed under the MIT License (see LICENSES/MACE-MIT.txt at repository root)
 #
 # Local minimal copy for spherical-fix native MACE symmetric contraction.
 ###########################################################################################

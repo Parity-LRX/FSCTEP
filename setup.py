@@ -60,7 +60,8 @@ setup(
     author="Your Name",
     author_email="your.email@example.com",
     description="A Python library for molecular modeling with E3NN-based neural networks",
-    license="MIT",
+    license="LicenseRef-FSCETP-Academic-NonCommercial-1.0",
+    license_files=["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/*.txt"],
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/molecular_force_field",
@@ -68,7 +69,7 @@ setup(
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: MIT License",
+        "License :: Other/Proprietary License",
         "Topic :: Scientific/Engineering :: Chemistry",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",
